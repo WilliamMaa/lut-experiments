@@ -1,0 +1,4 @@
+data/*
+AGENTS.md
+*.pth
+*.pt
