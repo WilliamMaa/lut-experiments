@@ -1,0 +1,3 @@
+[submodule "HGQ2"]
+	path = HGQ2
+	url = git@github.com:WilliamMaa/HGQ2.git
