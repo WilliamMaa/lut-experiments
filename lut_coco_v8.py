@@ -1,25 +1,30 @@
 """
-LUT 替换 1x1 Conv 完整训练 (v6 - spawn fix)
-============================================
-修复 DataLoader 多进程 + CUDA fork 死锁：
-  mp.set_start_method('spawn') 替代默认 fork，
-  子进程不继承父进程 CUDA context，死锁消除。
-  workers 恢复 8，训练速度不受影响。
+LUT 替换 1x1 Conv - v8 (Phase 2 量化修正)
+==========================================
+复用 v7 Phase 1 checkpoint，只跑 Phase 2。
 
-Phase 1: 手术 + 冷启动全训练 (50 epoch, lr=1e-3)
-Phase 2: QAT (40 epoch, lr=1e-4, 自动加载 Phase 1 best.pt)
+v7 Phase 2 的问题：
+  - 量化对象是 gf/bf（动态激活），不是 lut.weight（静态权重）
+  - qnoise ramp 期间 STE 梯度对 lut.weight 几乎没有更新压力
+  - 结果：Phase 2 几乎无提升（0.3122 → 0.3128）
+
+v8 修正：
+  - 直接量化 lut.weight（这才是存进 SRAM 的东西）
+  - 去掉 qnoise ramp，Phase 2 从第一个 epoch 全量化
+  - gf/bf 保持浮点，scale 用 tanh 约束
 
 用法:
-  python lut_v6_spawn.py --phase 1 --device 3
-  python lut_v6_spawn.py --phase 2 --device 3
-  python lut_v6_spawn.py --smoke  --device 3   # 1 epoch 完整 val，验证不死锁
+  python lut_coco_v8.py --phase 2 --device 3
+  python lut_coco_v8.py --smoke  --device 3
 """
 
 import torch, torch.nn as nn, torch.multiprocessing as mp
+import torch.nn.functional as F
 import yaml, os, sys, json, argparse, glob
 from datetime import datetime
 from ultralytics import YOLO
 from ultralytics.nn.modules.conv import Conv
+from ultralytics.models.yolo.detect import DetectionTrainer
 
 
 # =====================================================================
@@ -37,16 +42,18 @@ def quantize_ste(x, qmax):
 
 
 # =====================================================================
-# LUT 模块
+# LUT 模块 (v8)
 # =====================================================================
 
 class LUT_Conv1x1_Replacement(nn.Module):
     def __init__(self, c_in, c_out, lut_size=256, addr_dim=8,
-                 quant_bits=None, qnoise=0.0):
+                 quant_bits=None):
         super().__init__()
         assert c_in == c_out
-        self.channels   = c_in; self.lut_size = lut_size; self.addr_dim = addr_dim
-        self.quant_bits = quant_bits; self.qnoise = qnoise
+        self.channels   = c_in
+        self.lut_size   = lut_size
+        self.addr_dim   = addr_dim
+        self.quant_bits = quant_bits   # None = 浮点, int = 量化位宽
 
         self.lut = nn.Embedding(lut_size, c_in * 2)
         nn.init.normal_(self.lut.weight, mean=0.0, std=0.005)
@@ -59,28 +66,40 @@ class LUT_Conv1x1_Replacement(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
+
+        # 地址计算
         scale = self.addr_scale.detach().abs()
-        a = x[:, :self.addr_dim].mean(dim=[2, 3]).abs() * scale
-        f = a % self.lut_size; fl = f.long(); w = f - fl.float()
-        o = 0
-        for i in range(self.addr_dim):
-            flw = self.lut(fl[:, i]); clw = self.lut((fl[:, i] + 1) % self.lut_size)
-            o = o + (1 - w[:, i:i+1]) * flw + w[:, i:i+1] * clw
-        o = o / self.addr_dim
-        gf, bf = o[:, :C] * self.scale_gamma, o[:, C:] * self.scale_beta
+        a  = x[:, :self.addr_dim].mean(dim=[2, 3]).abs() * scale
+        f  = a % self.lut_size
+        fl = f.long()
+        w  = f - fl.float()
+
+        # [v8] 量化 lut.weight 本身（训练时走 STE，验证时走 round）
         if self.quant_bits is not None:
             qm = 2 ** (self.quant_bits - 1) - 1
             if self.training:
-                g_q = quantize_ste(gf, qm)
-                b_q = quantize_ste(bf, qm)
-                g = (1 - self.qnoise) * gf + self.qnoise * g_q
-                b = (1 - self.qnoise) * bf + self.qnoise * b_q
+                lut_w = quantize_ste(self.lut.weight, qm)
             else:
-                g = (gf * qm).clamp(-qm, qm).round() / qm
-                b = (bf * qm).clamp(-qm, qm).round() / qm
+                lut_w = (self.lut.weight * qm).clamp(-qm, qm).round() / qm
         else:
-            g, b = gf, bf
-        return self.act(self.bn(x * (1 + g.view(B, C, 1, 1)) + b.view(B, C, 1, 1)))
+            lut_w = self.lut.weight
+
+        # 插值查表
+        o = 0
+        for i in range(self.addr_dim):
+            flw = F.embedding(fl[:, i], lut_w)
+            clw = F.embedding((fl[:, i] + 1) % self.lut_size, lut_w)
+            o   = o + (1 - w[:, i:i+1]) * flw + w[:, i:i+1] * clw
+        o = o / self.addr_dim
+
+        # tanh 约束 scale，保持 gf/bf 浮点
+        gf = o[:, :C] * torch.tanh(self.scale_gamma)
+        bf = o[:, C:] * torch.tanh(self.scale_beta)
+
+        out = x * (1 + gf.view(B, C, 1, 1)) + bf.view(B, C, 1, 1)
+        if out.dtype != x.dtype:
+            out = out.to(x.dtype)
+        return self.act(self.bn(out))
 
 
 # =====================================================================
@@ -106,20 +125,15 @@ def replace_1x1_conv_with_lut(module, prefix='', replaced=None):
             replace_1x1_conv_with_lut(child, path, replaced)
     return replaced
 
-def set_lut_qbits(model):
-    def _set(m):
-        for c in m.children():
-            if isinstance(c, LUT_Conv1x1_Replacement):
-                c.quant_bits = get_quant_config(c.channels)
-            else: _set(c)
-    _set(model.model.model)
+def set_lut_qbits(module):
+    for m in module.modules():
+        if isinstance(m, LUT_Conv1x1_Replacement):
+            m.quant_bits = get_quant_config(m.channels)
 
-def set_lut_qnoise(model, qnoise):
-    def _set(m):
-        for c in m.children():
-            if isinstance(c, LUT_Conv1x1_Replacement): c.qnoise = qnoise
-            else: _set(c)
-    _set(model.model.model)
+def clear_lut_qbits(module):
+    for m in module.modules():
+        if isinstance(m, LUT_Conv1x1_Replacement):
+            m.quant_bits = None
 
 
 # =====================================================================
@@ -152,8 +166,9 @@ def prepare_dataset_config():
 # 权重加载
 # =====================================================================
 
-def load_weights_from_ckpt(model, weights, replaced):
+def load_weights_from_ckpt(model, weights):
     if not (weights and os.path.exists(weights)):
+        print(f"  [WARN] ckpt not found: {weights}")
         return False
     print(f"  Loading weights: {weights}")
     ckpt = torch.load(weights, map_location='cpu', weights_only=False)
@@ -174,65 +189,79 @@ def load_weights_from_ckpt(model, weights, replaced):
     if state:
         m, u = model.model.load_state_dict(state, strict=False)
         print(f"  Loaded. Missing:{len(m)} Unexpected:{len(u)}")
+        # BN 校验
+        for name, mod in model.model.named_modules():
+            if isinstance(mod, LUT_Conv1x1_Replacement):
+                s = mod.bn.running_mean.abs().sum().item()
+                lut_s = mod.lut.weight.abs().mean().item()
+                print(f"  {name}: BN_mean_sum={s:.3f} lut_weight_abs_mean={lut_s:.5f}")
         return True
     print("  [WARN] Could not extract state_dict")
     return False
 
 
 # =====================================================================
-# 核心训练逻辑（phase 1 / 2 / smoke 共用）
+# 自定义 Trainer
 # =====================================================================
 
-def _build_and_train(phase, epochs, lr, wu, name, proj, ckpt, device, smoke=False):
-    data = prepare_dataset_config()
+class LUTTrainer(DetectionTrainer):
+    def get_model(self, cfg=None, weights=None, verbose=True):
+        return weights  # 直接返回已手术的模型，阻止按 yaml 重建
 
+
+# =====================================================================
+# Phase 2 训练
+# =====================================================================
+
+def train_phase2(device=0, epochs=40, lr=1e-4, smoke=False):
+    data    = prepare_dataset_config()
+    proj    = 'runs/detect/runs/lut_v8'
+    wu      = 3
+    name    = 'v8_smoke' if smoke else 'v8_qat'
+    epochs  = 1 if smoke else epochs
+
+    # 找 v7 Phase 1 ckpt
+    v7_ckpt = 'runs/detect/runs/lut_v7/v7_fulltrain/weights/best.pt'
+    if not os.path.exists(v7_ckpt):
+        hits = glob.glob('**/v7_fulltrain/weights/best.pt', recursive=True)
+        v7_ckpt = hits[0] if hits else None
+
+    tag = f"v8 Phase 2 QAT{'  [SMOKE]' if smoke else ''}"
+    print("=" * 60); print(tag); print("=" * 60)
+    print(f"  v7 ckpt : {v7_ckpt or 'NOT FOUND'}")
+
+    # 1. 加载 + 手术
     print(f"\n[1/3] Loading yolov8n.pt ...")
     model = YOLO('yolov8n.pt')
     print(f"\n[2/3] Surgery ...")
     replaced = replace_1x1_conv_with_lut(model.model.model)
 
-    need_quant = (phase == 2 or smoke)
-    if need_quant:
-        if ckpt:
-            loaded = load_weights_from_ckpt(model, ckpt, replaced)
-            if not loaded and phase == 2:
-                print("  [ERROR] Failed to load Phase 1 weights!"); return None
-        elif phase == 2:
-            print("  [ERROR] Phase 2 requires Phase 1 checkpoint!"); return None
-        else:
-            print("  [WARN] No ckpt found for smoke, using random init")
+    # 2. 灌 v7 Phase 1 权重（包含训好的 lut.weight）
+    if v7_ckpt:
+        loaded = load_weights_from_ckpt(model, v7_ckpt)
+        if not loaded:
+            print("  [ERROR] Failed to load v7 Phase 1 weights!"); return
+    else:
+        print("  [ERROR] v7 Phase 1 checkpoint not found!"); return
 
-        print(f"\n  Setting quant_bits:")
-        set_lut_qbits(model); set_lut_qnoise(model, 0.0)
-        for r in replaced:
-            bits = get_quant_config(r['c_in'])
-            r['quant_bits'] = bits
-            r['storage_q_kb'] = 256 * r['c_in'] * 2 * bits / 8 / 1024
-            print(f"    {r['path']}: {r['c_in']}ch -> INT{bits}  "
-                  f"FP={r['storage_fp_kb']:.0f}KB  Q={r['storage_q_kb']:.0f}KB")
+    # 3. 设量化位宽（直接全量化，不 ramp）
+    print(f"\n  Setting quant_bits (full quantization from ep0):")
+    set_lut_qbits(model.model)
+    for r in replaced:
+        bits = get_quant_config(r['c_in'])
+        r['quant_bits']    = bits
+        r['storage_q_kb']  = 256 * r['c_in'] * 2 * bits / 8 / 1024
+        print(f"    {r['path']}: {r['c_in']}ch -> INT{bits}  "
+              f"FP={r['storage_fp_kb']:.0f}KB  Q={r['storage_q_kb']:.0f}KB")
 
     total_fp = sum(r['storage_fp_kb'] for r in replaced)
-    total_q  = sum(r.get('storage_q_kb', r['storage_fp_kb']) for r in replaced)
-    print(f"  Storage total: FP={total_fp:.0f}KB  Q={total_q:.0f}KB")
+    total_q  = sum(r['storage_q_kb'] for r in replaced)
+    print(f"  Storage: FP={total_fp:.0f}KB  Q={total_q:.0f}KB")
 
-    if need_quant:
-        ramp_end = 15
-
-        def on_epoch_end(trainer):
-            e = trainer.epoch
-            if e < wu:         q = 0.0
-            elif e < ramp_end: q = min(1.0, (e - wu) / (ramp_end - wu))
-            else:              q = 1.0
-            set_lut_qnoise(model, q)
-            if e % 5 == 0 or e == wu or e == ramp_end - 1:
-                label = "plateau" if e >= ramp_end else "ramp" if e >= wu else "warmup"
-                print(f"  [QNOISE] epoch={e} qnoise={q:.3f} [{label}]")
-
-        model.add_callback('on_train_epoch_end', on_epoch_end)
-
-    print(f"\n[3/3] Train: epochs={epochs} lr={lr} warmup={wu}"
-          f"{'  [SMOKE]' if smoke else ''}")
-    kwargs = {
+    # 4. 训练
+    print(f"\n[3/3] Train: epochs={epochs} lr={lr} warmup={wu}")
+    overrides = {
+        'model':           'yolov8n.pt',
         'data':            data,
         'epochs':          epochs,
         'imgsz':           640,
@@ -251,102 +280,51 @@ def _build_and_train(phase, epochs, lr, wu, name, proj, ckpt, device, smoke=Fals
         'cache':           False,
         'warmup_epochs':   wu,
         'warmup_momentum': 0.8,
-        'workers':         8,   # spawn 模式下多进程安全
+        'workers':         8,
     }
 
-    results = model.train(**kwargs)
-    return results, replaced, total_fp, total_q
+    results = model.train(trainer=LUTTrainer, **overrides)
 
+    mAP = mAP50 = 0.0
+    if results is not None:
+        if hasattr(results, 'box') and results.box:
+            mAP   = float(results.box.map)
+            mAP50 = float(results.box.map50)
+        elif hasattr(results, 'results_dict'):
+            mAP   = float(results.results_dict.get('metrics/mAP50-95(B)', 0.0))
+            mAP50 = float(results.results_dict.get('metrics/mAP50(B)', 0.0))
 
-# =====================================================================
-# 训练入口
-# =====================================================================
-
-def train(phase=1, device=0):
-    proj = 'runs/detect/runs/lut_v6'
-
-    if phase == 1:
-        epochs, lr, wu, name = 50, 1e-3, 3, 'v6_fulltrain'
-        ckpt = None
-    else:
-        epochs, lr, wu, name = 40, 1e-4, 3, 'v6_qat'
-        ckpt = f"{proj}/v6_fulltrain/weights/best.pt"
-        if not os.path.exists(ckpt):
-            hits = glob.glob('**/v6_fulltrain/weights/best.pt', recursive=True)
-            ckpt = hits[0] if hits else None
-
-    tag = f"v6 Phase {phase} ({'Full Train' if phase == 1 else 'QAT'})"
-    print("=" * 60); print(tag); print("=" * 60)
-
-    out = _build_and_train(phase, epochs, lr, wu, name, proj, ckpt, device, smoke=False)
-    if out is None: return
-
-    results, replaced, total_fp, total_q = out
-    mAP   = float(results.box.map)   if hasattr(results, 'box') and results.box else 0.0
-    mAP50 = float(results.box.map50) if hasattr(results, 'box') and results.box else 0.0
+    if smoke:
+        print("\n" + "=" * 60)
+        status = "PASSED" if mAP > 0 else "PASSED (mAP=0, check log)"
+        print(f"[SMOKE] {status} - validation completed without hanging")
+        print(f"  mAP50-95: {mAP:.4f}  mAP50: {mAP50:.4f}")
+        print("=" * 60)
+        return
 
     ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    os.makedirs("results", exist_ok=True)
     report = {
         "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        "version": "v6", "phase": phase,
+        "version": "v8", "phase": 2,
+        "v7_phase1_ckpt": v7_ckpt,
         "baseline": {"yolov8n": 0.373},
+        "v7_phase1": {"mAP50-95": 0.3122},
         "result": {"mAP50-95": mAP, "mAP50": mAP50},
-        "delta": mAP - 0.373,
+        "delta_vs_baseline": mAP - 0.373,
+        "delta_vs_phase1":   mAP - 0.3122,
         "layers": replaced,
         "storage": {"fp_kb": total_fp, "q_kb": total_q},
     }
-    os.makedirs("results", exist_ok=True)
-    rf = f"results/report_lut_v6_phase{phase}_{ts}.json"
+    rf = f"results/report_lut_v8_phase2_{ts}.json"
     with open(rf, 'w') as f: json.dump(report, f, indent=4, ensure_ascii=False)
 
     print("\n" + "=" * 60)
     print(f"{tag} done")
-    print(f"  mAP50-95 : {mAP:.4f}  (baseline: 0.373  delta: {mAP-0.373:+.4f})")
+    print(f"  mAP50-95 : {mAP:.4f}  (v7 Phase1: 0.3122  delta: {mAP-0.3122:+.4f})")
     print(f"  mAP50    : {mAP50:.4f}")
     print(f"  Storage  : FP={total_fp:.0f}KB  Q={total_q:.0f}KB")
     print(f"  Report   : {rf}")
-    print("=" * 60)
-
-
-# =====================================================================
-# Smoke Test：1 epoch，完整 val2017，完全对齐 Phase 2 路径
-# =====================================================================
-
-def smoke_test(device=0):
-    proj = 'runs/detect/runs/lut_v6'
-    ckpt = f"{proj}/v6_fulltrain/weights/best.pt"
-    if not os.path.exists(ckpt):
-        hits = glob.glob('**/v6_fulltrain/weights/best.pt', recursive=True)
-        ckpt = hits[0] if hits else None
-
-    print("=" * 60)
-    print("LUT v6 Smoke Test (1 epoch, 完整 val2017, spawn workers=8)")
-    print(f"  ckpt  : {ckpt or 'NOT FOUND - random init'}")
-    print(f"  device: cuda:{device}")
-    print("=" * 60)
-
-    out = _build_and_train(
-        phase=2,
-        epochs=1,
-        lr=1e-4,
-        wu=3,
-        name='smoke_spawn',
-        proj='runs/lut_v6_smoke_spawn',
-        ckpt=ckpt,
-        device=device,
-        smoke=True,
-    )
-    if out is None:
-        print("[SMOKE] FAILED - could not build model")
-        return
-
-    results, _, _, _ = out
-    mAP   = float(results.box.map)   if hasattr(results, 'box') and results.box else 0.0
-    mAP50 = float(results.box.map50) if hasattr(results, 'box') and results.box else 0.0
-    print("\n" + "=" * 60)
-    print("[SMOKE] PASSED - validation completed without hanging")
-    print(f"  mAP50-95: {mAP:.4f}")
-    print(f"  mAP50   : {mAP50:.4f}")
     print("=" * 60)
 
 
@@ -355,31 +333,28 @@ def smoke_test(device=0):
 # =====================================================================
 
 if __name__ == '__main__':
-    # spawn 替代 fork：子进程不继承父进程 CUDA context，消除死锁根因
-    # 必须在 __main__ 保护下、任何 CUDA 操作之前调用
     mp.set_start_method('spawn', force=True)
 
     p = argparse.ArgumentParser()
     g = p.add_mutually_exclusive_group(required=True)
-    g.add_argument('--phase', type=int, choices=[1, 2], help='Phase 1: full train / Phase 2: QAT')
-    g.add_argument('--smoke', action='store_true',      help='1 epoch smoke test (完整 val)')
+    g.add_argument('--phase', type=int, choices=[2], help='Phase 2: QAT (复用 v7 Phase 1)')
+    g.add_argument('--smoke', action='store_true',   help='1 epoch smoke test')
     p.add_argument('--device', type=int, default=3)
+    p.add_argument('--epochs', type=int, default=40)
+    p.add_argument('--lr',     type=float, default=1e-4)
     args = p.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(args.device)
-    ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    ts  = datetime.now().strftime('%Y%m%d_%H%M%S')
     os.makedirs("logs", exist_ok=True)
-    log = f"logs/lut_v6_{'smoke' if args.smoke else f'phase{args.phase}'}_{ts}.log"
+    log = f"logs/lut_v8_{'smoke' if args.smoke else 'phase2'}_{ts}.log"
+    print(f"[INFO] Log: {log}  GPU: cuda:{args.device}")
+
     fh = open(log, "a", buffering=1)
     sys.stdout = fh
     sys.stderr = fh
-    print(f"[INFO] Log: {log}  GPU: cuda:{args.device}")
-
     try:
-        if args.smoke:
-            smoke_test(device=0)
-        else:
-            train(phase=args.phase, device=0)
+        train_phase2(device=0, epochs=args.epochs, lr=args.lr, smoke=args.smoke)
     except Exception as e:
         print(f"[ERROR] {e}")
         import traceback; traceback.print_exc()
