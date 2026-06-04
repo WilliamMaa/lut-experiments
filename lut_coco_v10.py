@@ -27,7 +27,7 @@ v10 相比 v9 的主要变化：
   # Phase1 detection fine-tune
   python lut_coco_v10.py --phase 1 --target_mode 6  --device 3 --epochs 50
   python lut_coco_v10.py --phase 1 --target_mode 8  --device 3 --epochs 50
-  python lut_coco_v10.py --phase 1 --target_mode 68 --device 3 --epochs 50
+  python lut_coco_v10.1.py --phase 1 --target_mode 68 --device 3 --epochs 50
 
   # Phase2 QAT
   python lut_coco_v10.py --phase 2 --target_mode 6  --device 3 --epochs 40
@@ -300,48 +300,75 @@ class SpatialGroupMultiHeadLUTDelta(nn.Module):
             return (1.0 - self.qnoise) * self.tables + self.qnoise * q_tables
         return q_tables
 
-    def _quant_float(self, z, g: int, h: int):
-        mean = self.addr_mean[g, h].to(z.device, z.dtype)
-        std = self.addr_std[g, h].to(z.device, z.dtype).clamp_min(1e-6)
+    def _quant_float_all(self, z):
+        """
+        z: [B, K, H, W], K = groups * heads
+        """
+        G, Hd = self.groups, self.heads
+        mean = self.addr_mean.reshape(1, G * Hd, 1, 1).to(z.device, z.dtype)
+        std = self.addr_std.reshape(1, G * Hd, 1, 1).to(z.device, z.dtype).clamp_min(1e-6)
+
         z_norm = (z - mean) / std
         z_clip = z_norm.clamp(-self.addr_clip, self.addr_clip)
         qf = (z_clip + self.addr_clip) / (2.0 * self.addr_clip) * (self.lut_size - 1)
         return qf
 
-    def _interp_lookup(self, table_gh, qf):
-        """Linear interpolation lookup.
-
-        table_gh: [L, group_size]
-        qf: [B, H, W], float in [0, L-1]
-        returns: [B, group_size, H, W]
+    def _interp_lookup_all(self, tables, qf):
         """
-        q_low = torch.floor(qf).long().clamp(0, self.lut_size - 1)
-        q_high = (q_low + 1).clamp(0, self.lut_size - 1)
-        w = (qf - q_low.float()).unsqueeze(-1)  # [B,H,W,1]
-        lo = table_gh[q_low]                   # [B,H,W,group_size]
-        hi = table_gh[q_high]
-        d = (1.0 - w) * lo + w * hi
-        return d.permute(0, 3, 1, 2).contiguous()
+        tables: [G, heads, L, group_size]
+        qf:     [B, K, H, W], K = G * heads
+
+        returns:
+            d: [B, G, heads, group_size, H, W]
+        """
+        B, K, H, W = qf.shape
+        G, Hd, L, GS = self.groups, self.heads, self.lut_size, self.group_size
+
+        tables_flat = tables.reshape(K, L, GS)  # [K, L, GS]
+
+        q_low = torch.floor(qf).long().clamp(0, L - 1)
+        q_high = (q_low + 1).clamp(0, L - 1)
+        w = (qf - q_low.float()).unsqueeze(-1)  # [B, K, H, W, 1]
+
+        k_idx = torch.arange(K, device=qf.device).view(1, K, 1, 1).expand(B, K, H, W)
+
+        lo = tables_flat[k_idx, q_low]   # [B, K, H, W, GS]
+        hi = tables_flat[k_idx, q_high]  # [B, K, H, W, GS]
+
+        d = (1.0 - w) * lo + w * hi      # [B, K, H, W, GS]
+
+        d = d.view(B, G, Hd, H, W, GS)
+        d = d.permute(0, 1, 2, 5, 3, 4).contiguous()  # [B, G, heads, GS, H, W]
+        return d
 
     def forward_raw(self, x):
         B, C, H, W = x.shape
         assert C == self.channels
+
         tables = self._lookup_tables()
+
+        # [G, heads] -> [K]
+        addr_flat = self.addr_idx.reshape(-1).to(x.device)
+
+        # Gather all address channels at once: [B, K, H, W]
+        z = x.index_select(1, addr_flat)
+
+        # Quantize all addresses at once
+        qf = self._quant_float_all(z)
+
+        # Lookup all groups/heads at once
+        d = self._interp_lookup_all(tables, qf)  # [B, G, heads, GS, H, W]
+
+        # Fuse heads
+        delta = d.mean(dim=2)  # [B, G, GS, H, W]
+
+        # Residual group delta
         xg = x.view(B, self.groups, self.group_size, H, W)
-        out_groups = []
-        for g in range(self.groups):
-            delta = x.new_zeros(B, self.group_size, H, W)
-            for h in range(self.heads):
-                ch = int(self.addr_idx[g, h].item())
-                z = x[:, ch, :, :]
-                qf = self._quant_float(z, g, h)
-                d = self._interp_lookup(tables[g, h], qf)
-                delta = delta + d
-            delta = delta / float(self.heads)
-            alpha = torch.tanh(self.alpha_raw[g]).to(x.dtype)
-            raw_g = xg[:, g] + alpha.view(1, 1, 1, 1) * delta
-            out_groups.append(raw_g)
-        raw = torch.cat(out_groups, dim=1)
+        alpha = torch.tanh(self.alpha_raw).to(x.dtype).view(1, self.groups, 1, 1, 1)
+
+        raw = xg + alpha * delta
+        raw = raw.reshape(B, C, H, W).contiguous()
+
         self.last_raw = raw
         return raw
 
@@ -755,6 +782,12 @@ class LUTV10DistillTrainer(DetectionTrainer):
 
     def _set_stage_trainability(self):
         e = getattr(self, 'epoch', 0)
+
+        if getattr(self, '_last_stage_epoch', None) == e:
+            return
+
+        self._last_stage_epoch = e
+
         if e < 5:
             set_only_lut_trainable(self.model, bn_trainable=False)
             stage = 'LUT-only'
@@ -764,8 +797,8 @@ class LUTV10DistillTrainer(DetectionTrainer):
         else:
             set_all_trainable(self.model)
             stage = 'full'
-        if e in (0, 5, 10) or e % 10 == 0:
-            print(f"  [STAGE] epoch={e} trainability={stage}")
+
+        print(f"  [STAGE] epoch={e} trainability={stage}")
 
     def _install_distill_loss_patch(self):
         student = self.model
