@@ -34,9 +34,16 @@ def compute_local_metrics(original, perturbed):
     }
 
 
-def compute_model_metrics(model, eval_loader, reference_logits_list=None):
+def compute_model_metrics(model, eval_loader, reference_probs_list=None):
     """
-    Run model on eval_loader and compute metrics vs reference (if provided).
+    Run model on eval_loader and compute metrics.
+    
+    If reference_probs_list is provided, compute KL divergence online
+    (per-batch) to avoid storing all logits in CPU memory.
+    
+    Args:
+        reference_probs_list: list of CPU Tensor[batch_seq_len, vocab] 
+                              (softmax probs from baseline, flattened over batch+seq)
     
     Returns:
         dict with avg_kl, avg_ppl, next_token_acc
@@ -48,10 +55,9 @@ def compute_model_metrics(model, eval_loader, reference_logits_list=None):
     total_tokens = 0
     correct = 0
     num_batches = 0
-    all_logits = []
     
     with torch.no_grad():
-        for batch in tqdm(eval_loader, desc="Eval", leave=False):
+        for bi, batch in enumerate(tqdm(eval_loader, desc="Eval", leave=False)):
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch.get("attention_mask", None)
             if attention_mask is not None:
@@ -59,10 +65,8 @@ def compute_model_metrics(model, eval_loader, reference_logits_list=None):
             
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             logits = outputs.logits  # [B, seq, vocab]
-            all_logits.append(logits.cpu())
             
-            # Next-token accuracy (predict next token from current)
-            # Shift: predict token t+1 from position t
+            # Next-token accuracy
             preds = logits[:, :-1, :].argmax(dim=-1)  # [B, seq-1]
             targets = input_ids[:, 1:]                # [B, seq-1]
             if attention_mask is not None:
@@ -73,16 +77,7 @@ def compute_model_metrics(model, eval_loader, reference_logits_list=None):
                 correct += (preds == targets).sum().item()
                 total_tokens += targets.numel()
             
-            # NLL for perplexity (on non-padding tokens)
-            log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)
-            nll = F.nll_loss(
-                log_probs.reshape(-1, log_probs.size(-1)),
-                targets.reshape(-1),
-                reduction="sum",
-                ignore_index=-100,
-            )
-            # Since we can't easily ignore padding in NLL without labels, 
-            # we compute token-level cross entropy manually with mask
+            # NLL for perplexity
             if attention_mask is not None:
                 token_mask = attention_mask[:, 1:].bool().reshape(-1)
                 token_nll = F.cross_entropy(
@@ -98,6 +93,17 @@ def compute_model_metrics(model, eval_loader, reference_logits_list=None):
                     reduction="sum",
                 ).item()
             
+            # KL divergence (online, per-batch)
+            if reference_probs_list is not None:
+                cur_logp = F.log_softmax(logits, dim=-1)  # [B, seq, vocab]
+                # Flatten over batch and seq
+                B, seq, V = cur_logp.shape
+                cur_logp_flat = cur_logp.reshape(-1, V).cpu()  # [B*seq, vocab]
+                ref_p = reference_probs_list[bi]  # [B*seq, vocab] on CPU
+                
+                kl = (ref_p * (torch.log(ref_p + 1e-10) - cur_logp_flat)).sum(dim=-1)
+                total_kl += kl.sum().item()
+            
             num_batches += 1
     
     result = {
@@ -105,32 +111,39 @@ def compute_model_metrics(model, eval_loader, reference_logits_list=None):
         "ppl": torch.exp(torch.tensor(total_nll / max(total_tokens, 1))).item(),
     }
     
-    # KL divergence vs reference
-    if reference_logits_list is not None:
-        kl_sum = 0.0
-        kl_tokens = 0
-        for ref_logits, cur_logits in zip(reference_logits_list, all_logits):
-            # Both on CPU
-            ref_logp = F.log_softmax(ref_logits, dim=-1)
-            cur_p = F.softmax(cur_logits, dim=-1)
-            kl = (cur_p * (torch.log(cur_p + 1e-10) - ref_logp)).sum(dim=-1)
-            kl_sum += kl.sum().item()
-            kl_tokens += kl.numel()
-        result["avg_kl"] = kl_sum / max(kl_tokens, 1)
+    if reference_probs_list is not None:
+        # Count total tokens for KL (same as eval tokens but over full seq incl first token)
+        kl_tokens = sum(p.shape[0] for p in reference_probs_list)
+        result["avg_kl"] = total_kl / max(kl_tokens, 1)
     else:
         result["avg_kl"] = None
     
-    return result, all_logits
+    return result
 
 
-def compute_kl_between_runs(logits_a_list, logits_b_list):
-    """Compute KL(A || B) given lists of logits tensors."""
-    kl_sum = 0.0
-    tokens = 0
-    for a, b in zip(logits_a_list, logits_b_list):
-        log_a = F.log_softmax(a, dim=-1)
-        p_b = F.softmax(b, dim=-1)
-        kl = (p_b * (torch.log(p_b + 1e-10) - log_a)).sum(dim=-1)
-        kl_sum += kl.sum().item()
-        tokens += kl.numel()
-    return kl_sum / max(tokens, 1)
+def compute_baseline_probs(model, eval_loader):
+    """
+    Compute baseline softmax probabilities for KL divergence.
+    Returns a list of CPU tensors, one per batch, each flattened over batch+seq.
+    
+    This avoids storing full logits (which are bf16/float32 and huge).
+    Storing probs (float32) is still large but we do it only once for baseline.
+    """
+    model.eval()
+    device = next(model.parameters()).device
+    probs_list = []
+    
+    with torch.no_grad():
+        for batch in tqdm(eval_loader, desc="Baseline", leave=False):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch.get("attention_mask", None)
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+            
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = outputs.logits
+            probs = F.softmax(logits, dim=-1).cpu().float()
+            # Flatten over batch and seq: [B*seq, vocab]
+            probs_list.append(probs.reshape(-1, probs.size(-1)))
+    
+    return probs_list

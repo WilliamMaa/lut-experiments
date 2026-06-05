@@ -8,7 +8,7 @@ from tqdm import tqdm
 from config import V0Config, get_hook_target
 from hooks import PerturbationHook
 from bucket import build_bucket_table
-from metrics import compute_model_metrics, compute_local_metrics
+from metrics import compute_model_metrics, compute_baseline_probs
 
 
 def run_sensitivity_scan(
@@ -18,11 +18,14 @@ def run_sensitivity_scan(
     eval_loader,
     addr_stats,
     config: V0Config,
-    reference_logits=None,
+    reference_probs=None,
     save_path: str = "results/scan_results.json",
 ):
     """
     Run zero / mean / noise / bucket scan for all candidates.
+    
+    Args:
+        reference_probs: list of CPU tensors from compute_baseline_probs()
     
     Returns:
         list of result dicts.
@@ -31,13 +34,14 @@ def run_sensitivity_scan(
     device = next(model.parameters()).device
     os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
     
-    # If no reference logits provided, compute baseline once
-    if reference_logits is None:
-        print("[SCAN] Computing baseline logits...")
-        baseline_metrics, reference_logits = compute_model_metrics(model, eval_loader)
+    # If no reference probs provided, compute baseline once
+    if reference_probs is None:
+        print("[SCAN] Computing baseline probabilities...")
+        reference_probs = compute_baseline_probs(model, eval_loader)
+        baseline_metrics = compute_model_metrics(model, eval_loader)
         print(f"[SCAN] Baseline: next_token_acc={baseline_metrics['next_token_acc']:.4f}, ppl={baseline_metrics['ppl']:.2f}")
     else:
-        baseline_metrics = None
+        baseline_metrics = compute_model_metrics(model, eval_loader)
     
     all_results = []
     
@@ -56,6 +60,7 @@ def run_sensitivity_scan(
                     "group": group_id,
                     "group_size": group_size,
                 }
+                target_mod = get_hook_target(model, layer_id, cand_type)
                 
                 # --- ZERO ---
                 hook_obj = PerturbationHook(
@@ -64,10 +69,11 @@ def run_sensitivity_scan(
                     group_id=group_id,
                     mode="zero",
                 )
-                target_mod = get_hook_target(model, layer_id, cand_type)
                 handle = target_mod.register_forward_hook(hook_obj)
-                metrics_zero, _ = compute_model_metrics(model, eval_loader, reference_logits)
-                handle.remove()
+                try:
+                    metrics_zero = compute_model_metrics(model, eval_loader, reference_probs)
+                finally:
+                    handle.remove()
                 group_result.update({
                     "kl_zero": metrics_zero.get("avg_kl"),
                     "ppl_zero": metrics_zero["ppl"],
@@ -85,8 +91,10 @@ def run_sensitivity_scan(
                     mean_vec=mean_vec,
                 )
                 handle = target_mod.register_forward_hook(hook_obj)
-                metrics_mean, _ = compute_model_metrics(model, eval_loader, reference_logits)
-                handle.remove()
+                try:
+                    metrics_mean = compute_model_metrics(model, eval_loader, reference_probs)
+                finally:
+                    handle.remove()
                 group_result.update({
                     "kl_mean": metrics_mean.get("avg_kl"),
                     "ppl_mean": metrics_mean["ppl"],
@@ -126,8 +134,10 @@ def run_sensitivity_scan(
                     addr_clip=config.addr_clip,
                 )
                 handle = target_mod.register_forward_hook(hook_obj)
-                metrics_bucket, _ = compute_model_metrics(model, eval_loader, reference_logits)
-                handle.remove()
+                try:
+                    metrics_bucket = compute_model_metrics(model, eval_loader, reference_probs)
+                finally:
+                    handle.remove()
                 group_result.update({
                     "kl_bucket": metrics_bucket.get("avg_kl"),
                     "ppl_bucket": metrics_bucket["ppl"],
@@ -137,9 +147,6 @@ def run_sensitivity_scan(
                     "bucket_avg_var": per_bin_var[per_bin_count > 0].mean().item() if (per_bin_count > 0).any() else 0.0,
                 })
                 print(f"  BUCKET-> KL={metrics_bucket.get('avg_kl', 0):.6f}, PPL={metrics_bucket['ppl']:.2f}, ACC={metrics_bucket['next_token_acc']:.4f}, coverage={coverage:.2%}")
-                
-                # --- NOISE (optional, after pipeline stable) ---
-                # For v0 first run we skip noise to save time; can be enabled in config.
                 
                 all_results.append(group_result)
                 

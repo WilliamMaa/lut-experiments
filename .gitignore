@@ -1,4 +1,4 @@
 data/*
-AGENTS.md
+# AGENTS.md
 *.pth
 *.pt

@@ -3,6 +3,10 @@
 Run this BEFORE run_v0.py. If this hangs or crashes, do NOT proceed.
 """
 
+import os
+os.environ["ACCELERATE_USE_CPU"] = "False"
+os.environ["ACCELERATE_MIXED_PRECISION"] = "no"
+
 import sys
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer

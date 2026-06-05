@@ -10,6 +10,11 @@ Usage:
 
 import os
 import sys
+
+# Force disable any accelerate auto-device-map behavior
+os.environ["ACCELERATE_USE_CPU"] = "False"
+os.environ["ACCELERATE_MIXED_PRECISION"] = "no"
+
 import argparse
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
