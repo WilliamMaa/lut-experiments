@@ -375,13 +375,45 @@ def experiment_C(model, calib_loader, eval_loader, addr_stats, reference_probs, 
     return results
 
 
+from dataclasses import dataclass, field
+
+@dataclass
 class V0_5Config(V0Config):
     """Extended config for v0.5."""
-    layer_ids = (6,)
-    candidate_types = ("mlp_delta",)
-    groups_to_test = [4, 3, 8, 1, 13, 9, 0]
-    binning_modes = ["uniform", "quantile"]
-    num_bins_list = [32, 64, 128, 256]
+    layer_ids: tuple = (6,)
+    candidate_types: tuple = ("mlp_delta",)
+    groups_to_test: list = field(default_factory=lambda: [4, 3, 8, 1, 13, 9, 0])
+    binning_modes: list = field(default_factory=lambda: ["uniform", "quantile"])
+    num_bins_list: list = field(default_factory=lambda: [32, 64, 128, 256])
+
+
+def _report_experiment_B(results, baseline_metrics, save_path):
+    """Generate markdown report for Experiment B (multi-group combinations)."""
+    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
+    lines = ["# Experiment B: Multi-Group Combination Test\n"]
+    if baseline_metrics:
+        lines.append(f"**Baseline PPL**: {baseline_metrics.get('ppl', 'N/A'):.2f}\n")
+    lines.append("| Groups | Num Groups | KL Bucket | PPL Bucket |")
+    lines.append("|--------|-----------|-----------|------------|")
+    for r in results:
+        lines.append(f"| {r['groups']} | {r['num_groups']} | {r['kl_bucket']:.6f} | {r['ppl_bucket']:.2f} |")
+    with open(save_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"[RANK] Report B saved to {save_path}")
+
+
+def _report_experiment_C(results, save_path):
+    """Generate markdown report for Experiment C (head ablation)."""
+    os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
+    lines = ["# Experiment C: Single-Head vs Two-Head Ablation\n"]
+    lines.append("| Group | Heads | KL Bucket | PPL Bucket | Coverage | Entropy |")
+    lines.append("|-------|-------|-----------|------------|----------|---------|")
+    for r in results:
+        lines.append(f"| {r['group']} | {r['heads']} | {r['kl_bucket']:.6f} | {r['ppl_bucket']:.2f} | "
+                     f"{r['coverage']:.2%} | {r['entropy']:.4f} |")
+    with open(save_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    print(f"[RANK] Report C saved to {save_path}")
 
 
 def main():
@@ -455,6 +487,8 @@ def main():
         with open(save_path_B, "w") as f:
             json.dump(results_B, f, indent=2, ensure_ascii=False)
         print(f"\n[EXP-B] Saved to {save_path_B}")
+        # Simple markdown report for B
+        _report_experiment_B(results_B, baseline_metrics, os.path.join(config.result_dir, "v0_5_report_B.md"))
 
     # Experiment C
     if not args.skip_exp_c and best is not None:
@@ -463,6 +497,8 @@ def main():
         with open(save_path_C, "w") as f:
             json.dump(results_C, f, indent=2, ensure_ascii=False)
         print(f"\n[EXP-C] Saved to {save_path_C}")
+        # Simple markdown report for C
+        _report_experiment_C(results_C, os.path.join(config.result_dir, "v0_5_report_C.md"))
 
     print("\n" + "=" * 70)
     print("LLM-LUT v0.5 complete.")

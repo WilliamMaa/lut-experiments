@@ -111,15 +111,14 @@ def build_bucket_table(
         table = torch.zeros(num_bins, group_size)
         return table, 0.0, torch.zeros(num_bins), torch.zeros(num_bins), None
     
-    all_addresses = torch.cat(all_addresses, dim=0)  # [N]
-    all_targets = torch.cat(all_targets, dim=0)      # [N, group_size]
+    all_addresses = torch.cat(all_addresses, dim=0)  # [N] on CPU
+    all_targets = torch.cat(all_targets, dim=0)      # [N, group_size] on CPU
     
     # Compute quantile boundaries if needed
     quantile_boundaries = None
     if binning_mode == "quantile":
         # Use float for quantile computation
         addr_float = all_addresses.float()
-        # Add small noise to avoid degenerate boundaries
         q = torch.linspace(0, 1, num_bins + 1)
         quantile_boundaries = torch.quantile(addr_float, q)
         # Ensure strictly increasing
@@ -130,6 +129,9 @@ def build_bucket_table(
         ])
         # Assign bins using searchsorted
         addr_bin = torch.searchsorted(quantile_boundaries, addr_float).long().clamp(0, num_bins - 1)
+    else:
+        # uniform mode: addr_bin is already in all_addresses
+        addr_bin = all_addresses
     
     # Build table
     table = torch.zeros(num_bins, group_size)
