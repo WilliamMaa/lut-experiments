@@ -253,6 +253,8 @@ def run_v1_2_experiment(config: V1Config):
     v10_bucket_kl = 0.6066
 
     def fmt(name, metrics):
+        if not metrics or "ppl" not in metrics:
+            return f"  {name:22s}: N/A"
         kl = metrics.get("avg_kl", 0)
         recovery = (kl_zero - kl) / kl_zero if kl_zero > 0 else 0
         marker = ""
@@ -262,7 +264,6 @@ def run_v1_2_experiment(config: V1Config):
 
     print(fmt("zero", baseline_results.get("zero", {})))
     print(fmt("mean", baseline_results.get("mean", {})))
-    print(fmt("joint_bucket", baseline_results.get("bucket", {})))
     print(fmt("v1.0_bucket_2d_ref", {"avg_kl": v10_bucket_kl, "ppl": 41.94, "next_token_acc": 0.4883}))
     for name, metrics, _ in experiments:
         print(fmt(name, metrics))
