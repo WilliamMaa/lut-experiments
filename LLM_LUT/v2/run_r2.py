@@ -32,7 +32,7 @@ from metrics import compute_baseline_probs, compute_model_metrics
 
 from r1_replacement import ReplacementEngine
 from r2_scan import fast_scan_groups
-from r2_auto_eval import generate_outputs, run_auto_eval, AUTO_PROMPTS
+from r2_auto_eval import generate_outputs, AUTO_PROMPTS
 
 
 def load_model_and_data(model_name, calib_size, eval_size, max_seq_len, batch_size, device_str="cuda:0"):
@@ -154,27 +154,36 @@ def run_scaling_experiment(args):
     repl_metrics = compute_model_metrics(model, eval_loader, reference_probs_list=reference_probs)
     print(f"  Replacement: KL={repl_metrics['avg_kl']:.4f} PPL={repl_metrics['ppl']:.2f} Acc={repl_metrics['next_token_acc']:.4f}")
 
-    # 6. Auto generation eval
-    print("\n[6/6] Auto generation evaluation...")
-    # Generate with replacement installed
-    repl_gen = generate_outputs(model, tokenizer, AUTO_PROMPTS, max_new_tokens=128, device=device)
+    # 6. Generation samples
+    print("\n[6/6] Collecting generation samples...")
+    repl_gen = generate_outputs(model, tokenizer, AUTO_PROMPTS, num_samples=args.gen_samples, max_new_tokens=128, device=device)
 
-    # Generate original (no hook)
     engine.uninstall()
-    clean_gen = generate_outputs(model, tokenizer, AUTO_PROMPTS, max_new_tokens=128, device=device)
+    clean_gen = generate_outputs(model, tokenizer, AUTO_PROMPTS, num_samples=args.gen_samples, max_new_tokens=128, device=device)
 
-    # Re-install for final state
+    # Re-install for checkpoint save
     engine.install()
-    auto_eval = run_auto_eval(clean_gen, repl_gen)
-    print(f"  Auto eval status: {auto_eval['status']}")
-    print(f"    Original: {auto_eval['original']['pass']}/{auto_eval['original']['total']} pass, "
-          f"rep={auto_eval['original']['avg_rep']:.2f}, len={auto_eval['original']['avg_len']:.0f}")
-    print(f"    Replacement: {auto_eval['replacement']['pass']}/{auto_eval['replacement']['total']} pass, "
-          f"rep={auto_eval['replacement']['avg_rep']:.2f}, len={auto_eval['replacement']['avg_len']:.0f}")
 
     # Save checkpoint
     ckpt_path = os.path.join(args.output_dir, "replacement.pt")
     engine.save(ckpt_path)
+
+    # Save generation samples to separate file
+    gen_path = os.path.join(args.output_dir, "generations.md")
+    with open(gen_path, "w", encoding="utf-8") as f:
+        f.write(f"# Generation Samples: {args.model_name}\n\n")
+        f.write(f"- Selected: Layer {best['layer']}, Group {best['group']}\n")
+        f.write(f"- {args.gen_samples} samples per prompt\n\n")
+        for idx, item in enumerate(AUTO_PROMPTS):
+            f.write(f"## Prompt {idx+1}: {item['prompt']}\n\n")
+            f.write("### Original (no hook)\n\n")
+            for i, text in enumerate(clean_gen[idx]):
+                f.write(f"{i+1}. {text}\n\n")
+            f.write("### Replacement (with hook)\n\n")
+            for i, text in enumerate(repl_gen[idx]):
+                f.write(f"{i+1}. {text}\n\n")
+            f.write("---\n\n")
+    print(f"  Generation samples saved to {gen_path}")
 
     # Save report
     report_path = os.path.join(args.output_dir, "report.md")
@@ -195,12 +204,8 @@ def run_scaling_experiment(args):
             f.write(f"| {r['layer']} | {r['group']} | {r['kl_zero']:.4f} | {r.get('kl_mean', 0):.4f} | "
                     f"{r.get('kl_bucket', 0):.4f} | {r.get('ppl_bucket', 0):.2f} | {r.get('acc_bucket', 0):.4f} | "
                     f"{r.get('recovery', 0):.2%} |\n")
-        f.write(f"\n## Auto Eval Status: {auto_eval['status']}\n\n")
-        f.write("| Prompt ID | Original Pass | Replacement Pass |\n")
-        f.write("|-----------|---------------|------------------|\n")
-        for o, r in zip(auto_eval['details']['original'], auto_eval['details']['replacement']):
-            f.write(f"| {o['prompt_id']} | {'✅' if o['passed'] else '❌'} | {'✅' if r['passed'] else '❌'} |\n")
-    print(f"\n  Report saved to {report_path}")
+        f.write(f"\nGeneration samples saved in [{os.path.basename(gen_path)}]({os.path.basename(gen_path)})\n")
+    print(f"  Report saved to {report_path}")
 
     # Save JSON
     json_path = os.path.join(args.output_dir, "results.json")
@@ -211,8 +216,11 @@ def run_scaling_experiment(args):
                        "selected_layer": best["layer"], "selected_group": best["group"]},
             "original": orig_metrics,
             "replacement": repl_metrics,
-            "top_results": top_results,
-            "auto_eval": auto_eval,
+            "generations": {
+                "prompts": [p["prompt"] for p in AUTO_PROMPTS],
+                "original": clean_gen,
+                "replacement": repl_gen,
+            },
         }, f, indent=2, default=str)
     print(f"  JSON saved to {json_path}")
 
@@ -236,6 +244,8 @@ if __name__ == "__main__":
     parser.add_argument("--eval_size", type=int, default=256)
     parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--gen_samples", type=int, default=10,
+                        help="Number of generation samples per prompt")
     parser.add_argument("--output_dir", default="results/r2")
     args = parser.parse_args()
     run_scaling_experiment(args)
