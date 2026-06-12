@@ -127,7 +127,11 @@ def load_model_and_data(model_name, calib_size, eval_size, max_seq_len, batch_si
 
 
 def collect_baseline_logits(model, data_loader):
-    """Pre-compute baseline logits on calibration set."""
+    """Pre-compute baseline logits on calibration set, per batch.
+
+    Returns a list of [B, S, vocab] tensors so batches with different sequence
+    lengths (due to dynamic padding) do not need to be concatenated.
+    """
     all_logits = []
     model.eval()
     with torch.no_grad():
@@ -137,9 +141,8 @@ def collect_baseline_logits(model, data_loader):
             if attention_mask is not None:
                 attention_mask = attention_mask.to(model.device)
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            # Collect logits for all positions
             all_logits.append(outputs.logits.cpu())
-    return torch.cat(all_logits, dim=0)
+    return all_logits
 
 
 def finetune(model, calib_loader, eval_loader, engine, epochs, lr, output_dir):
@@ -181,11 +184,8 @@ def finetune(model, calib_loader, eval_loader, engine, epochs, lr, output_dir):
             outputs = model(input_ids=input_ids, attention_mask=attention_mask)
             logits = outputs.logits  # [B, S, vocab]
 
-            # Target: baseline logits (shifted for next-token prediction)
-            B, S = input_ids.shape
-            start_idx = bi * calib_loader.batch_size
-            end_idx = start_idx + B
-            target_logits = baseline_logits[start_idx:end_idx].to(device)
+            # Target: baseline logits for the same batch
+            target_logits = baseline_logits[bi].to(device)
 
             # KL divergence loss on next-token prediction
             # logits[:, :-1] predict input_ids[:, 1:]
