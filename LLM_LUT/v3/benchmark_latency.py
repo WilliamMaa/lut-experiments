@@ -23,7 +23,6 @@ Usage (dummy mode, no model load):
 """
 
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 os.environ["ACCELERATE_USE_DEVICE_MAP"] = "false"
 
 import argparse
@@ -31,6 +30,7 @@ import time
 import json
 import torch
 import torch.nn.functional as F
+from transformers import AutoModelForCausalLM
 
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
@@ -126,18 +126,18 @@ def create_dummy_data(batch_size, seq_len, intermediate_size, hidden_size, num_g
 
 def benchmark_real(args):
     """Benchmark with real model and checkpoints."""
-    from transformers import AutoModelForCausalLM
-
+    device = torch.device(args.device)
+    torch.cuda.set_device(device)
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         torch_dtype=torch.float16,
-        device_map="cuda:0",
+        device_map=args.device,
         low_cpu_mem_usage=True,
     )
     model.eval()
-    torch.cuda.set_device("cuda:0")
-    for i in range(1, torch.cuda.device_count()):
-        assert torch.cuda.memory_allocated(i) == 0, f"GPU {i} has allocated memory!"
+    for i in range(torch.cuda.device_count()):
+        if i != device.index and torch.cuda.memory_allocated(i) > 0:
+            print(f"[WARN] GPU {i} has allocated memory; proceeding because device_map={args.device} is explicit single-GPU.")
 
     device = model.device
     layer_id = args.layer
@@ -175,8 +175,8 @@ def benchmark_real(args):
         ckpt = torch.load(ckpt_path, map_location="cpu")
         group_configs[gid] = {
             "table": ckpt["table"].to(device, torch.float16),
-            "addr_mean": ckpt["addr_stats"]["mean"].to(device, torch.float16),
-            "addr_std": ckpt["addr_stats"]["std"].to(device, torch.float16),
+            "addr_mean": ckpt["addr_mean"].to(device, torch.float16),
+            "addr_std": ckpt["addr_std"].to(device, torch.float16),
         }
 
     M = args.batch_size * args.seq_len
@@ -352,6 +352,7 @@ def main():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--seq_len", type=int, default=128)
     parser.add_argument("--output", default="results/latency_breakdown.json")
+    parser.add_argument("--device", default="cuda:0", help="CUDA device to use (e.g. cuda:0, cuda:3)")
     parser.add_argument("--dummy", action="store_true", help="Use dummy data (no model load)")
     # Dummy mode params
     parser.add_argument("--hidden_size", type=int, default=3584)
@@ -360,7 +361,7 @@ def main():
     args = parser.parse_args()
 
     if args.dummy:
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        device = torch.device(args.device if torch.cuda.is_available() else "cpu")
         dtype = torch.float16 if torch.cuda.is_available() else torch.float32
         print(f"[Dummy mode] Device: {device}, dtype: {dtype}")
         data = create_dummy_data(

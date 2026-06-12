@@ -9,6 +9,7 @@ MANDATORY: Run gpu_sanity_check.py FIRST.
 """
 
 import os
+
 import sys
 import json
 import argparse
@@ -426,6 +427,7 @@ def main():
     parser.add_argument("--skip_exp_b", action="store_true")
     parser.add_argument("--skip_exp_c", action="store_true")
     parser.add_argument("--result_dir", type=str, default="results")
+    parser.add_argument("--device", default="cuda:0", help="CUDA device to use (e.g. cuda:0, cuda:3)")
     args = parser.parse_args()
 
     config = V0_5Config()
@@ -447,7 +449,7 @@ def main():
     print(f"Binning: {config.binning_modes}, Bins: {config.num_bins_list}")
 
     # Load model and data
-    model, tokenizer, calib_loader, eval_loader = load_model_and_data(config)
+    model, tokenizer, calib_loader, eval_loader = load_model_and_data(config, device_str=args.device)
 
     # Calibration (heads=2, default)
     print("\n[CALIB] Running address calibration (heads=2)...")

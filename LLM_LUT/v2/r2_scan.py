@@ -5,8 +5,8 @@ Two-phase scan:
   2. Mean + bucket on top-K per layer
 """
 
-import sys
 import os
+import sys
 
 V0_DIR = os.path.join(os.path.dirname(__file__), "..", "v0")
 sys.path.insert(0, V0_DIR)

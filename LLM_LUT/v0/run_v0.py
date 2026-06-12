@@ -11,7 +11,7 @@ Usage:
 import os
 import sys
 
-# Force disable any accelerate auto-device-map behavior
+# Single-GPU safety: no auto device map, but GPU is selectable via --device
 os.environ["ACCELERATE_USE_CPU"] = "False"
 os.environ["ACCELERATE_MIXED_PRECISION"] = "no"
 
@@ -37,6 +37,7 @@ def main():
     parser.add_argument("--skip_calib", action="store_true")
     parser.add_argument("--skip_scan", action="store_true")
     parser.add_argument("--result_dir", type=str, default="results")
+    parser.add_argument("--device", default="cuda:0", help="CUDA device to use (e.g. cuda:0, cuda:3)")
     args = parser.parse_args()
 
     config = V0Config()
@@ -54,7 +55,7 @@ def main():
     os.makedirs("data", exist_ok=True)
 
     # CRITICAL: single GPU only. Never use device_map="auto".
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     torch.cuda.set_device(device)
     print(f"Device: {device} (locked to single GPU)")
 

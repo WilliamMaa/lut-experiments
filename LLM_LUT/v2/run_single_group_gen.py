@@ -16,7 +16,6 @@ import torch
 
 os.environ["ACCELERATE_USE_DEVICE_MAP"] = "false"
 os.environ["ACCELERATE_MIXED_PRECISION"] = "no"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -43,12 +42,12 @@ def load_model_and_data(model_name, calib_size, max_seq_len, batch_size, device_
 
     dtype = getattr(torch, "bfloat16", torch.float32)
     try:
-        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype, trust_remote_code=True, device_map=device_str)
     except Exception as e:
         print(f"[WARN] Failed to load with {dtype}: {e}. Falling back to float32.")
-        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32, trust_remote_code=True, device_map=device_str)
 
-    model = model.to(device)
+    # model already on device via device_map
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
@@ -68,7 +67,7 @@ def load_model_and_data(model_name, calib_size, max_seq_len, batch_size, device_
 
 
 def run_single_group_generation(args):
-    device = torch.device("cuda:0")
+    device = torch.device(args.device)
     os.makedirs(args.output_dir, exist_ok=True)
 
     print("=" * 70)
@@ -79,7 +78,7 @@ def run_single_group_generation(args):
     # 1. Load
     print("\n[1/3] Loading model and data...")
     model, tokenizer, calib_loader = load_model_and_data(
-        args.model_name, args.calib_size, args.max_seq_len, args.batch_size
+        args.model_name, args.calib_size, args.max_seq_len, args.batch_size, device_str=args.device
     )
 
     # 2. Calibrate target layer
@@ -160,5 +159,6 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--gen_samples", type=int, default=10)
     parser.add_argument("--output_dir", default="results/single_group")
+    parser.add_argument("--device", default="cuda:0", help="CUDA device to use (e.g. cuda:0, cuda:3)")
     args = parser.parse_args()
     run_single_group_generation(args)

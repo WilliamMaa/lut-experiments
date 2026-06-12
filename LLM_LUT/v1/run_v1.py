@@ -11,7 +11,6 @@ MANDATORY: Run ../v0/gpu_sanity_check.py FIRST.
 import os
 os.environ["ACCELERATE_USE_DEVICE_MAP"] = "false"
 os.environ["ACCELERATE_MIXED_PRECISION"] = "no"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 import sys
 import json
@@ -94,9 +93,9 @@ def load_model_and_data(config: V1Config, device_str: str = "cuda:0"):
     return model, tokenizer, calib_loader, eval_loader
 
 
-def run_v1_experiment(config: V1Config):
+def run_v1_experiment(config: V1Config, device_str: str = "cuda:0"):
     """Run full v1.0 experiment."""
-    device = torch.device("cuda:0")
+    device = torch.device(device_str)
 
     print("=" * 60)
     print("LLM-LUT v1.0 Experiment")
@@ -104,7 +103,7 @@ def run_v1_experiment(config: V1Config):
 
     # 1. Load
     print("\n[1/6] Loading model and data...")
-    model, tokenizer, calib_loader, eval_loader = load_model_and_data(config)
+    model, tokenizer, calib_loader, eval_loader = load_model_and_data(config, device_str=device_str)
 
     # 2. Calibrate address
     print("\n[2/6] Calibrating address channels...")
@@ -372,5 +371,10 @@ def run_v1_experiment(config: V1Config):
 
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="LLM-LUT v1.0 Experiment")
+    parser.add_argument("--device", default="cuda:0", help="CUDA device to use (e.g. cuda:0, cuda:3)")
+    args = parser.parse_args()
+
     config = V1Config()
-    run_v1_experiment(config)
+    run_v1_experiment(config, device_str=args.device)

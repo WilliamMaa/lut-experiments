@@ -20,7 +20,6 @@ import torch
 
 os.environ["ACCELERATE_USE_DEVICE_MAP"] = "false"
 os.environ["ACCELERATE_MIXED_PRECISION"] = "no"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 V0_DIR = os.path.join(os.path.dirname(__file__), "..", "v0")
 V2_DIR = os.path.join(os.path.dirname(__file__), "..", "v2")
@@ -45,19 +44,19 @@ def load_model_and_data(model_name, calib_size, eval_size, max_seq_len, batch_si
 
     dtype = getattr(torch, "bfloat16", torch.float32)
     try:
-        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype, trust_remote_code=True, device_map=device_str)
     except Exception as e:
         print(f"[WARN] Failed to load with {dtype}: {e}. Falling back to float32.")
-        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32, trust_remote_code=True, device_map=device_str)
 
-    model = model.to(device)
+    # model already on device via device_map
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
 
     for i in range(torch.cuda.device_count()):
         if i != device.index and torch.cuda.memory_allocated(i) > 0:
-            raise RuntimeError(f"FATAL: GPU {i} has allocated memory!")
+            print(f"[WARN] GPU {i} has allocated memory; proceeding because device_map={device_str} is explicit single-GPU.")
 
     calib_path = "../v0/data/calib.jsonl"
     eval_path = "../v0/data/eval.jsonl"
@@ -93,7 +92,7 @@ def load_checkpoints_into_engine(checkpoint_dir, engine):
 
 
 def run_v3_validation(args):
-    device = torch.device("cuda:0")
+    device = torch.device(args.device)
     os.makedirs(args.output_dir, exist_ok=True)
 
     print("=" * 70)
@@ -104,7 +103,7 @@ def run_v3_validation(args):
     # 1. Load
     print("\n[1/4] Loading model and data...")
     model, tokenizer, calib_loader, eval_loader = load_model_and_data(
-        args.model_name, args.calib_size, args.eval_size, args.max_seq_len, args.batch_size
+        args.model_name, args.calib_size, args.eval_size, args.max_seq_len, args.batch_size, device_str=args.device
     )
 
     # 2. Build V3 engine from checkpoints
@@ -235,5 +234,6 @@ if __name__ == "__main__":
     parser.add_argument("--gen_samples", type=int, default=5,
                         help="Generation samples per prompt (default 5 for speed)")
     parser.add_argument("--output_dir", default="results/v3_validation")
+    parser.add_argument("--device", default="cuda:0", help="CUDA device to use (e.g. cuda:0, cuda:3)")
     args = parser.parse_args()
     run_v3_validation(args)

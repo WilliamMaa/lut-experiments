@@ -16,7 +16,6 @@ import torch
 
 os.environ["ACCELERATE_USE_DEVICE_MAP"] = "false"
 os.environ["ACCELERATE_MIXED_PRECISION"] = "no"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -46,12 +45,12 @@ def load_model_and_data(model_name, calib_size, eval_size, max_seq_len, batch_si
 
     dtype = getattr(torch, "bfloat16", torch.float32)
     try:
-        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=dtype, trust_remote_code=True, device_map=device_str)
     except Exception as e:
         print(f"[WARN] Failed to load with {dtype}: {e}. Falling back to float32.")
-        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32, trust_remote_code=True, device_map=device_str)
 
-    model = model.to(device)
+    # model already on device via device_map
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
@@ -75,7 +74,7 @@ def load_model_and_data(model_name, calib_size, eval_size, max_seq_len, batch_si
 
 def run_scaling_experiment(args):
     """Run full Scaling-R1 experiment for a given model."""
-    device = torch.device("cuda:0")
+    device = torch.device(args.device)
     os.makedirs(args.output_dir, exist_ok=True)
 
     print("=" * 70)
@@ -86,7 +85,7 @@ def run_scaling_experiment(args):
     # 1. Load
     print("\n[1/6] Loading model and data...")
     model, tokenizer, calib_loader, eval_loader = load_model_and_data(
-        args.model_name, args.calib_size, args.eval_size, args.max_seq_len, args.batch_size
+        args.model_name, args.calib_size, args.eval_size, args.max_seq_len, args.batch_size, device_str=args.device
     )
     num_layers = model.config.num_hidden_layers
     print(f"  Model: {num_layers} layers, hidden={model.config.hidden_size}, intermediate={model.config.intermediate_size}")

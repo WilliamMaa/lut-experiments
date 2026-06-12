@@ -21,6 +21,17 @@ except ImportError:
 # Triton kernel: multi-group LUT fill
 # ---------------------------------------------------------------------------
 if TRITON_AVAILABLE:
+    @triton.autotune(
+        configs=[
+            triton.Config({'BLOCK_M': 1},  num_warps=1),
+            triton.Config({'BLOCK_M': 2},  num_warps=1),
+            triton.Config({'BLOCK_M': 4},  num_warps=2),
+            triton.Config({'BLOCK_M': 8},  num_warps=2),
+            triton.Config({'BLOCK_M': 16}, num_warps=4),
+            triton.Config({'BLOCK_M': 32}, num_warps=4),
+        ],
+        key=['M', 'num_groups']
+    )
     @triton.jit
     def _lut_fill_multi_group_kernel(
         bin_idx_ptr,       # [M, num_groups, 2]   int32
@@ -70,14 +81,12 @@ if TRITON_AVAILABLE:
 
         for c in tl.range(0, GROUP_SIZE):
             # ---- LUT lookup ----
-            # lut_val = table[pid_group, b1, b2, c]
             table_idx = (b1 * stride_table_b1 +
                          b2 * stride_table_b2 +
                          c  * stride_table_c)
             lut_val = tl.load(table_base + table_idx, mask=m_mask)
 
             # ---- Denormalize ----
-            # lut_delta = lut_val * addr_std + addr_mean
             addr_mean_c = tl.load(mean_base + c * stride_mean_c)
             addr_std_c  = tl.load(std_base  + c * stride_mean_c)
             lut_delta = lut_val * addr_std_c + addr_mean_c
@@ -124,10 +133,7 @@ def triton_lut_fill(bin_idx, tables, normed_x, group_starts, addr_mean, addr_std
     addr_mean = addr_mean.contiguous().to(dtype)
     addr_std = addr_std.contiguous().to(dtype)
 
-    # Block size tuning
-    BLOCK_M = 128
-
-    grid = (triton.cdiv(M, BLOCK_M), num_groups)
+    grid = (triton.cdiv(M, 1), num_groups)  # BLOCK_M is auto-tuned
 
     _lut_fill_multi_group_kernel[grid](
         bin_idx, tables, normed_x, out, group_starts,
@@ -138,7 +144,6 @@ def triton_lut_fill(bin_idx, tables, normed_x, group_starts, addr_mean, addr_std
         normed_x.stride(0), normed_x.stride(1),
         out.stride(0), out.stride(1),
         addr_mean.stride(0), addr_mean.stride(1),
-        BLOCK_M=BLOCK_M,
     )
     return out
 

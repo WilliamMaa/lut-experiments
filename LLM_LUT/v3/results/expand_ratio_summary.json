@@ -1,0 +1,134 @@
+{
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "layer": 21,
+  "used_groups": [
+    4,
+    7,
+    26,
+    40,
+    50,
+    51
+  ],
+  "baseline": {
+    "kl": 0.00017037003122474234,
+    "ppl": 19.554128646850586,
+    "acc": 0.5132605304212169
+  },
+  "current_6group": {
+    "kl": 0.10868798584154207,
+    "ppl": 19.678449630737305,
+    "acc": 0.5179407176287052
+  },
+  "progressive": [
+    {
+      "num_groups": 8,
+      "group_ids": [
+        4,
+        7,
+        26,
+        40,
+        50,
+        51,
+        3,
+        41
+      ],
+      "kl": 0.12994224909846097,
+      "ppl": 19.99955177307129,
+      "acc": 0.5132605304212169,
+      "gen_file": "results/expand_ratio_l21/gen_g8.md",
+      "checkpoint_dir": "results/expand_ratio_l21/ckpt_g8"
+    },
+    {
+      "num_groups": 10,
+      "group_ids": [
+        4,
+        7,
+        26,
+        40,
+        50,
+        51,
+        3,
+        41,
+        45,
+        8
+      ],
+      "kl": 0.1461858023723511,
+      "ppl": 20.01320457458496,
+      "acc": 0.514820592823713,
+      "gen_file": "results/expand_ratio_l21/gen_g10.md",
+      "checkpoint_dir": "results/expand_ratio_l21/ckpt_g10"
+    },
+    {
+      "num_groups": 12,
+      "group_ids": [
+        4,
+        7,
+        26,
+        40,
+        50,
+        51,
+        3,
+        41,
+        45,
+        8,
+        28,
+        36
+      ],
+      "kl": 0.16925126436638505,
+      "ppl": 20.065959930419922,
+      "acc": 0.514820592823713,
+      "gen_file": "results/expand_ratio_l21/gen_g12.md",
+      "checkpoint_dir": "results/expand_ratio_l21/ckpt_g12"
+    },
+    {
+      "num_groups": 14,
+      "group_ids": [
+        4,
+        7,
+        26,
+        40,
+        50,
+        51,
+        3,
+        41,
+        45,
+        8,
+        28,
+        36,
+        48,
+        34
+      ],
+      "kl": 0.1817422235665256,
+      "ppl": 20.177793502807617,
+      "acc": 0.5179407176287052,
+      "gen_file": "results/expand_ratio_l21/gen_g14.md",
+      "checkpoint_dir": "results/expand_ratio_l21/ckpt_g14"
+    },
+    {
+      "num_groups": 16,
+      "group_ids": [
+        4,
+        7,
+        26,
+        40,
+        50,
+        51,
+        3,
+        41,
+        45,
+        8,
+        28,
+        36,
+        48,
+        34,
+        10,
+        42
+      ],
+      "kl": 0.19610258457187105,
+      "ppl": 20.286291122436523,
+      "acc": 0.5210608424336973,
+      "gen_file": "results/expand_ratio_l21/gen_g16.md",
+      "checkpoint_dir": "results/expand_ratio_l21/ckpt_g16"
+    }
+  ]
+}
