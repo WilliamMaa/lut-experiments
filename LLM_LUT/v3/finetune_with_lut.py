@@ -22,6 +22,7 @@ os.environ["ACCELERATE_USE_DEVICE_MAP"] = "false"
 
 import sys
 import json
+import glob
 import argparse
 from pathlib import Path
 
@@ -234,7 +235,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--layer", type=int, default=21)
-    parser.add_argument("--groups", default="26,50,51,4,7,40")
+    parser.add_argument("--groups", default="26,50,51,4,7,40", help="Comma-separated group IDs, or 'auto' to infer from checkpoint_dir")
     parser.add_argument("--checkpoint_dir", default="../v2/results/7B_l21_6group_ckpt")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-5)
@@ -247,7 +248,24 @@ def main():
     args = parser.parse_args()
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    group_list = [int(g.strip()) for g in args.groups.split(",")]
+    if args.groups.strip().lower() == "auto":
+        pattern = os.path.join(args.checkpoint_dir, f"replacement_l{args.layer}g*.pt")
+        ckpt_paths = sorted(glob.glob(pattern))
+        if not ckpt_paths:
+            raise ValueError(f"No checkpoints found for layer {args.layer} in {args.checkpoint_dir}")
+        group_list = []
+        for p in ckpt_paths:
+            name = os.path.basename(p)
+            prefix = f"replacement_l{args.layer}g"
+            suffix = ".pt"
+            if not (name.startswith(prefix) and name.endswith(suffix)):
+                raise ValueError(f"Unexpected checkpoint filename: {name}")
+            gid = int(name[len(prefix):-len(suffix)])
+            group_list.append(gid)
+        group_list = sorted(group_list)
+        print(f"[auto] Inferred groups from {args.checkpoint_dir}: {group_list}")
+    else:
+        group_list = [int(g.strip()) for g in args.groups.split(",")]
 
     print("=" * 70)
     print(f"Fine-tune with LUT: L{args.layer}, groups={group_list}")
