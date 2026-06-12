@@ -23,7 +23,7 @@ sys.path.insert(0, V2_DIR)
 import torch
 import torch.nn.functional as F
 
-from v3.triton_kernels import lut_fill, TRITON_AVAILABLE
+from triton_kernels import lut_fill, TRITON_AVAILABLE
 
 
 class V3PartialEngine:
