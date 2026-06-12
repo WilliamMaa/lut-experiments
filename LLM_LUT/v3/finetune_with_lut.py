@@ -155,6 +155,9 @@ def finetune(model, calib_loader, eval_loader, engine, epochs, lr, output_dir):
     for p in model.parameters():
         p.requires_grad_(False)
     down_proj.weight.requires_grad_(True)
+    # Fine-tune in fp32 for numerical stability (model stays fp16, only this weight is fp32)
+    original_dtype = down_proj.weight.dtype
+    down_proj.weight.data = down_proj.weight.data.float()
 
     optimizer = torch.optim.AdamW([down_proj.weight], lr=lr)
 
@@ -192,12 +195,21 @@ def finetune(model, calib_loader, eval_loader, engine, epochs, lr, output_dir):
             pred = logits[:, :-1, :].contiguous().view(-1, logits.size(-1))
             target = target_logits[:, :-1, :].contiguous().view(-1, target_logits.size(-1))
 
-            log_probs = F.log_softmax(pred, dim=-1)
-            target_probs = F.softmax(target, dim=-1)
+            # Compute KL in fp32 for numerical stability
+            pred_f32 = pred.float()
+            target_f32 = target.float()
+            log_probs = F.log_softmax(pred_f32, dim=-1)
+            target_probs = F.softmax(target_f32, dim=-1)
             loss = F.kl_div(log_probs, target_probs, reduction="batchmean")
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"[WARN] Batch {bi} has NaN/Inf loss. Skipping.")
+                optimizer.zero_grad()
+                continue
 
             optimizer.zero_grad()
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(down_proj.weight, max_norm=1.0)
             optimizer.step()
 
             total_loss += loss.item()
@@ -216,7 +228,7 @@ def finetune(model, calib_loader, eval_loader, engine, epochs, lr, output_dir):
 
         # Save checkpoint
         ckpt_path = os.path.join(output_dir, f"epoch{epoch}_down_proj.pt")
-        torch.save(down_proj.weight.data.cpu(), ckpt_path)
+        torch.save(down_proj.weight.data.to(original_dtype).cpu(), ckpt_path)
 
         results.append({
             "epoch": epoch,
