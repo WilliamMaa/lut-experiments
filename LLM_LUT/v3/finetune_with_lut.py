@@ -155,15 +155,16 @@ def finetune(model, calib_loader, eval_loader, engine, epochs, lr, output_dir):
     for p in model.parameters():
         p.requires_grad_(False)
     down_proj.weight.requires_grad_(True)
-    # Fine-tune in fp32 for numerical stability (model stays fp16, only this weight is fp32)
-    original_dtype = down_proj.weight.dtype
-    down_proj.weight.data = down_proj.weight.data.float()
 
     optimizer = torch.optim.AdamW([down_proj.weight], lr=lr)
 
-    # Pre-compute baseline logits
+    # Pre-compute baseline logits (model must stay fp16 here for original down_proj forward)
     print("\n[Pre-compute] Collecting baseline logits on calibration set...")
     baseline_logits = collect_baseline_logits(model, calib_loader)
+
+    # Convert target weight to fp32 for stable fine-tuning (after baseline, before installing LUT hook)
+    original_dtype = down_proj.weight.dtype
+    down_proj.weight.data = down_proj.weight.data.float()
 
     # Install engine
     engine.install()
