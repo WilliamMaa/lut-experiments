@@ -65,6 +65,13 @@ class TrainableV3PartialEngine(V3PartialEngine):
         if self.down_proj.bias is not None:
             active_bias = self.down_proj.bias[self._active_indices]
         active_out = F.linear(hidden, active_weight, active_bias)
+        if not torch.isfinite(active_out).all():
+            raise RuntimeError(
+                f"active_out contains NaN/Inf: "
+                f"hidden finite={torch.isfinite(hidden).all().item()}, "
+                f"weight finite={torch.isfinite(active_weight).all().item()}, "
+                f"active abs max={torch.nan_to_num(active_out.detach().float()).abs().max().item():.2e}"
+            )
 
         # --- LUT fill ---
         if len(replaced_groups) == 0:
@@ -86,6 +93,13 @@ class TrainableV3PartialEngine(V3PartialEngine):
                 lut_outputs = self._lut_fill_loop(B, S, normed_x, device, dtype)
         else:
             lut_outputs = self._lut_fill_loop(B, S, normed_x, device, dtype)
+
+        if not torch.isfinite(lut_outputs).all():
+            raise RuntimeError(
+                f"lut_outputs contains NaN/Inf: "
+                f"normed_x finite={torch.isfinite(normed_x).all().item()}, "
+                f"lut abs max={torch.nan_to_num(lut_outputs.detach().float()).abs().max().item():.2e}"
+            )
 
         # --- Assemble ---
         full_out = torch.zeros(B, S, hidden_size, device=device, dtype=dtype)
@@ -145,7 +159,14 @@ def collect_baseline_logits(model, data_loader):
     return all_logits
 
 
-def finetune(model, calib_loader, eval_loader, engine, epochs, lr, output_dir):
+def _check_weight_finite(weight, tag=""):
+    if not torch.isfinite(weight).all():
+        raise RuntimeError(f"{tag}down_proj weight is not finite")
+    w = weight.detach().float()
+    print(f"  [DEBUG] {tag}down_proj weight: finite=True, min={w.min().item():.4e}, max={w.max().item():.4e}, mean={w.mean().item():.4e}")
+
+
+def finetune(model, calib_loader, eval_loader, engine, epochs, lr, output_dir, baseline_eval_probs):
     """Fine-tune down_proj.weight to adapt to LUT presence."""
     device = model.device
     layer = model.model.layers[engine.layer_id]
@@ -156,9 +177,14 @@ def finetune(model, calib_loader, eval_loader, engine, epochs, lr, output_dir):
         p.requires_grad_(False)
     down_proj.weight.requires_grad_(True)
 
-    optimizer = torch.optim.AdamW([down_proj.weight], lr=lr)
+    optimizer = torch.optim.AdamW(
+        [down_proj.weight],
+        lr=lr,
+        weight_decay=0.0,
+        eps=1e-8,
+    )
 
-    # Pre-compute baseline logits (model must stay fp16 here for original down_proj forward)
+    # Pre-compute baseline logits on calibration set (original model, no LUT)
     print("\n[Pre-compute] Collecting baseline logits on calibration set...")
     baseline_logits = collect_baseline_logits(model, calib_loader)
 
@@ -168,6 +194,19 @@ def finetune(model, calib_loader, eval_loader, engine, epochs, lr, output_dir):
 
     # Install engine
     engine.install()
+
+    # Pre-train eval: LUT model vs original model
+    print("\n[Pre-train eval] Baseline evaluation (LUT model, before fine-tuning)...")
+    model.eval()
+    _check_weight_finite(down_proj.weight)
+    with torch.no_grad():
+        baseline_metrics = compute_model_metrics(
+            model,
+            eval_loader,
+            reference_probs_list=baseline_eval_probs,
+        )
+    print(f"  Before: KL={baseline_metrics.get('avg_kl', 0):.4f}, "
+          f"PPL={baseline_metrics['ppl']:.2f}, Acc={baseline_metrics['next_token_acc']:.4f}")
 
     results = []
     for epoch in range(1, epochs + 1):
@@ -184,35 +223,55 @@ def finetune(model, calib_loader, eval_loader, engine, epochs, lr, output_dir):
             if attention_mask is not None:
                 attention_mask = attention_mask.to(device)
 
+            optimizer.zero_grad(set_to_none=True)
+
             # Forward with LUT hook installed
             with torch.autocast(device_type="cuda", dtype=torch.float16):
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
                 logits = outputs.logits  # [B, S, vocab]
+
+            if not torch.isfinite(logits).all():
+                print(f"[WARN] Batch {bi}: non-finite logits, "
+                      f"weight finite={torch.isfinite(down_proj.weight).all().item()}")
+                optimizer.zero_grad(set_to_none=True)
+                continue
 
             # Target: baseline logits for the same batch
             target_logits = baseline_logits[bi].to(device)
 
             # KL divergence loss on next-token prediction
             # logits[:, :-1] predict input_ids[:, 1:]
-            pred = logits[:, :-1, :].contiguous().view(-1, logits.size(-1))
-            target = target_logits[:, :-1, :].contiguous().view(-1, target_logits.size(-1))
+            pred = logits[:, :-1, :].reshape(-1, logits.size(-1)).float()
+            target = target_logits[:, :-1, :].reshape(-1, target_logits.size(-1)).to(device=device, dtype=torch.float32)
 
-            # Compute KL in fp32 for numerical stability
-            pred_f32 = pred.float()
-            target_f32 = target.float()
-            log_probs = F.log_softmax(pred_f32, dim=-1)
-            target_probs = F.softmax(target_f32, dim=-1)
+            log_probs = F.log_softmax(pred, dim=-1)
+            target_log_probs = F.log_softmax(target, dim=-1)
+            target_probs = target_log_probs.exp()
+
             loss = F.kl_div(log_probs, target_probs, reduction="batchmean")
 
-            if torch.isnan(loss) or torch.isinf(loss):
-                print(f"[WARN] Batch {bi} has NaN/Inf loss. Skipping.")
-                optimizer.zero_grad()
+            if not torch.isfinite(loss):
+                print(f"[WARN] Batch {bi}: non-finite loss")
                 continue
 
-            optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(down_proj.weight, max_norm=1.0)
+
+            grad = down_proj.weight.grad
+            if grad is None or not torch.isfinite(grad).all():
+                print(f"[WARN] Batch {bi}: non-finite gradient, skipping update")
+                optimizer.zero_grad(set_to_none=True)
+                continue
+
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                [down_proj.weight],
+                max_norm=1.0,
+                error_if_nonfinite=True,
+            )
+
             optimizer.step()
+
+            if not torch.isfinite(down_proj.weight).all():
+                raise RuntimeError(f"down_proj.weight became NaN/Inf after batch {bi}")
 
             total_loss += loss.item()
             num_batches += 1
@@ -223,9 +282,13 @@ def finetune(model, calib_loader, eval_loader, engine, epochs, lr, output_dir):
         # Evaluate
         print(f"  Evaluating...")
         model.eval()
-        with torch.autocast(device_type="cuda", dtype=torch.float16):
-            reference_probs = compute_baseline_probs(model, eval_loader)
-            metrics = compute_model_metrics(model, eval_loader, reference_probs_list=reference_probs)
+        _check_weight_finite(down_proj.weight)
+        with torch.no_grad():
+            metrics = compute_model_metrics(
+                model,
+                eval_loader,
+                reference_probs_list=baseline_eval_probs,
+            )
 
         print(f"  KL={metrics.get('avg_kl', 0):.4f}, PPL={metrics['ppl']:.2f}, Acc={metrics['next_token_acc']:.4f}")
 
@@ -243,7 +306,7 @@ def finetune(model, calib_loader, eval_loader, engine, epochs, lr, output_dir):
         })
 
     engine.uninstall()
-    return results
+    return baseline_metrics, results
 
 
 def main():
@@ -307,18 +370,19 @@ def main():
             table=ckpt["table"],
         )
 
-    # Baseline eval
-    print("\n[3/3] Baseline evaluation (before fine-tuning)...")
-    engine.install()
-    with torch.autocast(device_type="cuda", dtype=torch.float16):
-        reference_probs = compute_baseline_probs(model, eval_loader)
-        baseline_metrics = compute_model_metrics(model, eval_loader, reference_probs_list=reference_probs)
-    print(f"  Before: KL={baseline_metrics.get('avg_kl', 0):.4f}, "
-          f"PPL={baseline_metrics['ppl']:.2f}, Acc={baseline_metrics['next_token_acc']:.4f}")
-    engine.uninstall()
+    # Pre-compute baseline eval probabilities on original model (no LUT)
+    print("\n[3/3] Collecting baseline eval probabilities (original model, no LUT)...")
+    model.eval()
+    with torch.no_grad():
+        baseline_eval_probs = compute_baseline_probs(model, eval_loader)
 
     # Fine-tune
-    results = finetune(model, calib_loader, eval_loader, engine, args.epochs, args.lr, args.output_dir)
+    print("\n[4/4] Fine-tuning...")
+    baseline_metrics, results = finetune(
+        model, calib_loader, eval_loader, engine,
+        args.epochs, args.lr, args.output_dir,
+        baseline_eval_probs=baseline_eval_probs,
+    )
 
     # Save summary
     summary = {
