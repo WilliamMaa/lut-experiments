@@ -185,8 +185,9 @@ def finetune(model, calib_loader, eval_loader, engine, epochs, lr, output_dir):
                 attention_mask = attention_mask.to(device)
 
             # Forward with LUT hook installed
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            logits = outputs.logits  # [B, S, vocab]
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = outputs.logits  # [B, S, vocab]
 
             # Target: baseline logits for the same batch
             target_logits = baseline_logits[bi].to(device)
@@ -222,8 +223,9 @@ def finetune(model, calib_loader, eval_loader, engine, epochs, lr, output_dir):
         # Evaluate
         print(f"  Evaluating...")
         model.eval()
-        reference_probs = compute_baseline_probs(model, eval_loader)
-        metrics = compute_model_metrics(model, eval_loader, reference_probs_list=reference_probs)
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            reference_probs = compute_baseline_probs(model, eval_loader)
+            metrics = compute_model_metrics(model, eval_loader, reference_probs_list=reference_probs)
 
         print(f"  KL={metrics.get('avg_kl', 0):.4f}, PPL={metrics['ppl']:.2f}, Acc={metrics['next_token_acc']:.4f}")
 
@@ -308,8 +310,9 @@ def main():
     # Baseline eval
     print("\n[3/3] Baseline evaluation (before fine-tuning)...")
     engine.install()
-    reference_probs = compute_baseline_probs(model, eval_loader)
-    baseline_metrics = compute_model_metrics(model, eval_loader, reference_probs_list=reference_probs)
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        reference_probs = compute_baseline_probs(model, eval_loader)
+        baseline_metrics = compute_model_metrics(model, eval_loader, reference_probs_list=reference_probs)
     print(f"  Before: KL={baseline_metrics.get('avg_kl', 0):.4f}, "
           f"PPL={baseline_metrics['ppl']:.2f}, Acc={baseline_metrics['next_token_acc']:.4f}")
     engine.uninstall()
