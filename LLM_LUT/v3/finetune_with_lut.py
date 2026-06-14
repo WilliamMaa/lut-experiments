@@ -200,11 +200,12 @@ def finetune(model, calib_loader, eval_loader, engine, epochs, lr, output_dir, b
     model.eval()
     _check_weight_finite(down_proj.weight)
     with torch.no_grad():
-        baseline_metrics = compute_model_metrics(
-            model,
-            eval_loader,
-            reference_probs_list=baseline_eval_probs,
-        )
+        with torch.autocast(device_type="cuda", dtype=torch.float16):
+            baseline_metrics = compute_model_metrics(
+                model,
+                eval_loader,
+                reference_probs_list=baseline_eval_probs,
+            )
     print(f"  Before: KL={baseline_metrics.get('avg_kl', 0):.4f}, "
           f"PPL={baseline_metrics['ppl']:.2f}, Acc={baseline_metrics['next_token_acc']:.4f}")
 
@@ -284,11 +285,12 @@ def finetune(model, calib_loader, eval_loader, engine, epochs, lr, output_dir, b
         model.eval()
         _check_weight_finite(down_proj.weight)
         with torch.no_grad():
-            metrics = compute_model_metrics(
-                model,
-                eval_loader,
-                reference_probs_list=baseline_eval_probs,
-            )
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                metrics = compute_model_metrics(
+                    model,
+                    eval_loader,
+                    reference_probs_list=baseline_eval_probs,
+                )
 
         print(f"  KL={metrics.get('avg_kl', 0):.4f}, PPL={metrics['ppl']:.2f}, Acc={metrics['next_token_acc']:.4f}")
 
