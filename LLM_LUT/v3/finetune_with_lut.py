@@ -60,10 +60,10 @@ class TrainableV3PartialEngine(V3PartialEngine):
         replaced_groups = sorted(self.group_configs.keys())
 
         # --- Always slice from original weight (no cache) for trainability ---
-        active_weight = self.down_proj.weight[self._active_indices, :]
+        active_weight = self.down_proj.weight[self._active_indices, :].to(dtype)
         active_bias = None
         if self.down_proj.bias is not None:
-            active_bias = self.down_proj.bias[self._active_indices]
+            active_bias = self.down_proj.bias[self._active_indices].to(dtype)
         active_out = F.linear(hidden, active_weight, active_bias)
         if not torch.isfinite(active_out).all():
             raise RuntimeError(
