@@ -287,7 +287,7 @@ def run_benchmarks(data, args):
             out.index_copy_(2, active_indices, active_out)
             # Triton fused LUT fill
             normed_x_flat = normed_x.view(M, hidden_size)
-            lut_out = lut_fill(bin_idx, tables, normed_x_flat, group_starts, addr_mean, addr_std)
+            lut_out = lut_fill(bin_idx, tables, normed_x_flat, group_starts)
             lut_out = lut_out.view(B, S, -1)
             out.index_copy_(2, replaced_indices, lut_out)
             return out
@@ -332,7 +332,7 @@ def run_benchmarks(data, args):
     if TRITON_AVAILABLE:
         def triton_lut_only_fn():
             normed_x_flat = normed_x.view(M, hidden_size)
-            return lut_fill(bin_idx, tables, normed_x_flat, group_starts, addr_mean, addr_std)
+            return lut_fill(bin_idx, tables, normed_x_flat, group_starts)
         try:
             results["triton_lut_only_ms"] = round(benchmark_fn(triton_lut_only_fn), 4)
         except Exception as e:

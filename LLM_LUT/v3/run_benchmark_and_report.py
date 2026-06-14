@@ -43,14 +43,12 @@ def autotune_lut_fill(data, num_autotune_iters=3):
     bin_idx = data["bin_idx"]
     tables = data["tables"]
     group_starts = data["group_starts"]
-    addr_mean = data["addr_mean"]
-    addr_std = data["addr_std"]
     normed_x_flat = normed_x.view(M, hidden_size)
 
     # Warmup + autotune (first few launches compile + tune)
     torch.cuda.synchronize()
     for _ in range(WARMUP):
-        _ = triton_lut_fill(bin_idx, tables, normed_x_flat, group_starts, addr_mean, addr_std)
+        _ = triton_lut_fill(bin_idx, tables, normed_x_flat, group_starts)
         torch.cuda.synchronize()
 
     # Run multiple times and pick best
@@ -60,7 +58,7 @@ def autotune_lut_fill(data, num_autotune_iters=3):
         start = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         start.record()
-        _ = triton_lut_fill(bin_idx, tables, normed_x_flat, group_starts, addr_mean, addr_std)
+        _ = triton_lut_fill(bin_idx, tables, normed_x_flat, group_starts)
         end.record()
         torch.cuda.synchronize()
         times.append(start.elapsed_time(end))

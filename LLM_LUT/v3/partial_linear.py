@@ -58,8 +58,6 @@ class V3PartialEngine:
 
         # Pre-built batched tensors (populated in install)
         self._batched_tables = None        # [num_groups, 64, 64, 64]
-        self._batched_addr_mean = None     # [num_groups, 64]
-        self._batched_addr_std = None      # [num_groups, 64]
         self._group_starts = None          # [num_groups] int32
 
         # Hook state
@@ -162,8 +160,6 @@ class V3PartialEngine:
                     self._batched_tables,
                     normed_x_flat,
                     self._group_starts,
-                    self._batched_addr_mean,
-                    self._batched_addr_std,
                 )
                 lut_outputs = lut_outputs_flat.view(B, S, -1)
             except Exception as e:
@@ -187,7 +183,7 @@ class V3PartialEngine:
         replaced_groups = sorted(self.group_configs.keys())
         lut_outputs = []
         for gid in replaced_groups:
-            addr_idx, addr_mean, addr_std, table = self.group_configs[gid]
+            table = self.group_configs[gid][3]
             bin_idx = self._cached_bin_idx[gid]  # [B, S, 2]
 
             b1 = bin_idx[:, :, 0].view(-1)
@@ -237,12 +233,6 @@ class V3PartialEngine:
         if num_replaced > 0:
             self._batched_tables = torch.stack([
                 self.group_configs[g][3] for g in replaced_groups
-            ], dim=0).to(self.down_proj.weight.device, self.down_proj.weight.dtype)
-            self._batched_addr_mean = torch.stack([
-                self.group_configs[g][1] for g in replaced_groups
-            ], dim=0).to(self.down_proj.weight.device, self.down_proj.weight.dtype)
-            self._batched_addr_std = torch.stack([
-                self.group_configs[g][2] for g in replaced_groups
             ], dim=0).to(self.down_proj.weight.device, self.down_proj.weight.dtype)
             self._group_starts = torch.tensor(
                 [g * self.group_size for g in replaced_groups],
