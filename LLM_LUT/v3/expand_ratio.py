@@ -140,7 +140,7 @@ def eval_multi_group(model, eval_loader, reference_probs, engines):
     return metrics
 
 
-def save_generation_samples(model, tokenizer, engines, output_path, num_prompts=3):
+def save_generation_samples(model, tokenizer, engines, output_path, num_prompts=3, device="cuda:0"):
     """Generate samples for drift detection."""
     for e in engines:
         e.install()
@@ -148,6 +148,7 @@ def save_generation_samples(model, tokenizer, engines, output_path, num_prompts=
         outputs = generate_outputs(
             model, tokenizer, prompts=AUTO_PROMPTS[:num_prompts],
             num_samples=1, max_new_tokens=64,
+            device=device,
         )
     finally:
         for e in engines:
@@ -362,7 +363,7 @@ def main():
 
         # Generation check
         gen_path = os.path.join(args.output_dir, f"gen_g{target}.md")
-        save_generation_samples(model, tokenizer, selected, gen_path, num_prompts=3)
+        save_generation_samples(model, tokenizer, selected, gen_path, num_prompts=3, device=args.device)
 
         progressive_results.append({
             "num_groups": target,
