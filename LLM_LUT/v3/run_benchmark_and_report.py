@@ -32,6 +32,28 @@ from benchmark_latency import (
 from triton_kernels import TRITON_AVAILABLE, triton_lut_fill
 
 
+def compute_lut_storage(checkpoint_dir, layer_id, group_list, group_size=64):
+    """Compute total LUT table storage from per-group checkpoints."""
+    total_table_bytes = 0
+    total_aux_bytes = 0
+    for gid in group_list:
+        ckpt_path = os.path.join(checkpoint_dir, f"replacement_l{layer_id}g{gid}.pt")
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        table = ckpt["table"]
+        total_table_bytes += table.element_size() * table.numel()
+        # aux: addr_idx (2 int64), addr_mean (2 float32), addr_std (2 float32)
+        aux_bytes = 2 * 8 + 2 * 4 + 2 * 4
+        total_aux_bytes += aux_bytes
+    total_bytes = total_table_bytes + total_aux_bytes
+    return {
+        "table_bytes": total_table_bytes,
+        "aux_bytes": total_aux_bytes,
+        "total_bytes": total_bytes,
+        "total_mib": total_bytes / (1024 ** 2),
+        "per_group_table_bytes": total_table_bytes // max(len(group_list), 1),
+    }
+
+
 def autotune_lut_fill(data, num_autotune_iters=3):
     """
     Run benchmark multiple times to let Triton autotune settle,
@@ -283,6 +305,21 @@ def generate_theory_report(results, output_path):
     lines.append("> **重要区分**：在 CIM 上，**功耗节省**是确定性的（与 replacement ratio 成正比），但**延迟改善**取决于 CIM 阵列的 RC 常数是否随 active columns 变化。若 CIM 的 analog array 延迟是固定的（与 N 无关），则延迟改善趋近于零，功耗改善仍为 10.7%。")
     lines.append("")
 
+    # Section 5.5: LUT Storage
+    lines.append("## 5.5 LUT 表存储开销")
+    lines.append("")
+    lut_storage = results.get("lut_storage")
+    if lut_storage:
+        lines.append("- 当前替换 **{} groups ({:.1f}%)** 的 LUT 表总存储: **{:.2f} MiB**".format(
+            current_groups, current_groups * group_size / hidden_size * 100, lut_storage["total_mib"]))
+        lines.append("- 其中 table 数据: {:.2f} MiB，辅助数据 (addr_idx/mean/std): {:.2f} KiB".format(
+            lut_storage["table_bytes"] / (1024**2), lut_storage["aux_bytes"] / 1024))
+        lines.append("- 每个 group 的 64×64×64 table: {:.1f} KiB".format(
+            lut_storage["per_group_table_bytes"] / 1024))
+    else:
+        lines.append("- 未计算 LUT 存储（仅在 real mode 下有效）")
+    lines.append("")
+
     # Section 6: Conclusion
     lines.append("## 6. 结论与建议")
     lines.append("")
@@ -330,6 +367,7 @@ def main():
     parser.add_argument("--output_json", default="results/benchmark_autotune.json")
     parser.add_argument("--output_report", default="results/THEORY_REPORT.md")
     parser.add_argument("--device", default="cuda:0", help="CUDA device to use (e.g. cuda:0, cuda:3)")
+    parser.add_argument("--finetuned_weight", default=None, help="Path to fine-tuned down_proj weight (e.g. epoch3_down_proj.pt)")
     args = parser.parse_args()
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -372,6 +410,13 @@ def main():
         results["v3_triton_autotuned_ms"] = None
 
     # Add metadata
+    # LUT storage (only meaningful in real mode)
+    lut_storage = None
+    if args.mode == "real":
+        lut_storage = compute_lut_storage(args.checkpoint_dir, args.layer, data["replaced_groups"])
+        print(f"  LUT storage: {lut_storage['total_mib']:.2f} MiB total "
+              f"({lut_storage['per_group_table_bytes'] / 1024:.1f} KiB table per group)")
+
     results.update({
         "model": args.model if args.mode == "real" else "dummy",
         "layer": args.layer,
@@ -382,6 +427,7 @@ def main():
         "intermediate_size": data["intermediate_size"],
         "replaced_ratio": (len(data["replaced_groups"]) * 64) / data["hidden_size"],
         "triton_available": TRITON_AVAILABLE,
+        "lut_storage": lut_storage,
     })
 
     # Save JSON

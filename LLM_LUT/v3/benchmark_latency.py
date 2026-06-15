@@ -149,6 +149,14 @@ def benchmark_real(args):
     group_size = 64
     num_groups_total = hidden_size // group_size
 
+    # Load fine-tuned down_proj weight if provided
+    if getattr(args, "finetuned_weight", None):
+        print(f"[Benchmark] Loading fine-tuned weight from {args.finetuned_weight}")
+        ft_weight = torch.load(args.finetuned_weight, map_location="cpu")
+        mlp.down_proj.weight.data.copy_(
+            ft_weight.to(mlp.down_proj.weight.device, mlp.down_proj.weight.dtype)
+        )
+
     hidden = torch.randn(args.batch_size, args.seq_len, intermediate_size, device=device, dtype=torch.float16)
     normed_x = torch.randn(args.batch_size, args.seq_len, hidden_size, device=device, dtype=torch.float16)
 
@@ -353,6 +361,7 @@ def main():
     parser.add_argument("--seq_len", type=int, default=128)
     parser.add_argument("--output", default="results/latency_breakdown.json")
     parser.add_argument("--device", default="cuda:0", help="CUDA device to use (e.g. cuda:0, cuda:3)")
+    parser.add_argument("--finetuned_weight", default=None, help="Path to fine-tuned down_proj weight (e.g. epoch3_down_proj.pt)")
     parser.add_argument("--dummy", action="store_true", help="Use dummy data (no model load)")
     # Dummy mode params
     parser.add_argument("--hidden_size", type=int, default=3584)
