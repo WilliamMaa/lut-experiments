@@ -61,57 +61,60 @@ class TrainableV3PartialEngine(V3PartialEngine):
 
         # Compute active matmul and LUT fill in fp32 for numerical stability,
         # then cast the assembled output back to the model dtype.
+        # Disable autocast so fp32 inputs are not silently cast back to fp16.
         compute_dtype = torch.float32
-        hidden_f32 = hidden.to(compute_dtype)
-        normed_x_f32 = normed_x.to(compute_dtype)
+        with torch.autocast(device_type=device.type, enabled=False):
+            hidden_f32 = hidden.to(compute_dtype)
+            normed_x_f32 = normed_x.to(compute_dtype)
 
-        # --- Always slice from original weight (no cache) for trainability ---
-        active_weight = self.down_proj.weight[self._active_indices, :].to(compute_dtype)
-        active_bias = None
-        if self.down_proj.bias is not None:
-            active_bias = self.down_proj.bias[self._active_indices].to(compute_dtype)
-        active_out = F.linear(hidden_f32, active_weight, active_bias)
-        if not torch.isfinite(active_out).all():
-            raise RuntimeError(
-                f"active_out contains NaN/Inf: "
-                f"hidden finite={torch.isfinite(hidden).all().item()}, "
-                f"weight finite={torch.isfinite(self.down_proj.weight).all().item()}, "
-                f"active abs max={torch.nan_to_num(active_out.detach()).abs().max().item():.2e}"
-            )
-
-        # --- LUT fill in fp32 ---
-        if len(replaced_groups) == 0:
-            lut_outputs = torch.empty(B, S, 0, device=device, dtype=compute_dtype)
-        elif self._batched_tables is not None and self._cached_bin_idx_tensor is not None:
-            M = B * S
-            normed_x_flat = normed_x_f32.view(M, hidden_size)
-            try:
-                tables_f32 = self._batched_tables.to(compute_dtype)
-                lut_outputs_flat = lut_fill(
-                    self._cached_bin_idx_tensor,
-                    tables_f32,
-                    normed_x_flat,
-                    self._group_starts,
+            # --- Always slice from original weight (no cache) for trainability ---
+            active_weight = self.down_proj.weight[self._active_indices, :].to(compute_dtype)
+            active_bias = None
+            if self.down_proj.bias is not None:
+                active_bias = self.down_proj.bias[self._active_indices].to(compute_dtype)
+            active_out = F.linear(hidden_f32, active_weight, active_bias)
+            if not torch.isfinite(active_out).all():
+                raise RuntimeError(
+                    f"active_out contains NaN/Inf: "
+                    f"hidden finite={torch.isfinite(hidden).all().item()}, "
+                    f"weight finite={torch.isfinite(self.down_proj.weight).all().item()}, "
+                    f"active abs max={torch.nan_to_num(active_out.detach()).abs().max().item():.2e}"
                 )
-                lut_outputs = lut_outputs_flat.view(B, S, -1)
-            except Exception as e:
-                print(f"[V3] LUT fill error ({e}), falling back to per-group loop")
+
+            # --- LUT fill in fp32 ---
+            if len(replaced_groups) == 0:
+                lut_outputs = torch.empty(B, S, 0, device=device, dtype=compute_dtype)
+            elif self._batched_tables is not None and self._cached_bin_idx_tensor is not None:
+                M = B * S
+                normed_x_flat = normed_x_f32.view(M, hidden_size)
+                try:
+                    tables_f32 = self._batched_tables.to(compute_dtype)
+                    lut_outputs_flat = lut_fill(
+                        self._cached_bin_idx_tensor,
+                        tables_f32,
+                        normed_x_flat,
+                        self._group_starts,
+                    )
+                    lut_outputs = lut_outputs_flat.view(B, S, -1)
+                except Exception as e:
+                    print(f"[V3] LUT fill error ({e}), falling back to per-group loop")
+                    lut_outputs = self._lut_fill_loop(B, S, normed_x_f32, device, compute_dtype)
+            else:
                 lut_outputs = self._lut_fill_loop(B, S, normed_x_f32, device, compute_dtype)
-        else:
-            lut_outputs = self._lut_fill_loop(B, S, normed_x_f32, device, compute_dtype)
 
-        if not torch.isfinite(lut_outputs).all():
-            raise RuntimeError(
-                f"lut_outputs contains NaN/Inf: "
-                f"normed_x finite={torch.isfinite(normed_x).all().item()}, "
-                f"lut abs max={torch.nan_to_num(lut_outputs.detach()).abs().max().item():.2e}"
-            )
+            if not torch.isfinite(lut_outputs).all():
+                raise RuntimeError(
+                    f"lut_outputs contains NaN/Inf: "
+                    f"normed_x finite={torch.isfinite(normed_x).all().item()}, "
+                    f"lut abs max={torch.nan_to_num(lut_outputs.detach()).abs().max().item():.2e}"
+                )
 
-        # --- Assemble in fp32 and cast back ---
-        full_out = torch.zeros(B, S, hidden_size, device=device, dtype=compute_dtype)
-        full_out = full_out.index_copy_(2, self._active_indices, active_out)
-        if lut_outputs.shape[-1] > 0:
-            full_out = full_out.index_copy_(2, self._replaced_indices, lut_outputs)
+            # --- Assemble in fp32 and cast back ---
+            full_out = torch.zeros(B, S, hidden_size, device=device, dtype=compute_dtype)
+            full_out = full_out.index_copy_(2, self._active_indices, active_out)
+            if lut_outputs.shape[-1] > 0:
+                full_out = full_out.index_copy_(2, self._replaced_indices, lut_outputs)
+
         return full_out.to(dtype)
 
 
