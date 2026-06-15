@@ -180,7 +180,7 @@ def main():
     args = parser.parse_args()
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    used_groups = set(int(g.strip()) for g in args.used_groups.split(","))
+    used_groups = set(int(g.strip()) for g in args.used_groups.split(",") if g.strip())
     layer_id = args.layer
     target_counts = [int(x) for x in args.target_counts.split(",")]
 
