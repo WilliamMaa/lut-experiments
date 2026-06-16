@@ -171,16 +171,23 @@ def main():
     parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--output_root", default="outputs", help="Root output directory for experiments")
-    parser.add_argument("--output_dir", default=None, help="Override output directory (default: output_root/expand_ratio_l{layer})")
+    parser.add_argument("--experiment_name", default=None, help="Experiment name prefix (default: expand_ratio_l{layer})")
     parser.add_argument("--top_k_zero", type=int, default=25, help="How many top zero-ablation groups to evaluate with bucket")
     parser.add_argument("--target_counts", default="8,10,12,14,16", help="Progressive group counts to evaluate")
     parser.add_argument("--device", default="cuda:0", help="CUDA device to use (e.g. cuda:0, cuda:3)")
     args = parser.parse_args()
 
-    if args.output_dir is None:
-        args.output_dir = os.path.join(args.output_root, f"expand_ratio_l{args.layer}")
+    if args.experiment_name is None:
+        args.experiment_name = f"expand_ratio_l{args.layer}"
 
-    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+    # Output paths by artifact type
+    summaries_dir = os.path.join(args.output_root, "summaries")
+    scans_dir = os.path.join(args.output_root, "scans")
+    generation_dir = os.path.join(args.output_root, "generation")
+    checkpoints_root = os.path.join(args.output_root, "checkpoints")
+    for d in [summaries_dir, scans_dir, generation_dir, checkpoints_root]:
+        Path(d).mkdir(parents=True, exist_ok=True)
+
     used_groups = set(int(g.strip()) for g in args.used_groups.split(",") if g.strip())
     layer_id = args.layer
     target_counts = [int(x) for x in args.target_counts.split(",")]
@@ -238,7 +245,8 @@ def main():
     zero_results.sort(key=lambda x: x["kl_zero"], reverse=True)
 
     # Save zero results
-    with open(os.path.join(args.output_dir, "zero_scan.json"), "w") as f:
+    zero_scan_path = os.path.join(scans_dir, f"{args.experiment_name}_zero_scan.json")
+    with open(zero_scan_path, "w") as f:
         json.dump(zero_results, f, indent=2)
 
     print(f"\n[Zero Scan] Top 10 candidates by zero KL:")
@@ -300,7 +308,8 @@ def main():
     # Sort by bucket KL
     bucket_results.sort(key=lambda x: x["kl_bucket"])
 
-    with open(os.path.join(args.output_dir, "bucket_eval.json"), "w") as f:
+    bucket_eval_path = os.path.join(scans_dir, f"{args.experiment_name}_bucket_eval.json")
+    with open(bucket_eval_path, "w") as f:
         # Don't save tensors to JSON
         json.dump([{k: v for k, v in r.items() if k != "table"} for r in bucket_results], f, indent=2)
 
@@ -362,7 +371,7 @@ def main():
         print(f"  KL={metrics.get('avg_kl', 0):.4f}, PPL={metrics['ppl']:.2f}, Acc={metrics['next_token_acc']:.4f}")
 
         # Generation check
-        gen_path = os.path.join(args.output_dir, f"gen_g{target}.md")
+        gen_path = os.path.join(generation_dir, f"{args.experiment_name}_g{target}.md")
         save_generation_samples(model, tokenizer, selected, gen_path, num_prompts=3, device=args.device)
 
         progressive_results.append({
@@ -375,7 +384,7 @@ def main():
         })
 
         # Save checkpoint in v3-compatible format (one file per group)
-        ckpt_dir = os.path.join(args.output_dir, "checkpoints", f"ckpt_g{target}")
+        ckpt_dir = os.path.join(checkpoints_root, f"l{layer_id}", f"g{target}")
         os.makedirs(ckpt_dir, exist_ok=True)
         for e in selected:
             torch.save({
@@ -408,17 +417,18 @@ def main():
         },
         "progressive": progressive_results,
     }
-    with open(os.path.join(args.output_dir, "summary.json"), "w") as f:
+    summary_path = os.path.join(summaries_dir, f"{args.experiment_name}.json")
+    with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
 
     print("\n" + "=" * 70)
     print("EXPAND RATIO COMPLETE")
     print("=" * 70)
-    print(f"Results saved to {args.output_dir}")
-    print(f"  zero_scan.json      — all unused groups zero ablation")
-    print(f"  bucket_eval.json    — top {args.top_k_zero} bucket evaluation")
-    print(f"  summary.json        — progressive multi-group results")
-    print(f"  gen_*.md            — generation samples for drift check")
+    print(f"Output root: {args.output_root}")
+    print(f"  summaries/  — {args.experiment_name}.json")
+    print(f"  scans/      — {args.experiment_name}_zero_scan.json, {args.experiment_name}_bucket_eval.json")
+    print(f"  generation/ — {args.experiment_name}_g*.md")
+    print(f"  checkpoints/l{layer_id}/g*/ — per-group .pt files")
 
 
 if __name__ == "__main__":
