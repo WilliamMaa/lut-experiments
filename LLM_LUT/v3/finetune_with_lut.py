@@ -11,10 +11,10 @@
     cd /data/mingyu/LLM_LUT/v3
     python finetune_with_lut.py \
         --model Qwen/Qwen2.5-7B-Instruct \
-        --layer 21 --groups "26,50,51,4,7,40" \
-        --checkpoint_dir ../v2/results/7B_l21_6group_ckpt \
+        --layer 21 --groups auto \
+        --checkpoint_dir outputs/checkpoints/l21/g16 \
         --epochs 3 --lr 1e-5 \
-        --output_dir results/finetune_l21
+        --output_dir outputs/finetune_l21
 """
 
 import os
@@ -322,8 +322,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--layer", type=int, default=21)
-    parser.add_argument("--groups", default="26,50,51,4,7,40", help="Comma-separated group IDs, or 'auto' to infer from checkpoint_dir")
-    parser.add_argument("--checkpoint_dir", default="results/expand_ratio_l21/checkpoints/ckpt_g16", help="Directory containing replacement_l{layer}g{gid}.pt files")
+    parser.add_argument("--groups", default="auto", help="Comma-separated group IDs, or 'auto' to infer from checkpoint_dir")
+    parser.add_argument("--checkpoint_dir", default="outputs/checkpoints/l21/g16", help="Directory containing replacement_l{layer}g{gid}.pt files")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--calib_size", type=int, default=512)

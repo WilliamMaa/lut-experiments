@@ -14,8 +14,8 @@ Decomposes v3 into:
 Usage (with real checkpoints):
     python benchmark_latency.py \
         --model Qwen/Qwen2.5-7B-Instruct \
-        --layer 21 --groups "26,50,51,4,7,40" \
-        --checkpoint_dir ../v2/results/7B_l21_6group_ckpt
+        --layer 21 --groups auto \
+        --checkpoint_dir outputs/checkpoints/l21/g16
 
 Usage (dummy mode, no model load):
     python benchmark_latency.py --dummy --hidden_size 3584 --intermediate_size 14336 \
@@ -23,6 +23,7 @@ Usage (dummy mode, no model load):
 """
 
 import os
+import glob
 os.environ["ACCELERATE_USE_DEVICE_MAP"] = "false"
 
 import argparse
@@ -62,7 +63,25 @@ def benchmark_fn(fn, *args, warmup=WARMUP, repeats=REPEATS):
     return times[len(times) // 2]  # median
 
 
-def parse_groups(groups_str):
+def parse_groups(groups_str, checkpoint_dir=None, layer_id=None):
+    groups_str = groups_str.strip()
+    if groups_str.lower() == "auto":
+        if checkpoint_dir is None or layer_id is None:
+            raise ValueError("--groups auto requires --checkpoint_dir and --layer")
+        pattern = os.path.join(checkpoint_dir, f"replacement_l{layer_id}g*.pt")
+        paths = sorted(glob.glob(pattern))
+        prefix = f"replacement_l{layer_id}g"
+        suffix = ".pt"
+        group_list = []
+        for p in paths:
+            name = os.path.basename(p)
+            if not (name.startswith(prefix) and name.endswith(suffix)):
+                continue
+            gid = int(name[len(prefix):-len(suffix)])
+            group_list.append(gid)
+        if not group_list:
+            raise ValueError(f"No checkpoints found for layer {layer_id} in {checkpoint_dir}")
+        return sorted(group_list)
     return [int(g.strip()) for g in groups_str.split(",")]
 
 
@@ -141,7 +160,7 @@ def benchmark_real(args):
 
     device = model.device
     layer_id = args.layer
-    group_list = parse_groups(args.groups)
+    group_list = parse_groups(args.groups, checkpoint_dir=args.checkpoint_dir, layer_id=layer_id)
 
     mlp = model.model.layers[layer_id].mlp
     hidden_size = mlp.down_proj.weight.shape[0]
@@ -355,8 +374,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--layer", type=int, default=21)
-    parser.add_argument("--groups", default="26,50,51,4,7,40")
-    parser.add_argument("--checkpoint_dir", default="../v2/results/7B_l21_6group_ckpt")
+    parser.add_argument("--groups", default="auto")
+    parser.add_argument("--checkpoint_dir", default="outputs/checkpoints/l21/g16")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--seq_len", type=int, default=128)
     parser.add_argument("--output", default="outputs/latency_breakdown.json")

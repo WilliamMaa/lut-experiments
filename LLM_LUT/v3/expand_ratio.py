@@ -7,13 +7,13 @@
         --model Qwen/Qwen2.5-7B-Instruct \
         --layer 21 \
         --used_groups "26,50,51,4,7,40" \
-        --output_dir results/expand_ratio_l21
+        --output_root outputs
 
 流程:
     1. Zero ablation 所有未使用 groups（快速筛选）
     2. Top 20 候选做 2D joint bucket 评估
     3. 逐步构建 8/10/12/14/16 group 配置，评估累积效果
-    4. 保存 checkpoint 和 generation 样本
+    4. 保存 checkpoint、summary、scan 和 generation 样本
 """
 
 import os

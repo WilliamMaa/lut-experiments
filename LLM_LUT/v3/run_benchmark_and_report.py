@@ -6,7 +6,7 @@
     python run_benchmark_and_report.py --mode dummy   # 快速模式，无模型加载
     python run_benchmark_and_report.py --mode real \
         --model Qwen/Qwen2.5-7B-Instruct \
-        --checkpoint_dir ../v2/results/7B_l21_6group_ckpt
+        --checkpoint_dir outputs/checkpoints/l21/g16
 
 输出:
     results/benchmark_autotune.json   # 原始 benchmark 数据
@@ -360,8 +360,8 @@ def main():
     parser.add_argument("--mode", choices=["dummy", "real"], default="dummy")
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--layer", type=int, default=21)
-    parser.add_argument("--groups", default="26,50,51,4,7,40")
-    parser.add_argument("--checkpoint_dir", default="../v2/results/7B_l21_6group_ckpt")
+    parser.add_argument("--groups", default="auto")
+    parser.add_argument("--checkpoint_dir", default="outputs/checkpoints/l21/g16")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--seq_len", type=int, default=128)
     parser.add_argument("--output_json", default="outputs/benchmark_autotune.json")
