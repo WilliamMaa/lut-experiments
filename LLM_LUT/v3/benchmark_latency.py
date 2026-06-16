@@ -359,7 +359,7 @@ def main():
     parser.add_argument("--checkpoint_dir", default="../v2/results/7B_l21_6group_ckpt")
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--seq_len", type=int, default=128)
-    parser.add_argument("--output", default="results/latency_breakdown.json")
+    parser.add_argument("--output", default="outputs/latency_breakdown.json")
     parser.add_argument("--device", default="cuda:0", help="CUDA device to use (e.g. cuda:0, cuda:3)")
     parser.add_argument("--finetuned_weight", default=None, help="Path to fine-tuned down_proj weight (e.g. epoch3_down_proj.pt)")
     parser.add_argument("--dummy", action="store_true", help="Use dummy data (no model load)")

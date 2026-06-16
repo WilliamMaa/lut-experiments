@@ -29,20 +29,16 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 V0_DIR = os.path.join(os.path.dirname(__file__), "..", "v0")
-V1_DIR = os.path.join(os.path.dirname(__file__), "..", "v1")
-V2_DIR = os.path.join(os.path.dirname(__file__), "..", "v2")
 sys.path.insert(0, V0_DIR)
-sys.path.insert(0, V1_DIR)
-sys.path.insert(0, V2_DIR)
 
 from data import prepare_data, load_jsonl, TextDataset
 from calibrate import calibrate_llm_address
 from metrics import compute_baseline_probs, compute_model_metrics
 from hooks import PerturbationHook
 from config import get_hook_target
-from train import collect_teacher_targets, build_joint_bucket_table
-from r1_replacement import ReplacementEngine
-from r2_auto_eval import generate_outputs, AUTO_PROMPTS
+from table_builder import collect_teacher_targets, build_joint_bucket_table
+from replacement_engine import ReplacementEngine
+from generation import generate_outputs, AUTO_PROMPTS
 
 
 def load_model_and_data(model_name, calib_size, eval_size, max_seq_len, batch_size, device_str="cuda:0"):
@@ -174,11 +170,15 @@ def main():
     parser.add_argument("--zero_eval_size", type=int, default=64, help="Fast eval size for zero ablation")
     parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--output_dir", default="results/expand_ratio_l21")
+    parser.add_argument("--output_root", default="outputs", help="Root output directory for experiments")
+    parser.add_argument("--output_dir", default=None, help="Override output directory (default: output_root/expand_ratio_l{layer})")
     parser.add_argument("--top_k_zero", type=int, default=25, help="How many top zero-ablation groups to evaluate with bucket")
     parser.add_argument("--target_counts", default="8,10,12,14,16", help="Progressive group counts to evaluate")
     parser.add_argument("--device", default="cuda:0", help="CUDA device to use (e.g. cuda:0, cuda:3)")
     args = parser.parse_args()
+
+    if args.output_dir is None:
+        args.output_dir = os.path.join(args.output_root, f"expand_ratio_l{args.layer}")
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     used_groups = set(int(g.strip()) for g in args.used_groups.split(",") if g.strip())
@@ -375,7 +375,7 @@ def main():
         })
 
         # Save checkpoint in v3-compatible format (one file per group)
-        ckpt_dir = os.path.join(args.output_dir, f"ckpt_g{target}")
+        ckpt_dir = os.path.join(args.output_dir, "checkpoints", f"ckpt_g{target}")
         os.makedirs(ckpt_dir, exist_ok=True)
         for e in selected:
             torch.save({

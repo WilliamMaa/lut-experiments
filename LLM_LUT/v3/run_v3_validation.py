@@ -22,14 +22,12 @@ os.environ["ACCELERATE_USE_DEVICE_MAP"] = "false"
 os.environ["ACCELERATE_MIXED_PRECISION"] = "no"
 
 V0_DIR = os.path.join(os.path.dirname(__file__), "..", "v0")
-V2_DIR = os.path.join(os.path.dirname(__file__), "..", "v2")
 sys.path.insert(0, V0_DIR)
-sys.path.insert(0, V2_DIR)
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from data import prepare_data, load_jsonl, TextDataset
 from metrics import compute_baseline_probs, compute_model_metrics
-from r2_auto_eval import generate_outputs, AUTO_PROMPTS
+from generation import generate_outputs, AUTO_PROMPTS
 
 from partial_linear import V3PartialEngine
 
@@ -225,7 +223,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="V3 Phase 1 Validation")
     parser.add_argument("--model", dest="model_name", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--checkpoint_dir", required=True,
-                        help="Directory containing replacement_*.pt checkpoints from v2")
+                        help="Directory containing replacement_l{layer}g{gid}.pt checkpoints")
     parser.add_argument("--calib_size", type=int, default=512)
     parser.add_argument("--eval_size", type=int, default=128,
                         help="Eval samples for metrics (default 128 for speed)")
@@ -233,7 +231,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--gen_samples", type=int, default=5,
                         help="Generation samples per prompt (default 5 for speed)")
-    parser.add_argument("--output_dir", default="results/v3_validation")
+    parser.add_argument("--output_dir", default="outputs/v3_validation")
     parser.add_argument("--device", default="cuda:0", help="CUDA device to use (e.g. cuda:0, cuda:3)")
     args = parser.parse_args()
     run_v3_validation(args)

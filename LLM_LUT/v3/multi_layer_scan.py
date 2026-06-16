@@ -29,9 +29,7 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 V0_DIR = os.path.join(os.path.dirname(__file__), "..", "v0")
-V2_DIR = os.path.join(os.path.dirname(__file__), "..", "v2")
 sys.path.insert(0, V0_DIR)
-sys.path.insert(0, V2_DIR)
 
 from data import prepare_data, load_jsonl, TextDataset
 from metrics import compute_baseline_probs, compute_model_metrics
@@ -75,20 +73,30 @@ def load_model_and_data(model_name, eval_size, max_seq_len, batch_size, device_s
 
 
 def load_groups_for_layer(checkpoint_root, layer_id, group_count):
-    """Return list of (group_id, checkpoint_path) for a layer config."""
-    ckpt_dir = os.path.join(checkpoint_root, f"expand_ratio_l{layer_id}", f"ckpt_g{group_count}")
-    pattern = os.path.join(ckpt_dir, f"replacement_l{layer_id}g*.pt")
-    paths = sorted(glob.glob(pattern))
-    groups = []
+    """Return list of (group_id, checkpoint_path) for a layer config.
+
+    Supports both new layout (checkpoints/ckpt_g{count}) and old layout (ckpt_g{count}).
+    """
+    candidates = [
+        os.path.join(checkpoint_root, f"expand_ratio_l{layer_id}", "checkpoints", f"ckpt_g{group_count}"),
+        os.path.join(checkpoint_root, f"expand_ratio_l{layer_id}", f"ckpt_g{group_count}"),
+    ]
     prefix = f"replacement_l{layer_id}g"
     suffix = ".pt"
-    for p in paths:
-        name = os.path.basename(p)
-        if not (name.startswith(prefix) and name.endswith(suffix)):
+    for ckpt_dir in candidates:
+        pattern = os.path.join(ckpt_dir, f"replacement_l{layer_id}g*.pt")
+        paths = sorted(glob.glob(pattern))
+        if not paths:
             continue
-        gid = int(name[len(prefix):-len(suffix)])
-        groups.append((gid, p))
-    return groups
+        groups = []
+        for p in paths:
+            name = os.path.basename(p)
+            if not (name.startswith(prefix) and name.endswith(suffix)):
+                continue
+            gid = int(name[len(prefix):-len(suffix)])
+            groups.append((gid, p))
+        return groups
+    return []
 
 
 def build_engine(model, layer_id, group_count, checkpoint_root):
@@ -174,7 +182,7 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--layers", default="19,20,21,22,23", help="Comma-separated candidate layer IDs")
     parser.add_argument("--group_counts", default="4,8,12,16", help="Comma-separated group counts to test per layer")
-    parser.add_argument("--checkpoint_root", default="results", help="Root dir containing expand_ratio_l{layer}/ckpt_g{count}")
+    parser.add_argument("--checkpoint_root", default="outputs", help="Root dir containing expand_ratio_l{layer}/ckpt_g{count}")
     parser.add_argument("--eval_size", type=int, default=128)
     parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=4)

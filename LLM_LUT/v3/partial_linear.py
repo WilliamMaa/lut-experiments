@@ -16,9 +16,7 @@ import sys
 import os
 
 V0_DIR = os.path.join(os.path.dirname(__file__), "..", "v0")
-V2_DIR = os.path.join(os.path.dirname(__file__), "..", "v2")
 sys.path.insert(0, V0_DIR)
-sys.path.insert(0, V2_DIR)
 
 import torch
 import torch.nn.functional as F

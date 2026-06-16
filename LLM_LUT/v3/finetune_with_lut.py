@@ -32,9 +32,7 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 V0_DIR = os.path.join(os.path.dirname(__file__), "..", "v0")
-V2_DIR = os.path.join(os.path.dirname(__file__), "..", "v2")
 sys.path.insert(0, V0_DIR)
-sys.path.insert(0, V2_DIR)
 
 from data import prepare_data, load_jsonl, TextDataset
 from metrics import compute_model_metrics, compute_baseline_probs
@@ -325,14 +323,14 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--layer", type=int, default=21)
     parser.add_argument("--groups", default="26,50,51,4,7,40", help="Comma-separated group IDs, or 'auto' to infer from checkpoint_dir")
-    parser.add_argument("--checkpoint_dir", default="../v2/results/7B_l21_6group_ckpt")
+    parser.add_argument("--checkpoint_dir", default="results/expand_ratio_l21/checkpoints/ckpt_g16", help="Directory containing replacement_l{layer}g{gid}.pt files")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--calib_size", type=int, default=512)
     parser.add_argument("--eval_size", type=int, default=128)
     parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--output_dir", default="results/finetune_l21")
+    parser.add_argument("--output_dir", default="outputs/finetune_l21")
     parser.add_argument("--device", default="cuda:0", help="CUDA device to use (e.g. cuda:0, cuda:3)")
     args = parser.parse_args()
 
