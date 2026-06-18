@@ -1,0 +1,97 @@
+{
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "layer": 21,
+  "used_groups": [],
+  "baseline": {
+    "kl": 0.00017037003122474234,
+    "ppl": 19.554128646850586,
+    "acc": 0.5132605304212169
+  },
+  "current_6group": {
+    "kl": 0.00017037003122474234,
+    "ppl": 19.554128646850586,
+    "acc": 0.5132605304212169
+  },
+  "progressive": [
+    {
+      "num_groups": 4,
+      "group_ids": [
+        45,
+        28,
+        36,
+        48
+      ],
+      "kl": 0.04487387708401027,
+      "ppl": 19.688047409057617,
+      "acc": 0.5226209048361935,
+      "gen_file": "outputs/generation/expand_ratio_l21_g4.md",
+      "checkpoint_dir": "outputs/checkpoints/l21/g4"
+    },
+    {
+      "num_groups": 8,
+      "group_ids": [
+        45,
+        28,
+        36,
+        48,
+        10,
+        42,
+        14,
+        19
+      ],
+      "kl": 0.08384203839383714,
+      "ppl": 20.169923782348633,
+      "acc": 0.53198127925117,
+      "gen_file": "outputs/generation/expand_ratio_l21_g8.md",
+      "checkpoint_dir": "outputs/checkpoints/l21/g8"
+    },
+    {
+      "num_groups": 12,
+      "group_ids": [
+        45,
+        28,
+        36,
+        48,
+        10,
+        42,
+        14,
+        19,
+        25,
+        9,
+        15,
+        20
+      ],
+      "kl": 0.13286891314264845,
+      "ppl": 19.879013061523438,
+      "acc": 0.5382215288611545,
+      "gen_file": "outputs/generation/expand_ratio_l21_g12.md",
+      "checkpoint_dir": "outputs/checkpoints/l21/g12"
+    },
+    {
+      "num_groups": 16,
+      "group_ids": [
+        45,
+        28,
+        36,
+        48,
+        10,
+        42,
+        14,
+        19,
+        25,
+        9,
+        15,
+        20,
+        4,
+        17,
+        0,
+        6
+      ],
+      "kl": 0.18034213036298752,
+      "ppl": 19.976163864135742,
+      "acc": 0.5351014040561622,
+      "gen_file": "outputs/generation/expand_ratio_l21_g16.md",
+      "checkpoint_dir": "outputs/checkpoints/l21/g16"
+    }
+  ]
+}

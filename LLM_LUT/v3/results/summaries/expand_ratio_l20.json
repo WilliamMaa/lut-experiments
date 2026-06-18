@@ -1,0 +1,97 @@
+{
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "layer": 20,
+  "used_groups": [],
+  "baseline": {
+    "kl": 0.00017037003122474234,
+    "ppl": 19.554128646850586,
+    "acc": 0.5132605304212169
+  },
+  "current_6group": {
+    "kl": 0.00017037003122474234,
+    "ppl": 19.554128646850586,
+    "acc": 0.5132605304212169
+  },
+  "progressive": [
+    {
+      "num_groups": 4,
+      "group_ids": [
+        28,
+        16,
+        30,
+        2
+      ],
+      "kl": 0.04951130802908989,
+      "ppl": 19.655441284179688,
+      "acc": 0.5101404056162246,
+      "gen_file": "outputs/generation/expand_ratio_l20_g4.md",
+      "checkpoint_dir": "outputs/checkpoints/l20/g4"
+    },
+    {
+      "num_groups": 8,
+      "group_ids": [
+        28,
+        16,
+        30,
+        2,
+        9,
+        33,
+        36,
+        48
+      ],
+      "kl": 0.09481893867662508,
+      "ppl": 19.82094955444336,
+      "acc": 0.5132605304212169,
+      "gen_file": "outputs/generation/expand_ratio_l20_g8.md",
+      "checkpoint_dir": "outputs/checkpoints/l20/g8"
+    },
+    {
+      "num_groups": 12,
+      "group_ids": [
+        28,
+        16,
+        30,
+        2,
+        9,
+        33,
+        36,
+        48,
+        5,
+        31,
+        26,
+        23
+      ],
+      "kl": 0.13435035454083796,
+      "ppl": 19.678449630737305,
+      "acc": 0.5132605304212169,
+      "gen_file": "outputs/generation/expand_ratio_l20_g12.md",
+      "checkpoint_dir": "outputs/checkpoints/l20/g12"
+    },
+    {
+      "num_groups": 16,
+      "group_ids": [
+        28,
+        16,
+        30,
+        2,
+        9,
+        33,
+        36,
+        48,
+        5,
+        31,
+        26,
+        23,
+        44,
+        51,
+        15,
+        19
+      ],
+      "kl": 0.18773531403443586,
+      "ppl": 19.584657669067383,
+      "acc": 0.5132605304212169,
+      "gen_file": "outputs/generation/expand_ratio_l20_g16.md",
+      "checkpoint_dir": "outputs/checkpoints/l20/g16"
+    }
+  ]
+}

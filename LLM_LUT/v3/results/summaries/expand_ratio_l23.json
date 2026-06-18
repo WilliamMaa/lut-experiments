@@ -1,0 +1,97 @@
+{
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "layer": 23,
+  "used_groups": [],
+  "baseline": {
+    "kl": 0.00017037003122474234,
+    "ppl": 19.554128646850586,
+    "acc": 0.5132605304212169
+  },
+  "current_6group": {
+    "kl": 0.00017037003122474234,
+    "ppl": 19.554128646850586,
+    "acc": 0.5132605304212169
+  },
+  "progressive": [
+    {
+      "num_groups": 4,
+      "group_ids": [
+        18,
+        11,
+        15,
+        27
+      ],
+      "kl": 0.02666025195423871,
+      "ppl": 19.8770751953125,
+      "acc": 0.5132605304212169,
+      "gen_file": "outputs/generation/expand_ratio_l23_g4.md",
+      "checkpoint_dir": "outputs/checkpoints/l23/g4"
+    },
+    {
+      "num_groups": 8,
+      "group_ids": [
+        18,
+        11,
+        15,
+        27,
+        42,
+        16,
+        19,
+        34
+      ],
+      "kl": 0.05717333176568763,
+      "ppl": 19.890647888183594,
+      "acc": 0.516380655226209,
+      "gen_file": "outputs/generation/expand_ratio_l23_g8.md",
+      "checkpoint_dir": "outputs/checkpoints/l23/g8"
+    },
+    {
+      "num_groups": 12,
+      "group_ids": [
+        18,
+        11,
+        15,
+        27,
+        42,
+        16,
+        19,
+        34,
+        9,
+        26,
+        28,
+        0
+      ],
+      "kl": 0.08532504655726969,
+      "ppl": 20.112972259521484,
+      "acc": 0.514820592823713,
+      "gen_file": "outputs/generation/expand_ratio_l23_g12.md",
+      "checkpoint_dir": "outputs/checkpoints/l23/g12"
+    },
+    {
+      "num_groups": 16,
+      "group_ids": [
+        18,
+        11,
+        15,
+        27,
+        42,
+        16,
+        19,
+        34,
+        9,
+        26,
+        28,
+        0,
+        6,
+        4,
+        22,
+        46
+      ],
+      "kl": 0.11464071447310382,
+      "ppl": 20.171890258789062,
+      "acc": 0.514820592823713,
+      "gen_file": "outputs/generation/expand_ratio_l23_g16.md",
+      "checkpoint_dir": "outputs/checkpoints/l23/g16"
+    }
+  ]
+}
