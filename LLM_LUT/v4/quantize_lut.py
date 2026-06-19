@@ -13,7 +13,6 @@ LUT 量化工具：把 v3 生成的 FP32 table checkpoint 量化成 FP16 或 INT
 """
 
 import os
-import sys
 import json
 import glob
 import argparse
@@ -21,9 +20,6 @@ from pathlib import Path
 from typing import Dict
 
 import torch
-
-V3_DIR = os.path.join(os.path.dirname(__file__), "..", "v3")
-sys.path.insert(0, V3_DIR)
 
 
 def quantize_tensor_symmetric_int8(tensor: torch.Tensor) -> Dict:

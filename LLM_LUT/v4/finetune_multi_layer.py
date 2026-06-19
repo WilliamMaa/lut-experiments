@@ -29,19 +29,26 @@ import argparse
 from pathlib import Path
 from typing import List, Tuple, Dict
 
+# Parse --device before importing torch, so we can hide all other GPUs
+# from the process via CUDA_VISIBLE_DEVICES. This avoids multi-GPU bugs.
+_earliest_parser = argparse.ArgumentParser(add_help=False)
+_earliest_parser.add_argument("--device", default="cuda:0")
+_earliest_args, _ = _earliest_parser.parse_known_args()
+
+if _earliest_args.device.startswith("cuda:"):
+    _gpu_id = _earliest_args.device.split(":", 1)[1]
+    os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_id
+    _canonical_device = "cuda:0"
+else:
+    _canonical_device = _earliest_args.device
+
 import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-# Insert v3 and v0 into path so we can reuse their modules without copying.
-V3_DIR = os.path.join(os.path.dirname(__file__), "..", "v3")
-V0_DIR = os.path.join(os.path.dirname(__file__), "..", "v0")
-sys.path.insert(0, V0_DIR)
-sys.path.insert(0, V3_DIR)
-
 from data import prepare_data, load_jsonl, TextDataset
 from metrics import compute_model_metrics, compute_baseline_probs
-from finetune_with_lut import TrainableV3PartialEngine, load_model_and_data, collect_baseline_logits
+from trainable_engine import TrainableV3PartialEngine, load_model_and_data, collect_baseline_logits
 
 
 def parse_layer_configs(arg_str: str) -> List[Tuple[int, int]]:
@@ -301,10 +308,13 @@ def main():
     parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--output_dir", default="results/finetune_all_layers_half")
-    parser.add_argument("--device", default="cuda:0", help="CUDA device to use (e.g. cuda:0)")
+    parser.add_argument("--device", default="cuda:0", help="CUDA device to expose to this process (e.g. cuda:1). Other GPUs are hidden via CUDA_VISIBLE_DEVICES.")
     parser.add_argument("--lut_dtype", default="fp32", choices=["fp32", "fp16", "int8"],
                         help="Dtype of LUT checkpoints on disk. Training itself still uses float.")
     args = parser.parse_args()
+
+    # Use the canonical device derived before torch was imported.
+    args.device = _canonical_device
 
     if args.configs is not None:
         configs = parse_layer_configs(args.configs)

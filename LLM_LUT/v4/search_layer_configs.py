@@ -2,7 +2,7 @@
 非均匀层 group 分配搜索。
 
 基于 v3 expand_ratio 生成的单层敏感度 summary，组合出候选配置，
-用 v3.multi_layer_scan 的 evaluate_multi_layer 评估，输出 Pareto 表。
+用 v4 自带的 V4PartialEngine 评估，输出 Pareto 表。
 
 用法:
     cd LLM_LUT/v4
@@ -14,6 +14,21 @@
 """
 
 import os
+
+# Parse --device before importing torch, so we can hide all other GPUs
+# from the process via CUDA_VISIBLE_DEVICES. This avoids multi-GPU bugs.
+import argparse as _ap
+_earliest_parser = _ap.ArgumentParser(add_help=False)
+_earliest_parser.add_argument("--device", default="cuda:0")
+_earliest_args, _ = _earliest_parser.parse_known_args()
+
+if _earliest_args.device.startswith("cuda:"):
+    _gpu_id = _earliest_args.device.split(":", 1)[1]
+    os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_id
+    _canonical_device = "cuda:0"
+else:
+    _canonical_device = _earliest_args.device
+
 import sys
 import json
 import argparse
@@ -23,17 +38,8 @@ from typing import List, Tuple, Dict
 
 import torch
 
-V3_DIR = os.path.join(os.path.dirname(__file__), "..", "v3")
-V0_DIR = os.path.join(os.path.dirname(__file__), "..", "v0")
-sys.path.insert(0, V0_DIR)
-sys.path.insert(0, V3_DIR)
-
-from multi_layer_scan import (
-    load_model_and_data,
-    compute_mac_reduction,
-    format_bytes,
-)
-from metrics import compute_baseline_probs, compute_model_metrics
+from trainable_engine import load_model_and_data
+from metrics import compute_baseline_probs, compute_model_metrics, compute_mac_reduction, format_bytes
 from partial_linear_quantized import V4PartialEngine
 
 
@@ -205,12 +211,15 @@ def main():
     parser.add_argument("--eval_size", type=int, default=128)
     parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--device", default="cuda:0", help="CUDA device to expose to this process (e.g. cuda:1). Other GPUs are hidden via CUDA_VISIBLE_DEVICES.")
     parser.add_argument("--output_path", default="results/layer_search_pareto.json")
     parser.add_argument("--max_configs", type=int, default=50,
                         help="Maximum number of candidate configurations to evaluate")
     parser.add_argument("--lut_dtype", default="fp32", choices=["fp32", "fp16", "int8"])
     args = parser.parse_args()
+
+    # Use the canonical device derived before torch was imported.
+    args.device = _canonical_device
 
     Path(args.output_path).parent.mkdir(parents=True, exist_ok=True)
     layers = [int(x.strip()) for x in args.layers.split(",")]

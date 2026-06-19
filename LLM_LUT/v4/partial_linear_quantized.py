@@ -23,13 +23,8 @@ LUT SRAM 读取带宽。
     engine.install()
 """
 
-import os
-import sys
-
-V3_DIR = os.path.join(os.path.dirname(__file__), "..", "v3")
-sys.path.insert(0, V3_DIR)
-
 import torch
+
 from partial_linear import V3PartialEngine
 
 
