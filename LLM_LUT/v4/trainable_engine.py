@@ -92,7 +92,7 @@ class TrainableV3PartialEngine(V3PartialEngine):
         return full_out.to(dtype)
 
 
-def load_model_and_data(model_name, calib_size, eval_size, max_seq_len, batch_size, device_str="cuda:0"):
+def load_model_and_data(model_name, eval_size, max_seq_len, batch_size, device_str="cuda:0", calib_size=0):
     device = torch.device(device_str)
     torch.cuda.set_device(device)
 

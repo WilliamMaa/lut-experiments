@@ -262,7 +262,7 @@ def main():
 
     # Load model and data once.
     print("\n[1/2] Loading model and data...")
-    model, tokenizer, eval_loader = load_model_and_data(
+    model, tokenizer, _calib_loader, eval_loader = load_model_and_data(
         args.model, args.eval_size, args.max_seq_len, args.batch_size, device_str=args.device
     )
     hidden_size = model.config.hidden_size
