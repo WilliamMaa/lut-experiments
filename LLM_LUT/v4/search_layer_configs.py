@@ -129,23 +129,25 @@ def load_layer_summary(summary_root: str, layer_id: int) -> Dict:
 
 
 def get_available_group_counts(summary: Dict) -> List[int]:
-    """Extract available group counts from summary's progressive results."""
-    progressive = summary.get("progressive", {})
+    """Extract available group counts from summary's progressive results.
+
+    v3 expand_ratio.py writes progressive as a list of dicts, each with
+    'num_groups' field.
+    """
+    progressive = summary.get("progressive", [])
     counts = []
-    for key in progressive.keys():
-        try:
-            counts.append(int(key))
-        except ValueError:
-            continue
+    for item in progressive:
+        if isinstance(item, dict) and "num_groups" in item:
+            counts.append(int(item["num_groups"]))
     return sorted(counts)
 
 
 def get_ppl_for_count(summary: Dict, count: int) -> float:
     """Return PPL for a given group count, or a large value if missing."""
-    progressive = summary.get("progressive", {})
-    key = str(count)
-    if key in progressive and "ppl" in progressive[key]:
-        return progressive[key]["ppl"]
+    progressive = summary.get("progressive", [])
+    for item in progressive:
+        if isinstance(item, dict) and item.get("num_groups") == count:
+            return item.get("ppl", float("inf"))
     return float("inf")
 
 
