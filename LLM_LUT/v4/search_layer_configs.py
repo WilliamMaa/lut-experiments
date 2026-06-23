@@ -24,7 +24,10 @@ _earliest_args, _ = _earliest_parser.parse_known_args()
 
 if _earliest_args.device.startswith("cuda:"):
     _gpu_id = _earliest_args.device.split(":", 1)[1]
-    os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_id
+    # Only set CUDA_VISIBLE_DEVICES if the user has not already set it.
+    # This respects explicit external isolation like CUDA_VISIBLE_DEVICES=1.
+    if "CUDA_VISIBLE_DEVICES" not in os.environ:
+        os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_id
     _canonical_device = "cuda:0"
 else:
     _canonical_device = _earliest_args.device

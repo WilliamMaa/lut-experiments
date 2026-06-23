@@ -37,7 +37,10 @@ _earliest_args, _ = _earliest_parser.parse_known_args()
 
 if _earliest_args.device.startswith("cuda:"):
     _gpu_id = _earliest_args.device.split(":", 1)[1]
-    os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_id
+    # Only set CUDA_VISIBLE_DEVICES if the user has not already set it.
+    # This respects explicit external isolation like CUDA_VISIBLE_DEVICES=1.
+    if "CUDA_VISIBLE_DEVICES" not in os.environ:
+        os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_id
     _canonical_device = "cuda:0"
 else:
     _canonical_device = _earliest_args.device
@@ -60,8 +63,30 @@ def parse_layer_configs(arg_str: str) -> List[Tuple[int, int]]:
     return configs
 
 
-def load_groups_for_layer(checkpoint_root: str, layer_id: int, group_count: int) -> List[Tuple[int, str]]:
-    """Return list of (group_id, checkpoint_path) for a layer config."""
+def load_layer_summary(checkpoint_root: str, layer_id: int) -> Dict:
+    """Load v3 expand_ratio summary JSON for a layer."""
+    path = os.path.join(checkpoint_root, "summaries", f"expand_ratio_l{layer_id}.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Summary not found: {path}. Run v3/expand_ratio.py first.")
+    with open(path, "r") as f:
+        return json.load(f)
+
+
+def get_group_ids_for_count(summary: Dict, count: int) -> List[int]:
+    """Return the group_ids used for a specific num_groups in the summary."""
+    progressive = summary.get("progressive", [])
+    for item in progressive:
+        if isinstance(item, dict) and item.get("num_groups") == count and "group_ids" in item:
+            return [int(g) for g in item["group_ids"]]
+    return []
+
+
+def load_groups_for_layer(checkpoint_root: str, layer_id: int, group_count: int,
+                          group_ids: List[int] = None) -> List[Tuple[int, str]]:
+    """Return list of (group_id, checkpoint_path) for a layer config.
+
+    If group_ids is provided, only load those groups.
+    """
     ckpt_dir = os.path.join(checkpoint_root, "checkpoints", f"l{layer_id}", f"g{group_count}")
     prefix = f"replacement_l{layer_id}g"
     suffix = ".pt"
@@ -73,14 +98,17 @@ def load_groups_for_layer(checkpoint_root: str, layer_id: int, group_count: int)
         if not (name.startswith(prefix) and name.endswith(suffix)):
             continue
         gid = int(name[len(prefix):-len(suffix)])
+        if group_ids is not None and gid not in group_ids:
+            continue
         groups.append((gid, p))
     return groups
 
 
 def build_engine_for_layer(model, layer_id: int, group_count: int, checkpoint_root: str,
-                           lut_dtype: str = "fp32") -> TrainableV3PartialEngine:
+                           lut_dtype: str = "fp32", summary: Dict = None) -> TrainableV3PartialEngine:
     """Build a TrainableV3PartialEngine for one layer from v3 checkpoints."""
-    groups = load_groups_for_layer(checkpoint_root, layer_id, group_count)
+    group_ids = get_group_ids_for_count(summary, group_count) if summary else None
+    groups = load_groups_for_layer(checkpoint_root, layer_id, group_count, group_ids=group_ids)
     if not groups:
         raise ValueError(f"No checkpoints found for L{layer_id} G{group_count} in {checkpoint_root}")
     if len(groups) != group_count:
@@ -348,9 +376,13 @@ def main():
 
     # Build engines.
     print("\n[2/4] Building V3PartialEngines...")
+    summaries = {lid: load_layer_summary(args.checkpoint_root, lid) for lid, _ in configs}
     engines = []
     for layer_id, group_count in configs:
-        engine = build_engine_for_layer(model, layer_id, group_count, args.checkpoint_root, lut_dtype=args.lut_dtype)
+        engine = build_engine_for_layer(
+            model, layer_id, group_count, args.checkpoint_root,
+            lut_dtype=args.lut_dtype, summary=summaries[layer_id],
+        )
         engines.append(engine)
 
     # Pre-compute baseline eval probabilities (original model, no LUT).
