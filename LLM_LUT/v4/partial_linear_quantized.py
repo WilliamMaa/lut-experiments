@@ -96,6 +96,34 @@ class V4PartialEngine(V3PartialEngine):
             # Restore original quantized configs for save()/inspect.
             self.group_configs = original_group_configs
 
+    def _mlp_pre_hook(self, module, input):
+        """MLP forward pre-hook: cache normed_x and compute bin indices.
+
+        Overrides the parent hook to handle both 4-tuple (fp32/fp16) and
+        7-tuple (int8 quantized) group configs stored in self.group_configs.
+        """
+        normed_x = input[0] if isinstance(input, tuple) else input
+        self._cached_normed_x = normed_x
+
+        replaced_groups = sorted(self.group_configs.keys())
+        num_replaced = len(replaced_groups)
+        B, S = normed_x.shape[:2]
+        device = normed_x.device
+
+        # Compute bin indices for all replaced groups.
+        # group_configs values may be 4-tuple or 7-tuple (v4 quantized format).
+        for gid, cfg in self.group_configs.items():
+            addr_idx, addr_mean, addr_std = cfg[0], cfg[1], cfg[2]
+            bin_idx = self._compute_bin_indices(normed_x, addr_idx, addr_mean, addr_std)
+            self._cached_bin_idx[gid] = bin_idx
+
+        # Batched tensor path for Triton
+        if num_replaced > 0 and self._batched_tables is not None:
+            bin_idx_tensor = torch.empty(B, S, num_replaced, 2, device=device, dtype=torch.int64)
+            for i, gid in enumerate(replaced_groups):
+                bin_idx_tensor[:, :, i, :] = self._cached_bin_idx[gid]
+            self._cached_bin_idx_tensor = bin_idx_tensor.view(B * S, num_replaced, 2)
+
     def save(self, path: str):
         """Save engine state, preserving quantization info."""
         os.makedirs(os.path.dirname(path) if os.path.dirname(path) else ".", exist_ok=True)

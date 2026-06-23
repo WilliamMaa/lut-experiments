@@ -43,8 +43,22 @@ from metrics import compute_baseline_probs, compute_model_metrics, compute_mac_r
 from partial_linear_quantized import V4PartialEngine
 
 
-def load_groups_for_layer(checkpoint_root: str, layer_id: int, group_count: int):
-    """Return list of (group_id, checkpoint_path) for a layer config."""
+def get_group_ids_for_count(summary: Dict, count: int) -> List[int]:
+    """Return the group_ids used for a specific num_groups in the summary."""
+    progressive = summary.get("progressive", [])
+    for item in progressive:
+        if isinstance(item, dict) and item.get("num_groups") == count and "group_ids" in item:
+            return [int(g) for g in item["group_ids"]]
+    return []
+
+
+def load_groups_for_layer(checkpoint_root: str, layer_id: int, group_count: int,
+                          group_ids: List[int] = None):
+    """Return list of (group_id, checkpoint_path) for a layer config.
+
+    If group_ids is provided, only load those groups; otherwise load all
+    checkpoints in the directory.
+    """
     import glob
     ckpt_dir = os.path.join(checkpoint_root, "checkpoints", f"l{layer_id}", f"g{group_count}")
     prefix = f"replacement_l{layer_id}g"
@@ -57,6 +71,8 @@ def load_groups_for_layer(checkpoint_root: str, layer_id: int, group_count: int)
         if not (name.startswith(prefix) and name.endswith(suffix)):
             continue
         gid = int(name[len(prefix):-len(suffix)])
+        if group_ids is not None and gid not in group_ids:
+            continue
         groups.append((gid, p))
     return groups
 
@@ -76,9 +92,10 @@ def compute_lut_storage(configs: List[Tuple[int, int]], checkpoint_root: str,
 
 
 def build_engine_for_layer(model, layer_id: int, group_count: int, checkpoint_root: str,
-                           lut_dtype: str = "fp32") -> V4PartialEngine:
+                           lut_dtype: str = "fp32", summary: Dict = None) -> V4PartialEngine:
     """Build a V4PartialEngine for one layer, supporting quantized checkpoints."""
-    groups = load_groups_for_layer(checkpoint_root, layer_id, group_count)
+    group_ids = get_group_ids_for_count(summary, group_count) if summary else None
+    groups = load_groups_for_layer(checkpoint_root, layer_id, group_count, group_ids=group_ids)
     if not groups:
         raise ValueError(f"No checkpoints found for L{layer_id} G{group_count} in {checkpoint_root}")
     if len(groups) != group_count:
@@ -101,7 +118,7 @@ def build_engine_for_layer(model, layer_id: int, group_count: int, checkpoint_ro
 
 
 def evaluate_multi_layer(model, eval_loader, reference_probs, configs, checkpoint_root,
-                         lut_dtype: str = "fp32"):
+                         lut_dtype: str = "fp32", summaries: Dict[int, Dict] = None):
     """Evaluate a list of (layer_id, group_count) configs installed simultaneously.
 
     Uses V4PartialEngine so INT8/FP16 checkpoints are handled correctly.
@@ -109,7 +126,11 @@ def evaluate_multi_layer(model, eval_loader, reference_probs, configs, checkpoin
     engines = []
     try:
         for layer_id, group_count in configs:
-            engine = build_engine_for_layer(model, layer_id, group_count, checkpoint_root, lut_dtype=lut_dtype)
+            summary = summaries.get(layer_id) if summaries else None
+            engine = build_engine_for_layer(
+                model, layer_id, group_count, checkpoint_root,
+                lut_dtype=lut_dtype, summary=summary,
+            )
             engine.install()
             engines.append(engine)
         metrics = compute_model_metrics(model, eval_loader, reference_probs_list=reference_probs)
@@ -277,13 +298,19 @@ def main():
     baseline_metrics = compute_model_metrics(model, eval_loader, reference_probs_list=None)
     print(f"  Baseline: PPL={baseline_metrics['ppl']:.2f}, Acc={baseline_metrics['next_token_acc']:.4f}")
 
+    # Pre-load summaries for all layers.
+    summaries = {lid: load_layer_summary(args.summary_root, lid) for lid in layers}
+
     # Evaluate each candidate.
     print("\n[Eval] Evaluating candidate configurations...")
     results = []
     for idx, configs in enumerate(candidate_configs, 1):
         print(f"  [{idx}/{len(candidate_configs)}] {configs} ...", end=" ")
         try:
-            metrics = evaluate_multi_layer(model, eval_loader, reference_probs, configs, args.checkpoint_root, lut_dtype=args.lut_dtype)
+            metrics = evaluate_multi_layer(
+                model, eval_loader, reference_probs, configs, args.checkpoint_root,
+                lut_dtype=args.lut_dtype, summaries=summaries,
+            )
             mac_ratio = compute_mac_reduction(configs, hidden_size, intermediate_size, num_layers)
             storage_bytes = compute_lut_storage(configs, args.checkpoint_root)
             entry = {
