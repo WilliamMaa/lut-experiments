@@ -206,7 +206,7 @@ def main():
     parser.add_argument("--layers", default="19,20,21,22,23", help="Comma-separated candidate layer IDs")
     parser.add_argument("--checkpoint_root", default="../v3/outputs",
                         help="Root directory containing checkpoints/l{layer}/g{count}")
-    parser.add_argument("--summary_root", default="../v3/results/summaries",
+    parser.add_argument("--summary_root", default="../v3/outputs/summaries",
                         help="Directory containing expand_ratio_l*.json summary files")
     parser.add_argument("--eval_size", type=int, default=128)
     parser.add_argument("--max_seq_len", type=int, default=512)

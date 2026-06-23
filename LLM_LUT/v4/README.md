@@ -104,7 +104,7 @@ python finetune_multi_layer.py \
 python search_layer_configs.py \
     --model Qwen/Qwen2.5-7B-Instruct \
     --checkpoint_root ../v3/outputs \
-    --summary_root ../v3/results/summaries \
+    --summary_root ../v3/outputs/summaries \
     --output_path results/layer_search_pareto.json
 ```
 
