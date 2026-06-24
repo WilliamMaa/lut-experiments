@@ -329,6 +329,9 @@ def main():
                         help="Used with --layers to assign the same group count to every layer")
     parser.add_argument("--checkpoint_root", default="../v3/outputs",
                         help="Root directory containing checkpoints/l{layer}/g{count}")
+    parser.add_argument("--summary_root", default=None,
+                        help="Root directory containing summaries/expand_ratio_l*.json. "
+                             "Defaults to --checkpoint_root.")
     parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--calib_size", type=int, default=512)
@@ -343,6 +346,9 @@ def main():
 
     # Use the canonical device derived before torch was imported.
     args.device = _canonical_device
+
+    if args.summary_root is None:
+        args.summary_root = args.checkpoint_root
 
     if args.configs is not None:
         configs = parse_layer_configs(args.configs)
@@ -376,7 +382,7 @@ def main():
 
     # Build engines.
     print("\n[2/4] Building V3PartialEngines...")
-    summaries = {lid: load_layer_summary(args.checkpoint_root, lid) for lid, _ in configs}
+    summaries = {lid: load_layer_summary(args.summary_root, lid) for lid, _ in configs}
     engines = []
     for layer_id, group_count in configs:
         engine = build_engine_for_layer(
