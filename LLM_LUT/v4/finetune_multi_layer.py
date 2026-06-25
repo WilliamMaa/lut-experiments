@@ -342,6 +342,9 @@ def main():
     parser.add_argument("--device", default="cuda:0", help="CUDA device to expose to this process (e.g. cuda:1). Other GPUs are hidden via CUDA_VISIBLE_DEVICES.")
     parser.add_argument("--lut_dtype", default="fp32", choices=["fp32", "fp16", "int8"],
                         help="Dtype of LUT checkpoints on disk. Training itself still uses float.")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Directory containing l*_epoch*_down_proj.pt checkpoints to resume from. "
+                             "If provided, the latest epoch is loaded as the starting point.")
     args = parser.parse_args()
 
     # Use the canonical device derived before torch was imported.
@@ -390,6 +393,42 @@ def main():
             lut_dtype=args.lut_dtype, summary=summaries[layer_id],
         )
         engines.append(engine)
+
+    # Resume from previous down_proj checkpoints if requested.
+    if args.resume is not None:
+        print(f"\n[Resume] Loading down_proj weights from {args.resume}...")
+        resume_epochs = {}
+        for layer_id, _ in configs:
+            pattern = os.path.join(args.resume, f"l{layer_id}_epoch*_down_proj.pt")
+            paths = sorted(glob.glob(pattern))
+            if not paths:
+                raise FileNotFoundError(f"No resume checkpoint found for L{layer_id} in {args.resume}")
+            # Extract epoch number and pick the largest one.
+            best_path = None
+            best_epoch = -1
+            for p in paths:
+                name = os.path.basename(p)
+                prefix = f"l{layer_id}_epoch"
+                suffix = "_down_proj.pt"
+                if name.startswith(prefix) and name.endswith(suffix):
+                    epoch_str = name[len(prefix):-len(suffix)]
+                    try:
+                        epoch = int(epoch_str)
+                        if epoch > best_epoch:
+                            best_epoch = epoch
+                            best_path = p
+                    except ValueError:
+                        continue
+            if best_path is None:
+                raise FileNotFoundError(f"No valid resume checkpoint for L{layer_id} in {args.resume}")
+            resume_epochs[layer_id] = best_epoch
+            ckpt = torch.load(best_path, map_location="cpu")
+            down_proj = model.model.layers[layer_id].mlp.down_proj
+            target_device = down_proj.weight.device
+            target_dtype = down_proj.weight.dtype
+            down_proj.weight.data = ckpt.to(device=target_device, dtype=target_dtype)
+        print(f"  Resumed from epoch {max(resume_epochs.values())}: " +
+              ", ".join(f"L{lid}:ep{ep}" for lid, ep in sorted(resume_epochs.items())))
 
     # Pre-compute baseline eval probabilities (original model, no LUT).
     print("\n[3/4] Collecting baseline eval probabilities (original model, no LUT)...")
