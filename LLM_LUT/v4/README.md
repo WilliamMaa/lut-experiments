@@ -42,14 +42,18 @@ LLM_LUT/v4/
 
 ## 多 GPU 隔离
 
-v4 脚本会在 `import torch` **之前**根据 `--device` 自动设置 `CUDA_VISIBLE_DEVICES`，让进程只能看到目标 GPU，避免多卡切片/死锁 bug。例如：
+默认情况下，`--device` 会直接把对应设备字符串（如 `cuda:1`）传给所有函数，不再自动修改 `CUDA_VISIBLE_DEVICES`。这样调试更直观，也避免某些驱动/环境下因提前设置 `CUDA_VISIBLE_DEVICES` 导致的初始化失败。
 
 ```bash
 python finetune_multi_layer.py --device cuda:1 ...
-# 等价于 CUDA_VISIBLE_DEVICES=1 python finetune_multi_layer.py --device cuda:0 ...
 ```
 
-脚本内部会把 device 规范化为 `cuda:0`。
+如果你仍希望进程只看到一个 GPU（老行为，可彻底避免多卡切片/死锁 bug），请加 `--isolate_gpu`：
+
+```bash
+python finetune_multi_layer.py --device cuda:1 --isolate_gpu ...
+# 等价于 CUDA_VISIBLE_DEVICES=1 python finetune_multi_layer.py --device cuda:0 ...
+```
 
 ## 前置数据
 

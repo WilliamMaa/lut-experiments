@@ -94,7 +94,23 @@ class TrainableV3PartialEngine(V3PartialEngine):
 
 def load_model_and_data(model_name, eval_size, max_seq_len, batch_size, device_str="cuda:0", calib_size=0):
     device = torch.device(device_str)
-    torch.cuda.set_device(device)
+
+    # Print what PyTorch sees before touching CUDA, so environment problems are obvious.
+    print(f"[load_model_and_data] requested device: {device_str}")
+    print(f"[load_model_and_data] torch.version.cuda = {torch.version.cuda}")
+    print(f"[load_model_and_data] torch.cuda.is_available() = {torch.cuda.is_available()}")
+    print(f"[load_model_and_data] torch.cuda.device_count() = {torch.cuda.device_count()}")
+
+    try:
+        torch.cuda.set_device(device)
+    except RuntimeError as e:
+        raise RuntimeError(
+            f"Failed to set CUDA device {device_str}. "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<not set>')}. "
+            f"torch.version.cuda={torch.version.cuda}. "
+            f"This usually means PyTorch cannot initialise CUDA (driver/runtime mismatch, "
+            f"bad GPU state, or CUDA libraries missing). Original error: {e}"
+        ) from e
 
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:

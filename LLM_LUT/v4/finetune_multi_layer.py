@@ -29,18 +29,19 @@ import argparse
 from pathlib import Path
 from typing import List, Tuple, Dict
 
-# Parse --device before importing torch, so we can hide all other GPUs
-# from the process via CUDA_VISIBLE_DEVICES. This avoids multi-GPU bugs.
+# Parse --device / --isolate_gpu before importing torch.  By default we do NOT
+# manipulate CUDA_VISIBLE_DEVICES; the user passes the exact device (e.g. cuda:1)
+# and every function uses that device explicitly.  If --isolate_gpu is set, we
+# restore the old behaviour of hiding other GPUs via CUDA_VISIBLE_DEVICES before
+# torch is imported.
 _earliest_parser = argparse.ArgumentParser(add_help=False)
 _earliest_parser.add_argument("--device", default="cuda:0")
+_earliest_parser.add_argument("--isolate_gpu", action="store_true")
 _earliest_args, _ = _earliest_parser.parse_known_args()
 
-if _earliest_args.device.startswith("cuda:"):
+if _earliest_args.isolate_gpu and _earliest_args.device.startswith("cuda:"):
     _gpu_id = _earliest_args.device.split(":", 1)[1]
-    # Only set CUDA_VISIBLE_DEVICES if the user has not already set it.
-    # This respects explicit external isolation like CUDA_VISIBLE_DEVICES=1.
-    if "CUDA_VISIBLE_DEVICES" not in os.environ:
-        os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_id
+    os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_id
     _canonical_device = "cuda:0"
 else:
     _canonical_device = _earliest_args.device
@@ -350,7 +351,8 @@ def main():
     parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--output_dir", default="results/finetune_all_layers_half")
-    parser.add_argument("--device", default="cuda:0", help="CUDA device to expose to this process (e.g. cuda:1). Other GPUs are hidden via CUDA_VISIBLE_DEVICES.")
+    parser.add_argument("--device", default="cuda:0", help="CUDA device to use, e.g. cuda:1. The exact device string is passed through to all functions.")
+    parser.add_argument("--isolate_gpu", action="store_true", help="Set CUDA_VISIBLE_DEVICES before importing torch so that cuda:0 maps to the requested GPU. Old behaviour; off by default.")
     parser.add_argument("--lut_dtype", default="fp32", choices=["fp32", "fp16", "int8"],
                         help="Dtype of LUT checkpoints on disk. Training itself still uses float.")
     parser.add_argument("--resume", type=str, default=None,
