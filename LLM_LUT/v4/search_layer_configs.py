@@ -144,8 +144,15 @@ def evaluate_multi_layer(model, eval_loader, reference_probs, configs, checkpoin
 
 
 def load_layer_summary(summary_root: str, layer_id: int) -> Dict:
-    """Load v3 expand_ratio summary JSON for a layer."""
+    """Load v3 expand_ratio summary JSON for a layer.
+
+    Supports both ``summary_root/expand_ratio_l*.json`` and
+    ``summary_root/summaries/expand_ratio_l*.json`` for compatibility with
+    ``finetune_multi_layer.py``.
+    """
     path = os.path.join(summary_root, f"expand_ratio_l{layer_id}.json")
+    if not os.path.exists(path):
+        path = os.path.join(summary_root, "summaries", f"expand_ratio_l{layer_id}.json")
     if not os.path.exists(path):
         raise FileNotFoundError(f"Summary not found: {path}. Run v3/expand_ratio.py first.")
     with open(path, "r") as f:
