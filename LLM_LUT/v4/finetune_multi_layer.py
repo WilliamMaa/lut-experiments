@@ -203,6 +203,8 @@ def finetune_multi_layer(model, calib_loader, eval_loader, engines: List[Trainab
 
     trainable_params = [model.model.layers[engine.layer_id].mlp.down_proj.weight for engine in engines
                         if engine.layer_id not in freeze_layer_set]
+    trainable_down_projs = [model.model.layers[engine.layer_id].mlp.down_proj for engine in engines
+                            if engine.layer_id not in freeze_layer_set]
     optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0.0, eps=1e-8)
 
     # Pre-compute baseline logits (original model, no LUT).
@@ -271,8 +273,9 @@ def finetune_multi_layer(model, calib_loader, eval_loader, engines: List[Trainab
 
             loss.backward()
 
+            # Only check gradients for trainable layers; frozen layers have None grad.
             grads_finite = True
-            for dp in down_projs:
+            for dp in trainable_down_projs:
                 grad = dp.weight.grad
                 if grad is None or not torch.isfinite(grad).all():
                     grads_finite = False
