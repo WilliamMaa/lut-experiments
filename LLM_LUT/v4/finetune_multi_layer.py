@@ -174,7 +174,10 @@ def format_bytes(n: int) -> str:
 
 def finetune_multi_layer(model, calib_loader, eval_loader, engines: List[TrainableV3PartialEngine],
                          epochs: int, lr: float, output_dir: str, baseline_eval_probs,
-                         configs: List[Tuple[int, int]]) -> Tuple[Dict, List[Dict]]:
+                         configs: List[Tuple[int, int]],
+                         freeze_layer_set: set = None) -> Tuple[Dict, List[Dict]]:
+    if freeze_layer_set is None:
+        freeze_layer_set = set()
     """Joint fine-tune multiple layers' down_proj weights with LUT installed."""
     device = model.device
 
@@ -463,6 +466,7 @@ def main():
         args.epochs, args.lr, args.output_dir,
         baseline_eval_probs=baseline_eval_probs,
         configs=configs,
+        freeze_layer_set=freeze_layer_set,
     )
 
     mac_reduction = compute_mac_reduction(configs, hidden_size, intermediate_size, num_layers)
