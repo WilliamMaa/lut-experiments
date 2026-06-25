@@ -186,10 +186,17 @@ def finetune_multi_layer(model, calib_loader, eval_loader, engines: List[Trainab
 
     for p in model.parameters():
         p.requires_grad_(False)
-    for dp in down_projs:
-        dp.weight.requires_grad_(True)
+    for engine in engines:
+        layer_id = engine.layer_id
+        dp = model.model.layers[layer_id].mlp.down_proj
+        if layer_id in freeze_layer_set:
+            dp.weight.requires_grad_(False)
+            print(f"  [Freeze] L{layer_id} down_proj is frozen")
+        else:
+            dp.weight.requires_grad_(True)
 
-    trainable_params = [dp.weight for dp in down_projs]
+    trainable_params = [model.model.layers[engine.layer_id].mlp.down_proj.weight for engine in engines
+                        if engine.layer_id not in freeze_layer_set]
     optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0.0, eps=1e-8)
 
     # Pre-compute baseline logits (original model, no LUT).
@@ -293,9 +300,10 @@ def finetune_multi_layer(model, calib_loader, eval_loader, engines: List[Trainab
 
         print(f"  KL={metrics.get('avg_kl', 0):.4f}, PPL={metrics['ppl']:.2f}, Acc={metrics['next_token_acc']:.4f}")
 
-        # Save per-layer weights.
+        # Save per-layer weights (all layers, including frozen ones).
         epoch_paths = {}
-        for dp, (layer_id, _), orig_dtype in zip(down_projs, configs, original_dtypes):
+        for engine, (layer_id, _), orig_dtype in zip(engines, configs, original_dtypes):
+            dp = model.model.layers[layer_id].mlp.down_proj
             ckpt_name = f"l{layer_id}_epoch{epoch}_down_proj.pt"
             ckpt_path = os.path.join(output_dir, ckpt_name)
             torch.save(dp.weight.data.to(orig_dtype).cpu(), ckpt_path)
@@ -344,7 +352,11 @@ def main():
                         help="Dtype of LUT checkpoints on disk. Training itself still uses float.")
     parser.add_argument("--resume", type=str, default=None,
                         help="Directory containing l*_epoch*_down_proj.pt checkpoints to resume from. "
-                             "If provided, the latest epoch is loaded as the starting point.")
+                             "If provided, the latest epoch is loaded as the starting point. "
+                             "Missing layers are left uninitialized (useful for staged training).")
+    parser.add_argument("--freeze_layers", type=str, default=None,
+                        help="Comma-separated layer IDs whose down_proj weights are loaded/frozen and "
+                             "excluded from training. Useful for staged training.")
     args = parser.parse_args()
 
     # Use the canonical device derived before torch was imported.
@@ -352,6 +364,10 @@ def main():
 
     if args.summary_root is None:
         args.summary_root = args.checkpoint_root
+
+    freeze_layer_set = set()
+    if args.freeze_layers is not None:
+        freeze_layer_set = {int(x.strip()) for x in args.freeze_layers.split(",")}
 
     if args.configs is not None:
         configs = parse_layer_configs(args.configs)
@@ -420,15 +436,19 @@ def main():
                     except ValueError:
                         continue
             if best_path is None:
-                raise FileNotFoundError(f"No valid resume checkpoint for L{layer_id} in {args.resume}")
+                print(f"  [WARN] No resume checkpoint for L{layer_id}; leaving as current weight")
+                continue
             resume_epochs[layer_id] = best_epoch
             ckpt = torch.load(best_path, map_location="cpu")
             down_proj = model.model.layers[layer_id].mlp.down_proj
             target_device = down_proj.weight.device
             target_dtype = down_proj.weight.dtype
             down_proj.weight.data = ckpt.to(device=target_device, dtype=target_dtype)
-        print(f"  Resumed from epoch {max(resume_epochs.values())}: " +
-              ", ".join(f"L{lid}:ep{ep}" for lid, ep in sorted(resume_epochs.items())))
+        if resume_epochs:
+            print(f"  Resumed from epoch {max(resume_epochs.values())}: " +
+                  ", ".join(f"L{lid}:ep{ep}" for lid, ep in sorted(resume_epochs.items())))
+        else:
+            print("  No layers were resumed.")
 
     # Pre-compute baseline eval probabilities (original model, no LUT).
     print("\n[3/4] Collecting baseline eval probabilities (original model, no LUT)...")
