@@ -418,6 +418,8 @@ def main():
         engines.append(engine)
 
     # Resume from previous down_proj checkpoints if requested.
+    # Missing layers are left uninitialized (useful for staged training where
+    # some layers are added in the current stage).
     if args.resume is not None:
         print(f"\n[Resume] Loading down_proj weights from {args.resume}...")
         resume_epochs = {}
@@ -425,7 +427,8 @@ def main():
             pattern = os.path.join(args.resume, f"l{layer_id}_epoch*_down_proj.pt")
             paths = sorted(glob.glob(pattern))
             if not paths:
-                raise FileNotFoundError(f"No resume checkpoint found for L{layer_id} in {args.resume}")
+                print(f"  [WARN] No resume checkpoint for L{layer_id}; leaving as current weight")
+                continue
             # Extract epoch number and pick the largest one.
             best_path = None
             best_epoch = -1
