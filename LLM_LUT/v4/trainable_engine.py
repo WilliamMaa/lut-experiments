@@ -112,19 +112,27 @@ def load_model_and_data(model_name, eval_size, max_seq_len, batch_size, device_s
             f"bad GPU state, or CUDA libraries missing). Original error: {e}"
         ) from e
 
+    print(f"[load_model_and_data] current CUDA device: {torch.cuda.get_device_name(device)}")
+
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
+    # Load to CPU first, then explicitly move to the requested single device.
+    # This avoids accelerate/device_map dispatching and guarantees the model is
+    # on exactly the GPU we specified.
     model = AutoModelForCausalLM.from_pretrained(
         model_name, torch_dtype=torch.float16,
-        device_map=device_str, low_cpu_mem_usage=True,
     )
+    model = model.to(device)
     model.eval()
+
+    print(f"[load_model_and_data] model device: {model.device}")
+    print(f"[load_model_and_data] GPU memory allocated: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GiB")
 
     for i in range(torch.cuda.device_count()):
         if i != device.index and torch.cuda.memory_allocated(i) > 0:
-            print(f"[WARN] GPU {i} has allocated memory; proceeding because device_map={device_str} is explicit single-GPU.")
+            print(f"[WARN] GPU {i} has allocated memory; proceeding because explicit single-GPU loading was requested.")
 
     # Reuse the same calib/eval data location as v0/v3.
     base_dir = os.path.dirname(os.path.abspath(__file__))

@@ -28,7 +28,9 @@ _earliest_args, _ = _earliest_parser.parse_known_args()
 
 if _earliest_args.isolate_gpu and _earliest_args.device.startswith("cuda:"):
     _gpu_id = _earliest_args.device.split(":", 1)[1]
-    os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_id
+    # Respect an explicit external CUDA_VISIBLE_DEVICES (e.g. CUDA_VISIBLE_DEVICES=1).
+    if "CUDA_VISIBLE_DEVICES" not in os.environ:
+        os.environ["CUDA_VISIBLE_DEVICES"] = _gpu_id
     _canonical_device = "cuda:0"
 else:
     _canonical_device = _earliest_args.device
