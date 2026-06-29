@@ -423,10 +423,16 @@ def main():
     # Resume from previous down_proj checkpoints if requested.
     # Missing layers are left uninitialized (useful for staged training where
     # some layers are added in the current stage).
+    # When --freeze_layers is specified, only resume the frozen layers; trainable
+    # layers are re-initialized from the base model / v3 checkpoint. This is
+    # necessary when the current stage changes group counts for some layers.
     if args.resume is not None:
         print(f"\n[Resume] Loading down_proj weights from {args.resume}...")
         resume_epochs = {}
         for layer_id, _ in configs:
+            if freeze_layer_set and layer_id not in freeze_layer_set:
+                print(f"  [Skip] L{layer_id} is trainable in this stage; using base weight")
+                continue
             pattern = os.path.join(args.resume, f"l{layer_id}_epoch*_down_proj.pt")
             paths = sorted(glob.glob(pattern))
             if not paths:
