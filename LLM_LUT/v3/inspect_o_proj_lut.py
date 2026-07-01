@@ -217,26 +217,23 @@ def inspect_layer(model, tokenizer, layer_id: int, calib_batch, eval_batch,
     try:
         model.eval()
         with torch.no_grad():
-            for key in ["input_ids", "attention_mask"]:
-                if key in calib_batch:
-                    calib_batch[key] = calib_batch[key].to(device)
-                if key in eval_batch:
-                    eval_batch[key] = eval_batch[key].to(device)
+            calib_inputs = {k: v.to(device) for k, v in calib_batch.items()}
+            eval_inputs = {k: v.to(device) for k, v in eval_batch.items()}
 
             with torch.autocast(device_type="cuda", dtype=torch.float16):
-                _ = model(**calib_batch)
-                _ = model(**eval_batch)
+                _ = model(**calib_inputs)
+                _ = model(**eval_inputs)
     finally:
         handle.remove()
 
-    # Combine calibration tokens.
-    calib_inputs = torch.cat([x.view(-1, hidden_size) for x in captured["input"][:len(calib_batch["input_ids"])]], dim=0)
-    calib_outputs = torch.cat([x.view(-1, hidden_size) for x in captured["output"][:len(calib_batch["input_ids"])]], dim=0)
+    # We called model(**calib_batch) then model(**eval_batch); the hook fired twice.
+    if len(captured["input"]) < 2:
+        raise RuntimeError(f"Expected 2 hook captures (calib + eval), got {len(captured['input'])}")
 
-    # Combine eval tokens.
-    eval_offset = len(calib_batch["input_ids"])
-    eval_inputs = torch.cat([x.view(-1, hidden_size) for x in captured["input"][eval_offset:]], dim=0)
-    eval_outputs = torch.cat([x.view(-1, hidden_size) for x in captured["output"][eval_offset:]], dim=0)
+    calib_inputs = captured["input"][0].view(-1, hidden_size)
+    calib_outputs = captured["output"][0].view(-1, hidden_size)
+    eval_inputs = captured["input"][1].view(-1, hidden_size)
+    eval_outputs = captured["output"][1].view(-1, hidden_size)
 
     # Select good address channels using calib data (first group only for speed).
     addr_idx, _ = select_address_channels(calib_inputs, calib_outputs, group_size, num_bins)
