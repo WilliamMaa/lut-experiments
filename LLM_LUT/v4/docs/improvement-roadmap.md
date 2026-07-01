@@ -116,8 +116,8 @@ stage 3 用 INT8 全层，PPL 崩到 35+。不一定是 group 数太多，可能
 | `o_proj` | [hidden_size, hidden_size] | attention 输出，可能敏感 |
 
 ### 方法
-1. 选择 1-2 个候选模块（建议先 `gate_proj`）。
-2. 在 v3 中生成这些模块的 per-layer LUT checkpoint。
+1. 先用独立检查脚本（不改动现有 v3 down_proj 流程）探测候选模块的可行性。
+2. 如果检查通过，再在 v3 中生成该模块的 per-layer LUT checkpoint。
 3. 用少量层做替换实验，测量 PPL 影响。
 4. 如果某模块比 `down_proj` 更耐受，扩展到多层。
 
