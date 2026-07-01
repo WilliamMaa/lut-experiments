@@ -364,6 +364,9 @@ def main():
                         help="Directory containing l*_epoch*_down_proj.pt checkpoints to resume from. "
                              "If provided, the latest epoch is loaded as the starting point. "
                              "Missing layers are left uninitialized (useful for staged training).")
+    parser.add_argument("--resume_best_epoch", action="store_true",
+                        help="When resuming, load the epoch with the lowest PPL from summary.json "
+                             "instead of the latest epoch.")
     parser.add_argument("--freeze_layers", type=str, default=None,
                         help="Comma-separated layer IDs whose down_proj weights are loaded/frozen and "
                              "excluded from training. Useful for staged training.")
@@ -438,7 +441,22 @@ def main():
             if not paths:
                 print(f"  [WARN] No resume checkpoint for L{layer_id}; leaving as current weight")
                 continue
-            # Extract epoch number and pick the largest one.
+
+            # Determine target epoch: latest or best PPL from summary.json.
+            target_epoch = None
+            if args.resume_best_epoch:
+                summary_path = os.path.join(args.resume, "summary.json")
+                if os.path.exists(summary_path):
+                    try:
+                        with open(summary_path, "r") as f:
+                            summary = json.load(f)
+                        best_entry = min(summary.get("after", []), key=lambda e: e.get("ppl", float("inf")))
+                        target_epoch = best_entry.get("epoch")
+                        print(f"  [Resume] Using best epoch {target_epoch} (PPL={best_entry.get('ppl', 0):.2f}) from summary.json")
+                    except Exception as e:
+                        print(f"  [WARN] Failed to load summary.json for best epoch selection: {e}; falling back to latest epoch")
+
+            # Extract epoch number and pick the target or largest one.
             best_path = None
             best_epoch = -1
             for p in paths:
@@ -449,6 +467,10 @@ def main():
                     epoch_str = name[len(prefix):-len(suffix)]
                     try:
                         epoch = int(epoch_str)
+                        if target_epoch is not None and epoch == target_epoch:
+                            best_epoch = epoch
+                            best_path = p
+                            break
                         if epoch > best_epoch:
                             best_epoch = epoch
                             best_path = p
