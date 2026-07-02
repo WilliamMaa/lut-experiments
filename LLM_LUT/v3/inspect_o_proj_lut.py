@@ -110,7 +110,7 @@ def build_lut_for_layer(inputs: torch.Tensor, outputs: torch.Tensor,
 
     num_cells = num_bins * num_bins
     table = torch.zeros(num_cells, hidden_size, device=outputs.device, dtype=outputs.dtype)
-    counts = torch.zeros(num_cells, device=outputs.device, dtype=outputs.dtype)
+    counts = torch.zeros(num_cells, device=outputs.device, dtype=torch.float32)
 
     # Vectorized accumulation: scatter_add over all tokens.
     flat_idx_exp = flat_idx.unsqueeze(1).expand(-1, hidden_size)
