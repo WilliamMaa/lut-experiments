@@ -91,7 +91,8 @@ def compute_address_bins(x: torch.Tensor, addr_idx: torch.Tensor,
 
 
 def build_lut_for_layer(inputs: torch.Tensor, outputs: torch.Tensor,
-                        group_size: int, num_bins: int, addr_idx: torch.Tensor) -> torch.Tensor:
+                        group_size: int, num_bins: int, addr_idx: torch.Tensor,
+                        use_residual: bool = False) -> torch.Tensor:
     """
     Build a 2D LUT table for one layer's o_proj.
 
@@ -101,6 +102,9 @@ def build_lut_for_layer(inputs: torch.Tensor, outputs: torch.Tensor,
         group_size: output channels per group
         num_bins: LUT bins per address dim
         addr_idx: [2] input channel indices used as address
+        use_residual: if True, store (output - input) as a residual delta
+            instead of the full output, matching the down_proj partial-LUT
+            semantics where the LUT only has to learn a small correction.
     Returns:
         table: [num_bins, num_bins, hidden_size]
     """
@@ -108,13 +112,19 @@ def build_lut_for_layer(inputs: torch.Tensor, outputs: torch.Tensor,
     bin_idx = compute_address_bins(inputs, addr_idx, num_bins)  # [N, 2]
     flat_idx = bin_idx[:, 0] * num_bins + bin_idx[:, 1]  # [N]
 
+    target = outputs
+    if use_residual:
+        target = outputs - inputs
+
     num_cells = num_bins * num_bins
-    table = torch.zeros(num_cells, hidden_size, device=outputs.device, dtype=outputs.dtype)
+    # Accumulate in fp32 to avoid fp16 overflow on high-magnitude layers
+    # (e.g. L27 produced inf in the first run).
+    table = torch.zeros(num_cells, hidden_size, device=outputs.device, dtype=torch.float32)
     counts = torch.zeros(num_cells, device=outputs.device, dtype=torch.float32)
 
     # Vectorized accumulation: scatter_add over all tokens.
     flat_idx_exp = flat_idx.unsqueeze(1).expand(-1, hidden_size)
-    table.scatter_add_(0, flat_idx_exp, outputs)
+    table.scatter_add_(0, flat_idx_exp, target.float())
     counts.scatter_add_(0, flat_idx, torch.ones_like(flat_idx, dtype=torch.float32))
 
     counts = counts.clamp_min(1.0).unsqueeze(1)
@@ -124,10 +134,14 @@ def build_lut_for_layer(inputs: torch.Tensor, outputs: torch.Tensor,
 
 def evaluate_lut_reconstruction(inputs: torch.Tensor, outputs: torch.Tensor,
                                 table: torch.Tensor, group_size: int,
-                                addr_idx: torch.Tensor) -> Dict:
+                                addr_idx: torch.Tensor,
+                                use_residual: bool = False) -> Dict:
     """
     Evaluate how well the LUT reconstructs the true o_proj output.
     Returns relative MSE and per-group relative MSE.
+
+    If use_residual is True, ``table`` stores residual deltas and the
+    reconstructed output is ``inputs + lookup(table)``.
     """
     hidden_size = outputs.shape[-1]
     num_groups = hidden_size // group_size
@@ -136,9 +150,13 @@ def evaluate_lut_reconstruction(inputs: torch.Tensor, outputs: torch.Tensor,
     flat_idx = bin_idx[:, 0] * num_bins + bin_idx[:, 1]  # [N]
 
     table_flat = table.view(num_bins * num_bins, hidden_size)
-    reconstructed = table_flat[flat_idx]  # [N, hidden_size]
+    lookup = table_flat[flat_idx]  # [N, hidden_size]
+    if use_residual:
+        reconstructed = inputs.float() + lookup.float()
+    else:
+        reconstructed = lookup
 
-    mse = F.mse_loss(reconstructed, outputs, reduction="mean").item()
+    mse = F.mse_loss(reconstructed, outputs.float(), reduction="mean").item()
     output_var = outputs.var().item()
     relative_mse = mse / (output_var + 1e-8)
 
@@ -149,7 +167,7 @@ def evaluate_lut_reconstruction(inputs: torch.Tensor, outputs: torch.Tensor,
         g_end = g_start + group_size
         rec_group = reconstructed[:, g_start:g_end]
         out_group = outputs[:, g_start:g_end]
-        g_mse = F.mse_loss(rec_group, out_group, reduction="mean").item()
+        g_mse = F.mse_loss(rec_group.float(), out_group.float(), reduction="mean").item()
         group_rmse.append(g_mse ** 0.5)
 
     return {
@@ -161,10 +179,13 @@ def evaluate_lut_reconstruction(inputs: torch.Tensor, outputs: torch.Tensor,
 
 
 def select_address_channels(inputs: torch.Tensor, outputs: torch.Tensor,
-                            group_size: int, num_bins: int, num_candidates: int = 8) -> Tuple[torch.Tensor, float]:
+                            group_size: int, num_bins: int, num_candidates: int = 8,
+                            use_residual: bool = False) -> Tuple[torch.Tensor, float]:
     """
     Try several candidate address channel pairs and pick the one with lowest reconstruction error.
     Returns (best_addr_idx, best_relative_mse).
+
+    If use_residual is True, the target for the LUT is (output - input).
     """
     hidden_size = inputs.shape[-1]
     num_groups = hidden_size // group_size
@@ -184,12 +205,16 @@ def select_address_channels(inputs: torch.Tensor, outputs: torch.Tensor,
     g_start = 0
     g_end = group_size
     out_group = outputs[:, g_start:g_end]
+    if use_residual:
+        out_group = out_group - inputs[:, g_start:g_end]
 
     for c1, c2 in pairs:
         addr_idx = torch.tensor([c1, c2], device=inputs.device)
         try:
-            table = build_lut_for_layer(inputs, out_group, group_size, num_bins, addr_idx)
-            metrics = evaluate_lut_reconstruction(inputs, out_group, table, group_size, addr_idx)
+            table = build_lut_for_layer(inputs, out_group, group_size, num_bins, addr_idx,
+                                        use_residual=False)
+            metrics = evaluate_lut_reconstruction(inputs, out_group, table, group_size, addr_idx,
+                                                  use_residual=False)
             if metrics["rmse"] < best_rmse:
                 best_rmse = metrics["rmse"]
                 best_pair = (c1, c2)
@@ -203,7 +228,8 @@ def select_address_channels(inputs: torch.Tensor, outputs: torch.Tensor,
 
 
 def inspect_layer(model, tokenizer, layer_id: int, calib_batch, eval_batch,
-                  group_size: int, num_bins: int, device) -> Dict:
+                  group_size: int, num_bins: int, device,
+                  use_residual: bool = False) -> Dict:
     """Inspect o_proj LUT viability for one layer."""
     layer = model.model.layers[layer_id]
     o_proj = layer.self_attn.o_proj
@@ -241,13 +267,16 @@ def inspect_layer(model, tokenizer, layer_id: int, calib_batch, eval_batch,
     eval_outputs = captured["output"][1].view(-1, hidden_size)
 
     # Select good address channels using calib data (first group only for speed).
-    addr_idx, _ = select_address_channels(calib_inputs, calib_outputs, group_size, num_bins)
+    addr_idx, _ = select_address_channels(calib_inputs, calib_outputs, group_size, num_bins,
+                                          use_residual=use_residual)
 
     # Build full LUT from calib data.
-    table = build_lut_for_layer(calib_inputs, calib_outputs, group_size, num_bins, addr_idx)
+    table = build_lut_for_layer(calib_inputs, calib_outputs, group_size, num_bins, addr_idx,
+                                use_residual=use_residual)
 
     # Evaluate on eval data.
-    metrics = evaluate_lut_reconstruction(eval_inputs, eval_outputs, table, group_size, addr_idx)
+    metrics = evaluate_lut_reconstruction(eval_inputs, eval_outputs, table, group_size, addr_idx,
+                                          use_residual=use_residual)
 
     metrics["group_rmse_mean"] = sum(metrics["group_rmse"]) / len(metrics["group_rmse"])
     metrics["group_rmse_max"] = max(metrics["group_rmse"])
@@ -268,6 +297,8 @@ def main():
     parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output_path", default="results/o_proj_lut_inspection.json")
+    parser.add_argument("--residual", action="store_true",
+                        help="Store (output - input) residual deltas in the LUT instead of the full output.")
     args = parser.parse_args()
 
     layers = [int(x.strip()) for x in args.layers.split(",")]
@@ -278,8 +309,9 @@ def main():
 
     print("Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, torch_dtype=torch.float16, device_map=str(device), low_cpu_mem_usage=False
+        args.model, torch_dtype=torch.float16, low_cpu_mem_usage=True
     )
+    model.to(device)
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
     if tokenizer.pad_token is None:
@@ -289,13 +321,15 @@ def main():
     calib_batch, eval_batch = prepare_texts(tokenizer, args.max_seq_len, args.calib_size, args.eval_size)
 
     print(f"\nInspecting o_proj LUT viability for layers: {layers}")
+    print(f"Mode: {'residual delta' if args.residual else 'full output'}")
     print("=" * 70)
 
     results = []
     for layer_id in tqdm(layers, desc="Layers"):
         metrics = inspect_layer(
             model, tokenizer, layer_id, calib_batch, eval_batch,
-            args.group_size, args.num_bins, device
+            args.group_size, args.num_bins, device,
+            use_residual=args.residual
         )
         results.append({
             "layer_id": layer_id,
@@ -319,6 +353,7 @@ def main():
         "model": args.model,
         "group_size": args.group_size,
         "num_bins": args.num_bins,
+        "use_residual": args.residual,
         "layers": results_sorted,
     }
     with open(args.output_path, "w") as f:
