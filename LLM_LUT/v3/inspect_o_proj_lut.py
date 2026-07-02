@@ -102,27 +102,24 @@ def build_lut_for_layer(inputs: torch.Tensor, outputs: torch.Tensor,
         num_bins: LUT bins per address dim
         addr_idx: [2] input channel indices used as address
     Returns:
-        table: [num_bins, num_bins, group_size]
+        table: [num_bins, num_bins, hidden_size]
     """
     hidden_size = outputs.shape[-1]
-    num_groups = hidden_size // group_size
-    bin_idx = compute_address_bins(inputs, addr_idx, num_bins)
-    table = torch.zeros(num_bins, num_bins, group_size, device=outputs.device, dtype=outputs.dtype)
-    counts = torch.zeros(num_bins, num_bins, device=outputs.device, dtype=torch.long)
+    bin_idx = compute_address_bins(inputs, addr_idx, num_bins)  # [N, 2]
+    flat_idx = bin_idx[:, 0] * num_bins + bin_idx[:, 1]  # [N]
 
-    for g in range(num_groups):
-        g_start = g * group_size
-        g_end = g_start + group_size
-        out_group = outputs[:, g_start:g_end]
-        for i in range(bin_idx.shape[0]):
-            b1 = bin_idx[i, 0]
-            b2 = bin_idx[i, 1]
-            table[b1, b2] += out_group[i]
-            counts[b1, b2] += 1
+    num_cells = num_bins * num_bins
+    table = torch.zeros(num_cells, hidden_size, device=outputs.device, dtype=outputs.dtype)
+    counts = torch.zeros(num_cells, device=outputs.device, dtype=outputs.dtype)
 
-    counts = counts.clamp_min(1)
-    table = table / counts.unsqueeze(-1)
-    return table
+    # Vectorized accumulation: scatter_add over all tokens.
+    flat_idx_exp = flat_idx.unsqueeze(1).expand(-1, hidden_size)
+    table.scatter_add_(0, flat_idx_exp, outputs)
+    counts.scatter_add_(0, flat_idx, torch.ones_like(flat_idx, dtype=torch.float32))
+
+    counts = counts.clamp_min(1.0).unsqueeze(1)
+    table = table / counts
+    return table.view(num_bins, num_bins, hidden_size)
 
 
 def evaluate_lut_reconstruction(inputs: torch.Tensor, outputs: torch.Tensor,
@@ -134,24 +131,32 @@ def evaluate_lut_reconstruction(inputs: torch.Tensor, outputs: torch.Tensor,
     """
     hidden_size = outputs.shape[-1]
     num_groups = hidden_size // group_size
-    bin_idx = compute_address_bins(inputs, addr_idx, table.shape[0])
+    num_bins = table.shape[0]
+    bin_idx = compute_address_bins(inputs, addr_idx, num_bins)
+    flat_idx = bin_idx[:, 0] * num_bins + bin_idx[:, 1]  # [N]
 
-    reconstructed = torch.zeros_like(outputs)
-    for g in range(num_groups):
-        g_start = g * group_size
-        g_end = g_start + group_size
-        b1 = bin_idx[:, 0]
-        b2 = bin_idx[:, 1]
-        reconstructed[:, g_start:g_end] = table[b1, b2]
+    table_flat = table.view(num_bins * num_bins, hidden_size)
+    reconstructed = table_flat[flat_idx]  # [N, hidden_size]
 
     mse = F.mse_loss(reconstructed, outputs, reduction="mean").item()
     output_var = outputs.var().item()
     relative_mse = mse / (output_var + 1e-8)
 
+    # Per-group RMSE.
+    group_rmse = []
+    for g in range(num_groups):
+        g_start = g * group_size
+        g_end = g_start + group_size
+        rec_group = reconstructed[:, g_start:g_end]
+        out_group = outputs[:, g_start:g_end]
+        g_mse = F.mse_loss(rec_group, out_group, reduction="mean").item()
+        group_rmse.append(g_mse ** 0.5)
+
     return {
         "mse": mse,
         "relative_mse": relative_mse,
         "rmse": mse ** 0.5,
+        "group_rmse": group_rmse,
     }
 
 
@@ -244,22 +249,10 @@ def inspect_layer(model, tokenizer, layer_id: int, calib_batch, eval_batch,
     # Evaluate on eval data.
     metrics = evaluate_lut_reconstruction(eval_inputs, eval_outputs, table, group_size, addr_idx)
 
-    # Also evaluate per-group relative MSE.
-    num_groups = hidden_size // group_size
-    group_rmse = []
-    for g in range(num_groups):
-        g_start = g * group_size
-        g_end = g_start + group_size
-        g_metrics = evaluate_lut_reconstruction(
-            eval_inputs, eval_outputs[:, g_start:g_end],
-            table[:, :, g_start:g_end], group_size, addr_idx
-        )
-        group_rmse.append(g_metrics["rmse"])
-
-    metrics["group_rmse_mean"] = sum(group_rmse) / len(group_rmse)
-    metrics["group_rmse_max"] = max(group_rmse)
+    metrics["group_rmse_mean"] = sum(metrics["group_rmse"]) / len(metrics["group_rmse"])
+    metrics["group_rmse_max"] = max(metrics["group_rmse"])
     metrics["addr_channels"] = addr_idx.tolist()
-    metrics["num_groups"] = num_groups
+    metrics["num_groups"] = hidden_size // group_size
 
     return metrics
 
