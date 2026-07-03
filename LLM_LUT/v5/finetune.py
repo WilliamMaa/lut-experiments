@@ -81,6 +81,7 @@ def build_engine_for_layer(model, layer_id: int, group_count: int,
 
         table = ckpt["lut_table"]
         lut_group = LUTGroup(table.shape[0], table.shape[1], table.shape[2], init_table=table)
+        lut_group = lut_group.to(model.device)
         engine.add_group(gid, address, lut_group)
     return engine
 

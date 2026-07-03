@@ -19,7 +19,7 @@ class LUTGroup(nn.Module):
     """
 
     def __init__(self, num_tables: int, num_entries: int, group_size: int,
-                 init_table: torch.Tensor = None):
+                 init_table: torch.Tensor = None, device: torch.device = None):
         super().__init__()
         self.num_tables = num_tables
         self.num_entries = num_entries
@@ -29,6 +29,8 @@ class LUTGroup(nn.Module):
             table = init_table.float().clone()
         else:
             table = torch.zeros(num_tables, num_entries, group_size)
+        if device is not None:
+            table = table.to(device)
         self.table = nn.Parameter(table)
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
@@ -88,6 +90,7 @@ class LUTGroup(nn.Module):
 def build_lut_group(num_tables: int, num_entries: int, group_size: int,
                     indices: torch.Tensor, targets: torch.Tensor) -> LUTGroup:
     """Helper to create and initialize a LUTGroup from calibration data."""
-    lut = LUTGroup(num_tables, num_entries, group_size)
+    device = indices.device if indices.is_cuda else targets.device
+    lut = LUTGroup(num_tables, num_entries, group_size, device=device)
     lut.initialize_from_calibration(indices, targets)
     return lut

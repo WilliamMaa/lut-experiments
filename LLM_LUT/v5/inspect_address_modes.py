@@ -58,7 +58,7 @@ def build_and_evaluate(calib_x, calib_down, eval_x, eval_down, group_ids, group_
             address.fit_calibration(calib_x.unsqueeze(0))
 
         indices = address.compute_indices(calib_x.unsqueeze(0)).view(-1, address.num_tables)
-        lut_group = LUTGroup(address.num_tables, address.num_entries, group_size)
+        lut_group = LUTGroup(address.num_tables, address.num_entries, group_size, device=calib_x.device)
         lut_group.initialize_from_calibration(indices, group_target)
 
         metrics = evaluate_group(eval_x, eval_down, address, lut_group, gid, group_size, use_residual)
