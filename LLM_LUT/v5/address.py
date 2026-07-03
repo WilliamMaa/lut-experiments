@@ -220,8 +220,8 @@ class AddressGreedyTree:
         best_left_mask = None
 
         for _ in range(num_candidates):
-            ch = torch.randint(0, self.input_dim, (self.channels_per_bit,), generator=self.gen)
-            signs = torch.randint(0, 2, (self.channels_per_bit,), generator=self.gen).float() * 2 - 1
+            ch = torch.randint(0, self.input_dim, (self.channels_per_bit,), generator=self.gen).to(x.device)
+            signs = (torch.randint(0, 2, (self.channels_per_bit,), generator=self.gen).float() * 2 - 1).to(x.device)
             proj = (x[:, ch] * signs.to(x.dtype)).sum(dim=-1)
             threshold = proj.median().item()
             left_mask = proj <= threshold
@@ -277,7 +277,9 @@ class AddressGreedyTree:
         if node.is_leaf:
             out[idx] = node.leaf_index
             return
-        proj = (x[idx][:, node.channel_idx] * node.signs.to(x.dtype)).sum(dim=-1)
+        ch = node.channel_idx.to(x.device)
+        signs = node.signs.to(x.device, x.dtype)
+        proj = (x[idx][:, ch] * signs).sum(dim=-1)
         left_mask = proj <= node.threshold
         self._traverse(node.left, x, idx[left_mask], out)
         self._traverse(node.right, x, idx[~left_mask], out)
