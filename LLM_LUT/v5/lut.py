@@ -40,7 +40,7 @@ class LUTGroup(nn.Module):
         """
         B, S, M = indices.shape
         assert M == self.num_tables
-        flat_idx = indices.view(-1, M)  # [N, M]
+        flat_idx = indices.view(-1, M).to(self.table.device)  # [N, M]
         N = flat_idx.shape[0]
 
         # Gather per table: table[m, flat_idx[:, m], :]
@@ -64,8 +64,11 @@ class LUTGroup(nn.Module):
             M = self.num_tables
             E = self.num_entries
             gs = self.group_size
-            new_table = torch.zeros(M, E, gs, device=self.table.device, dtype=torch.float32)
-            counts = torch.zeros(M, E, device=self.table.device, dtype=torch.float32)
+            device = self.table.device
+            indices = indices.to(device)
+            targets = targets.to(device)
+            new_table = torch.zeros(M, E, gs, device=device, dtype=torch.float32)
+            counts = torch.zeros(M, E, device=device, dtype=torch.float32)
 
             for m in range(M):
                 idx_m = indices[:, m].clamp(0, E - 1)
