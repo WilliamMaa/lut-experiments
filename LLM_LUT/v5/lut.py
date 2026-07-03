@@ -34,23 +34,26 @@ class LUTGroup(nn.Module):
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            indices: [B, S, num_tables] long
+            indices: [B, S, num_tables] or [N, num_tables] long
         Returns:
-            out: [B, S, group_size]
+            out: [B, S, group_size] or [N, group_size]
         """
-        B, S, M = indices.shape
-        assert M == self.num_tables
-        flat_idx = indices.view(-1, M).to(self.table.device)  # [N, M]
+        assert indices.shape[-1] == self.num_tables
+        orig_shape = indices.shape
+        flat_idx = indices.reshape(-1, self.num_tables).to(self.table.device)  # [N, M]
         N = flat_idx.shape[0]
 
         # Gather per table: table[m, flat_idx[:, m], :]
         outs = []
-        for m in range(M):
+        for m in range(self.num_tables):
             t = self.table[m]  # [E, gs]
             idx_m = flat_idx[:, m].clamp(0, self.num_entries - 1)
             outs.append(t[idx_m])  # [N, gs]
         out = torch.stack(outs, dim=1).sum(dim=1)  # [N, gs]
-        return out.view(B, S, self.group_size)
+
+        if len(orig_shape) == 2:
+            return out
+        return out.view(orig_shape[0], orig_shape[1], self.group_size)
 
     def initialize_from_calibration(self, indices: torch.Tensor, targets: torch.Tensor):
         """
