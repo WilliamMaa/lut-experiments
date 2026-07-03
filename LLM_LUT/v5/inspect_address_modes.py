@@ -27,7 +27,8 @@ V0_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "v0
 
 def build_and_evaluate(calib_x, calib_down, eval_x, eval_down, group_ids, group_size,
                        address_mode, num_bins, num_tables, num_bits, channels_per_bit,
-                       use_residual, tree_candidates=64, tree_min_samples=32):
+                       use_residual, tree_candidates=32, tree_min_samples=32,
+                       tree_max_samples=65536):
     target = calib_down - calib_x if use_residual else calib_down
     results = []
     for gid in group_ids:
@@ -66,7 +67,8 @@ def build_and_evaluate(calib_x, calib_down, eval_x, eval_down, group_ids, group_
             )
             address.build(calib_x, group_target,
                           num_candidates=tree_candidates,
-                          min_samples=tree_min_samples)
+                          min_samples=tree_min_samples,
+                          max_samples=tree_max_samples)
 
         indices = address.compute_indices(calib_x.unsqueeze(0)).view(-1, address.num_tables)
         lut_group = LUTGroup(address.num_tables, address.num_entries, group_size, device=calib_x.device)
@@ -89,10 +91,12 @@ def main():
     parser.add_argument("--num_tables", type=int, default=4)
     parser.add_argument("--num_bits", type=int, default=10)
     parser.add_argument("--channels_per_bit", type=int, default=4)
-    parser.add_argument("--tree_candidates", type=int, default=64,
+    parser.add_argument("--tree_candidates", type=int, default=32,
                         help="Number of random projections to try per split in greedy tree")
     parser.add_argument("--tree_min_samples", type=int, default=32,
                         help="Minimum samples to allow a split in greedy tree")
+    parser.add_argument("--tree_max_samples", type=int, default=65536,
+                        help="Subsample calibration data for tree building")
     parser.add_argument("--calib_size", type=int, default=256)
     parser.add_argument("--eval_size", type=int, default=128)
     parser.add_argument("--max_seq_len", type=int, default=512)
@@ -145,7 +149,7 @@ def main():
             calib_x, calib_down, eval_x, eval_down, group_ids, args.group_size,
             "tree", 0, 1, args.num_bits, args.channels_per_bit,
             use_residual=True, tree_candidates=args.tree_candidates,
-            tree_min_samples=args.tree_min_samples
+            tree_min_samples=args.tree_min_samples, tree_max_samples=args.tree_max_samples
         )
 
         avg_2d = sum(r["relative_mse"] for r in res_2d) / len(res_2d)

@@ -185,7 +185,8 @@ class AddressGreedyTree:
             self.root = self._deserialize(tree_state)
 
     def build(self, x: torch.Tensor, target: torch.Tensor,
-              num_candidates: int = 64, min_samples: int = 32):
+              num_candidates: int = 64, min_samples: int = 32,
+              max_samples: int = 65536):
         """
         Build the tree from calibration data.
 
@@ -194,7 +195,13 @@ class AddressGreedyTree:
             target: [N, group_size] residual target
             num_candidates: how many random projections to try per split
             min_samples: do not split a node with fewer than 2*min_samples samples
+            max_samples: subsample calibration data to this size if larger
         """
+        N = x.shape[0]
+        if N > max_samples:
+            perm = torch.randperm(N, device=x.device)[:max_samples]
+            x = x[perm]
+            target = target[perm]
         self._leaf_counter = 0
         self.root = self._build_node(x, target, depth=0,
                                      num_candidates=num_candidates,

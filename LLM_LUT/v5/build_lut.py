@@ -171,10 +171,12 @@ def main():
     parser.add_argument("--use_residual", action="store_true", default=True,
                         help="LUT stores down_proj_output - residual (default True)")
     parser.add_argument("--no_residual", dest="use_residual", action="store_false")
-    parser.add_argument("--tree_candidates", type=int, default=64,
+    parser.add_argument("--tree_candidates", type=int, default=32,
                         help="Random projection candidates per split (tree mode)")
     parser.add_argument("--tree_min_samples", type=int, default=32,
                         help="Min samples to split a node (tree mode)")
+    parser.add_argument("--tree_max_samples", type=int, default=65536,
+                        help="Subsample calibration data for tree building")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -252,7 +254,8 @@ def main():
                 )
                 address.build(calib_x, group_target,
                               num_candidates=args.tree_candidates,
-                              min_samples=args.tree_min_samples)
+                              min_samples=args.tree_min_samples,
+                              max_samples=args.tree_max_samples)
 
             indices = address.compute_indices(calib_x.unsqueeze(0)).view(-1, address.num_tables)
             lut_group = LUTGroup(address.num_tables, address.num_entries, args.group_size, device=calib_x.device)
