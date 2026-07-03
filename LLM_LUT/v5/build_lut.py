@@ -60,8 +60,10 @@ def capture_mlp_residual(model, tokenizer, layer_id, calib_texts, eval_texts,
         captured["down_out"].append(output.detach())
 
     handle = mlp.register_forward_hook(mlp_hook)
-    calib_tok = tokenize_texts(tokenizer, calib_texts, max_seq_len)
-    eval_tok = tokenize_texts(tokenizer, eval_texts, max_seq_len)
+    calib_texts_plain = [t["text"] if isinstance(t, dict) else t for t in calib_texts]
+    eval_texts_plain = [t["text"] if isinstance(t, dict) else t for t in eval_texts]
+    calib_tok = tokenize_texts(tokenizer, calib_texts_plain, max_seq_len)
+    eval_tok = tokenize_texts(tokenizer, eval_texts_plain, max_seq_len)
 
     try:
         model.eval()
