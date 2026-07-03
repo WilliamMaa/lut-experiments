@@ -23,7 +23,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from engine import HybridPartialEngine
-from address import Address2D, AddressHighOrderRandom
+from address import Address2D, AddressHighOrderRandom, AddressGreedyTree
 from lut import LUTGroup
 from utils import load_model_and_data, collect_baseline_logits
 from metrics import compute_model_metrics, compute_baseline_probs, compute_mac_reduction, format_bytes
@@ -76,6 +76,22 @@ def build_engine_for_layer(model, layer_id: int, group_count: int,
             address.channel_idx = ckpt["channel_idx"]
             address.signs = ckpt["signs"]
             address.input_dim = int(ckpt["channel_idx"].max().item()) + 1
+        elif ckpt["address_type"] == "tree":
+            address = AddressGreedyTree(
+                input_dim=1,
+                num_bits=ckpt["num_bits"],
+                channels_per_bit=ckpt["channels_per_bit"],
+                tree_state=ckpt["tree_state"],
+            )
+            address.input_dim = int(ckpt["tree_state"]["tree"]["channel_idx"][0]) + 1 \
+                if isinstance(ckpt["tree_state"]["tree"]["channel_idx"], list) else 1
+            # Better infer from actual channel indices during traversal; set from max below
+            # Recompute by scanning tree
+            def max_ch(node):
+                if "leaf_index" in node:
+                    return 0
+                return max(max(node["channel_idx"]) + 1, max_ch(node["left"]), max_ch(node["right"]))
+            address.input_dim = max_ch(ckpt["tree_state"]["tree"])
         else:
             raise ValueError(f"Unknown address type: {ckpt['address_type']}")
 

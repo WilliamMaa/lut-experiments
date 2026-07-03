@@ -203,6 +203,11 @@ class HybridPartialEngine:
                 state["signs"] = address.signs
                 state["addr_mean"] = address.addr_mean
                 state["addr_std"] = address.addr_std
+            elif isinstance(address, AddressGreedyTree):
+                state["address_type"] = "tree"
+                state["num_bits"] = address.num_bits
+                state["channels_per_bit"] = address.channels_per_bit
+                state["tree_state"] = address.serialize()
             torch.save(state, path)
 
 

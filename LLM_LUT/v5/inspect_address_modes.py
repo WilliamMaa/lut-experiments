@@ -17,7 +17,7 @@ from typing import List
 import torch
 
 from build_lut import capture_mlp_residual, select_2d_address, evaluate_group, parse_configs
-from address import Address2D, AddressHighOrderRandom
+from address import Address2D, AddressHighOrderRandom, AddressGreedyTree
 from lut import LUTGroup
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -27,7 +27,7 @@ V0_DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "v0
 
 def build_and_evaluate(calib_x, calib_down, eval_x, eval_down, group_ids, group_size,
                        address_mode, num_bins, num_tables, num_bits, channels_per_bit,
-                       use_residual):
+                       use_residual, tree_candidates=64, tree_min_samples=32):
     target = calib_down - calib_x if use_residual else calib_down
     results = []
     for gid in group_ids:
@@ -46,7 +46,7 @@ def build_and_evaluate(calib_x, calib_down, eval_x, eval_down, group_ids, group_
                 calib_x[:, addr_idx].std(dim=0),
                 num_bins=num_bins,
             )
-        else:
+        elif address_mode == "high_order":
             seed = 1000 + gid
             address = AddressHighOrderRandom(
                 input_dim=calib_x.shape[-1],
@@ -56,6 +56,17 @@ def build_and_evaluate(calib_x, calib_down, eval_x, eval_down, group_ids, group_
                 seed=seed,
             )
             address.fit_calibration(calib_x.unsqueeze(0))
+        else:  # tree
+            seed = 1000 + gid
+            address = AddressGreedyTree(
+                input_dim=calib_x.shape[-1],
+                num_bits=num_bits,
+                channels_per_bit=channels_per_bit,
+                seed=seed,
+            )
+            address.build(calib_x, group_target,
+                          num_candidates=tree_candidates,
+                          min_samples=tree_min_samples)
 
         indices = address.compute_indices(calib_x.unsqueeze(0)).view(-1, address.num_tables)
         lut_group = LUTGroup(address.num_tables, address.num_entries, group_size, device=calib_x.device)
@@ -78,6 +89,10 @@ def main():
     parser.add_argument("--num_tables", type=int, default=4)
     parser.add_argument("--num_bits", type=int, default=10)
     parser.add_argument("--channels_per_bit", type=int, default=4)
+    parser.add_argument("--tree_candidates", type=int, default=64,
+                        help="Number of random projections to try per split in greedy tree")
+    parser.add_argument("--tree_min_samples", type=int, default=32,
+                        help="Minimum samples to allow a split in greedy tree")
     parser.add_argument("--calib_size", type=int, default=256)
     parser.add_argument("--eval_size", type=int, default=128)
     parser.add_argument("--max_seq_len", type=int, default=512)
@@ -126,16 +141,25 @@ def main():
             "high_order", 0, args.num_tables, args.num_bits, args.channels_per_bit,
             use_residual=True
         )
+        res_tree = build_and_evaluate(
+            calib_x, calib_down, eval_x, eval_down, group_ids, args.group_size,
+            "tree", 0, 1, args.num_bits, args.channels_per_bit,
+            use_residual=True, tree_candidates=args.tree_candidates,
+            tree_min_samples=args.tree_min_samples
+        )
 
         avg_2d = sum(r["relative_mse"] for r in res_2d) / len(res_2d)
         avg_ho = sum(r["relative_mse"] for r in res_ho) / len(res_ho)
+        avg_tree = sum(r["relative_mse"] for r in res_tree) / len(res_tree)
         print(f"  2D        avg rel_mse={avg_2d:.4f}")
         print(f"  high_order avg rel_mse={avg_ho:.4f} (M={args.num_tables}, B={args.num_bits})")
+        print(f"  tree      avg rel_mse={avg_tree:.4f} (B={args.num_bits}, cand={args.tree_candidates})")
 
         output["layers"].append({
             "layer_id": layer_id,
             "2d": {"avg_relative_mse": avg_2d, "groups": res_2d},
             "high_order": {"avg_relative_mse": avg_ho, "groups": res_ho},
+            "tree": {"avg_relative_mse": avg_tree, "groups": res_tree},
         })
 
     os.makedirs(os.path.dirname(args.output_path) or ".", exist_ok=True)

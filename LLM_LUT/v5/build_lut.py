@@ -26,7 +26,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from tqdm import tqdm
 
 from data import load_jsonl
-from address import Address2D, AddressHighOrderRandom
+from address import Address2D, AddressHighOrderRandom, AddressGreedyTree
 from lut import LUTGroup
 
 
@@ -157,7 +157,7 @@ def main():
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--configs", required=True,
                         help="layer:count[:group_ids] e.g. '21:8' or '21:4:0;1;2;3'")
-    parser.add_argument("--address_mode", default="high_order", choices=["2d", "high_order"])
+    parser.add_argument("--address_mode", default="high_order", choices=["2d", "high_order", "tree"])
     parser.add_argument("--num_bins", type=int, default=64)
     parser.add_argument("--num_tables", type=int, default=4)
     parser.add_argument("--num_bits", type=int, default=10)
@@ -171,6 +171,10 @@ def main():
     parser.add_argument("--use_residual", action="store_true", default=True,
                         help="LUT stores down_proj_output - residual (default True)")
     parser.add_argument("--no_residual", dest="use_residual", action="store_false")
+    parser.add_argument("--tree_candidates", type=int, default=64,
+                        help="Random projection candidates per split (tree mode)")
+    parser.add_argument("--tree_min_samples", type=int, default=32,
+                        help="Min samples to split a node (tree mode)")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -228,7 +232,7 @@ def main():
                     calib_x[:, addr_idx].std(dim=0),
                     num_bins=args.num_bins,
                 )
-            else:
+            elif args.address_mode == "high_order":
                 seed = layer_id * 1000 + gid
                 address = AddressHighOrderRandom(
                     input_dim=hidden_size,
@@ -238,6 +242,17 @@ def main():
                     seed=seed,
                 )
                 address.fit_calibration(calib_x.unsqueeze(0))
+            else:  # tree
+                seed = layer_id * 1000 + gid
+                address = AddressGreedyTree(
+                    input_dim=hidden_size,
+                    num_bits=args.num_bits,
+                    channels_per_bit=args.channels_per_bit,
+                    seed=seed,
+                )
+                address.build(calib_x, group_target,
+                              num_candidates=args.tree_candidates,
+                              min_samples=args.tree_min_samples)
 
             indices = address.compute_indices(calib_x.unsqueeze(0)).view(-1, address.num_tables)
             lut_group = LUTGroup(address.num_tables, address.num_entries, args.group_size, device=calib_x.device)
@@ -264,7 +279,7 @@ def main():
                 state["addr_std"] = address.addr_std
                 state["num_bins"] = address.num_bins
                 state["addr_clip"] = address.addr_clip
-            else:
+            elif args.address_mode == "high_order":
                 state["address_type"] = "high_order"
                 state["num_tables"] = address.num_tables
                 state["num_bits"] = address.num_bits
@@ -273,6 +288,11 @@ def main():
                 state["signs"] = address.signs
                 state["addr_mean"] = address.addr_mean
                 state["addr_std"] = address.addr_std
+            else:  # tree
+                state["address_type"] = "tree"
+                state["num_bits"] = address.num_bits
+                state["channels_per_bit"] = address.channels_per_bit
+                state["tree_state"] = address.serialize()
             torch.save(state, ckpt_path)
 
             layer_results["groups"].append({"group_id": gid, **eval_metrics})
