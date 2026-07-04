@@ -284,6 +284,7 @@ def main():
                 state["addr_clip"] = address.addr_clip
             elif args.address_mode == "high_order":
                 state["address_type"] = "high_order"
+                state["input_dim"] = hidden_size
                 state["num_tables"] = address.num_tables
                 state["num_bits"] = address.num_bits
                 state["channels_per_bit"] = address.channels_per_bit
@@ -293,6 +294,7 @@ def main():
                 state["addr_std"] = address.addr_std
             else:  # tree
                 state["address_type"] = "tree"
+                state["input_dim"] = hidden_size
                 state["num_bits"] = address.num_bits
                 state["channels_per_bit"] = address.channels_per_bit
                 state["tree_state"] = address.serialize()

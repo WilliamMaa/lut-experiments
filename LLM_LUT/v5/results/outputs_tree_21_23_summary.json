@@ -1,0 +1,231 @@
+{
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "address_mode": "tree",
+  "group_size": 64,
+  "num_bins": 64,
+  "num_tables": 4,
+  "num_bits": 10,
+  "channels_per_bit": 4,
+  "configs": [
+    [
+      21,
+      8,
+      [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    ],
+    [
+      22,
+      8,
+      [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    ],
+    [
+      23,
+      8,
+      [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ]
+    ]
+  ],
+  "results": [
+    {
+      "layer_id": 21,
+      "groups": [
+        {
+          "group_id": 0,
+          "mse": 1.0180542469024658,
+          "rmse": 1.0089867426792414,
+          "relative_mse": 1.3088355749223461
+        },
+        {
+          "group_id": 1,
+          "mse": 0.9706165790557861,
+          "rmse": 0.9851987510425427,
+          "relative_mse": 1.325215151177229
+        },
+        {
+          "group_id": 2,
+          "mse": 0.9523009061813354,
+          "rmse": 0.9758590606134349,
+          "relative_mse": 1.3657648654681445
+        },
+        {
+          "group_id": 3,
+          "mse": 0.9160131216049194,
+          "rmse": 0.9570857441237538,
+          "relative_mse": 1.469064090023839
+        },
+        {
+          "group_id": 4,
+          "mse": 0.9594447016716003,
+          "rmse": 0.9795124816313472,
+          "relative_mse": 1.2563572399573153
+        },
+        {
+          "group_id": 5,
+          "mse": 0.9155994653701782,
+          "rmse": 0.9568696177485092,
+          "relative_mse": 1.3365272114797202
+        },
+        {
+          "group_id": 6,
+          "mse": 0.9601898193359375,
+          "rmse": 0.9798927590996566,
+          "relative_mse": 1.2945811214529155
+        },
+        {
+          "group_id": 7,
+          "mse": 1.159334659576416,
+          "rmse": 1.0767240405862666,
+          "relative_mse": 0.9803127013772486
+        }
+      ]
+    },
+    {
+      "layer_id": 22,
+      "groups": [
+        {
+          "group_id": 0,
+          "mse": 1.248283863067627,
+          "rmse": 1.1172662453809419,
+          "relative_mse": 1.2386072316840233
+        },
+        {
+          "group_id": 1,
+          "mse": 1.2674527168273926,
+          "rmse": 1.1258120255297475,
+          "relative_mse": 1.072621133097198
+        },
+        {
+          "group_id": 2,
+          "mse": 1.250946283340454,
+          "rmse": 1.1184570994635663,
+          "relative_mse": 1.248507779099323
+        },
+        {
+          "group_id": 3,
+          "mse": 1.2345267534255981,
+          "rmse": 1.1110925944427845,
+          "relative_mse": 1.3127262534428823
+        },
+        {
+          "group_id": 4,
+          "mse": 1.2434380054473877,
+          "rmse": 1.1150955140468406,
+          "relative_mse": 1.1502082256549166
+        },
+        {
+          "group_id": 5,
+          "mse": 1.2048110961914062,
+          "rmse": 1.0976388733055176,
+          "relative_mse": 1.2858015105090073
+        },
+        {
+          "group_id": 6,
+          "mse": 1.2526164054870605,
+          "rmse": 1.1192034692079276,
+          "relative_mse": 1.3008916692673622
+        },
+        {
+          "group_id": 7,
+          "mse": 1.666761875152588,
+          "rmse": 1.2910313222972507,
+          "relative_mse": 1.1162617061646372
+        }
+      ]
+    },
+    {
+      "layer_id": 23,
+      "groups": [
+        {
+          "group_id": 0,
+          "mse": 1.5443665981292725,
+          "rmse": 1.2427254717471885,
+          "relative_mse": 1.2452215619947293
+        },
+        {
+          "group_id": 1,
+          "mse": 1.518871784210205,
+          "rmse": 1.2324251637362023,
+          "relative_mse": 1.210369412168924
+        },
+        {
+          "group_id": 2,
+          "mse": 1.5850087404251099,
+          "rmse": 1.2589713024628917,
+          "relative_mse": 1.3057513570590658
+        },
+        {
+          "group_id": 3,
+          "mse": 1.4727375507354736,
+          "rmse": 1.2135639870791626,
+          "relative_mse": 1.4684354789837837
+        },
+        {
+          "group_id": 4,
+          "mse": 1.5047621726989746,
+          "rmse": 1.2266874796373257,
+          "relative_mse": 1.3136201631647737
+        },
+        {
+          "group_id": 5,
+          "mse": 1.4664762020111084,
+          "rmse": 1.2109815035792695,
+          "relative_mse": 1.3195708412539278
+        },
+        {
+          "group_id": 6,
+          "mse": 1.6122910976409912,
+          "rmse": 1.2697602520322453,
+          "relative_mse": 0.8919427740955598
+        },
+        {
+          "group_id": 7,
+          "mse": 1.9616317749023438,
+          "rmse": 1.4005826555053236,
+          "relative_mse": 0.8314200865009348
+        }
+      ]
+    }
+  ]
+}
+
+# 1. 用 tree 生成 L21/22/23 各 8 group 的 checkpoints
+cd /data/mingyu/LLM_LUT/v5
+LD_LIBRARY_PATH="" HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 python build_lut.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --configs "21:8,22:8,23:8" \
+    --address_mode tree --num_bits 10 --tree_candidates 32 --tree_min_samples 32 --tree_max_samples 32768 \
+    --calib_size 256 --eval_size 128 \
+    --output_root ../v5/outputs_tree_21_23
+
+# 2. fine-tune（LUT 表值可训练）
+LD_LIBRARY_PATH="" HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 python finetune.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --configs "21:8,22:8,23:8" \
+    --checkpoint_root ../v5/outputs_tree_21_23 \
+    --epochs 5 --lr 5e-5 --calib_size 512 --eval_size 128 \
+    --output_dir results/finetune_v5_tree_21_23

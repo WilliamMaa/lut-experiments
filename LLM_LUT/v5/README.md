@@ -1,5 +1,7 @@
 # LLM_LUT v5
 
+> 最新进展与详细思考记录见 [`PROGRESS.md`](./PROGRESS.md)。
+
 v5 在 v4 的基础上引入**多元化 LUT** 策略，核心是两个新能力：
 
 1. **可训练 LUT 表值**：不再固定使用 calibration 均值，而是把 table 当成可训练参数，在 fine-tune 中联合优化。

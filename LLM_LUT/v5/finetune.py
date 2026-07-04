@@ -75,7 +75,8 @@ def build_engine_for_layer(model, layer_id: int, group_count: int,
             )
             address.channel_idx = ckpt["channel_idx"]
             address.signs = ckpt["signs"]
-            address.input_dim = int(ckpt["channel_idx"].max().item()) + 1
+            # Prefer explicitly saved input_dim; fall back to legacy channel-index inference
+            address.input_dim = int(ckpt.get("input_dim", ckpt["channel_idx"].max().item() + 1))
         elif ckpt["address_type"] == "tree":
             address = AddressGreedyTree(
                 input_dim=1,
@@ -83,15 +84,12 @@ def build_engine_for_layer(model, layer_id: int, group_count: int,
                 channels_per_bit=ckpt["channels_per_bit"],
                 tree_state=ckpt["tree_state"],
             )
-            address.input_dim = int(ckpt["tree_state"]["tree"]["channel_idx"][0]) + 1 \
-                if isinstance(ckpt["tree_state"]["tree"]["channel_idx"], list) else 1
-            # Better infer from actual channel indices during traversal; set from max below
-            # Recompute by scanning tree
+            # Prefer explicitly saved input_dim; fall back to legacy channel-index inference
             def max_ch(node):
                 if "leaf_index" in node:
                     return 0
                 return max(max(node["channel_idx"]) + 1, max_ch(node["left"]), max_ch(node["right"]))
-            address.input_dim = max_ch(ckpt["tree_state"]["tree"])
+            address.input_dim = int(ckpt.get("input_dim", max_ch(ckpt["tree_state"]["tree"])))
         else:
             raise ValueError(f"Unknown address type: {ckpt['address_type']}")
 
