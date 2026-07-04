@@ -13,7 +13,7 @@ LUT table values are trainable nn.Parameters.
 import torch
 import torch.nn.functional as F
 
-from address import Address2D, AddressHighOrderRandom
+from address import Address2D, AddressHighOrderRandom, AddressGreedyTree
 from lut import LUTGroup
 
 
@@ -205,6 +205,7 @@ class HybridPartialEngine:
                 state["addr_std"] = address.addr_std
             elif isinstance(address, AddressGreedyTree):
                 state["address_type"] = "tree"
+                state["input_dim"] = address.input_dim
                 state["num_bits"] = address.num_bits
                 state["channels_per_bit"] = address.channels_per_bit
                 state["tree_state"] = address.serialize()
@@ -238,7 +239,21 @@ def load_group_checkpoint(model, path: str) -> "HybridPartialEngine":
         )
         address.channel_idx = ckpt["channel_idx"]
         address.signs = ckpt["signs"]
-        address.input_dim = int(ckpt["channel_idx"].max().item()) + 1
+        address.input_dim = int(ckpt.get("input_dim", ckpt["channel_idx"].max().item() + 1))
+    elif ckpt["address_type"] == "tree":
+        address = AddressGreedyTree(
+            input_dim=1,
+            num_bits=ckpt["num_bits"],
+            channels_per_bit=ckpt["channels_per_bit"],
+            tree_state=ckpt["tree_state"],
+        )
+
+        def max_ch(node):
+            if "leaf_index" in node:
+                return 0
+            return max(max(node["channel_idx"]) + 1, max_ch(node["left"]), max_ch(node["right"]))
+
+        address.input_dim = int(ckpt.get("input_dim", max_ch(ckpt["tree_state"]["tree"])))
     else:
         raise ValueError(f"Unknown address type: {ckpt['address_type']}")
 
