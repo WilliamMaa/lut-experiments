@@ -230,9 +230,114 @@ LD_LIBRARY_PATH="" HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=1 python finetune.py \
 |---|---|---|
 | v5 源码 | `LLM_LUT/v5/` | address/lut/engine/build/inspect/finetune |
 | Tree checkpoints L21–L23 | `../v5/outputs_tree_21_23/` | 8 groups per layer |
-| Build summary | `LLM_LUT/v5/results/outputs_tree_21_23_summary.json` | 已从 v4/results 移回 |
+| Build summary | `LLM_LUT/v5/results/outputs_tree_21_23_summary.json` | 构建阶段指标 |
+| Fine-tune summary | `LLM_LUT/v4/results/finetune_v5_tree_21_23_summary.json` | 端到端 5 epoch 结果 |
 | 本文档 | `LLM_LUT/v5/PROGRESS.md` | 进展与思考 |
 
 ---
 
-*最后更新：2026-06-25*
+## 11. L21–L23 Tree + 可训练 LUT 端到端 Fine-Tune 结果
+
+完成了 v5 tree address 首次端到端联合微调（5 epoch）。
+
+### 11.1 配置
+
+- **替换层/组**：L21:8, L22:8, L23:8（共 24 个 group）
+- **地址**：`AddressGreedyTree`，`num_bits=10`，`channels_per_bit=4`
+- **LUT**：可训练，FP16（未量化），`group_size=64`
+- **训练**：5 epoch，lr=5e-5，calib 512，eval 128
+- **目标**：logits KL 蒸馏（来自无 LUT 原模型）
+
+### 11.2 关键指标
+
+| 阶段 | KL | PPL | Acc | MAC 削减 | LUT 存储 |
+|---|---|---|---|---|---|
+| 原模型 baseline（v4 记录） | — | **19.55** | — | 0% | 0 |
+| LUT 模型（fine-tune 前） | 0.5677 | 25.59 | 0.5133 | 0.41% | 3.00 MiB |
+| Epoch 1 | 0.4237 | 25.81 | 0.5070 | 0.41% | 3.00 MiB |
+| Epoch 2 | 0.3292 | 23.22 | 0.5179 | 0.41% | 3.00 MiB |
+| Epoch 3 | 0.2729 | 20.98 | 0.5335 | 0.41% | 3.00 MiB |
+| **Epoch 4（最佳 PPL）** | 0.2730 | **20.84** | 0.5226 | 0.41% | 3.00 MiB |
+| Epoch 5 | 0.2589 | 20.91 | 0.5133 | 0.41% | 3.00 MiB |
+
+### 11.3 与 v4 最佳结果对比
+
+| 配置 | 层数 | 总 group 数 | MAC 削减 | LUT 存储 | 最佳 PPL | 最佳 Acc |
+|---|---|---|---|---|---|---|
+| v4 2D INT8 | L15–L27（13 层） | ~164 | **2.78%** | 49.25 MiB | 29.25 | 0.470 |
+| v5 Tree FP16 | L21–L23（3 层） | 24 | 0.41% | 3.00 MiB | **20.84** | 0.523 |
+
+### 11.4 结论
+
+1. **Tree + 可训练 LUT 的质量恢复能力显著优于 v4 2D**：仅用 3 层、24 个 group，PPL 就接近原模型（20.84 vs 19.55），而 v4 用 13 层、~164 group 才到 29.25。
+2. **MAC 削减仍是瓶颈**：0.41% 远小于 v4 的 2.78%。当前优势是“用更少替换量达到更好质量”，下一步要验证“用 tree 复制/超越 v4 的 2.78% 时，PPL 能否仍保持优秀”。
+3. **过拟合迹象**：Epoch 4 PPL 最低，Epoch 5 略反弹；Acc 也是 Epoch 3 最高。说明 5 epoch 已接近收敛，后续可加 early stopping 或 lr decay。
+4. **存储很省**：24 group FP16 仅 3 MiB；即便扩到 13 层、同等 group 数，FP16 约 13 MiB，仍远小于 v4 INT8 的 49 MiB（因 tree 只有 2^10=1024 entries，而 2D 64×64=4096 entries）。
+
+### 11.5 直接下一步
+
+- **在 v4 的 13 层配置（L15–L27）上用 tree address 重新 build + fine-tune**，直接对比 MAC 削减 2.78% 时的 PPL/Acc。
+- 若 tree 在 2.78% MAC 削减下仍能把 PPL 拉到 25 以下，就证明 tree 是更优默认地址，可以继续扩层/扩 group 向 10% 推进。
+- 同步整理 expansion roadmap，评估 down_proj + o_proj 组合能否突破当前天花板（见 `EXPANSION_ROADMAP.md`）。
+
+---
+
+## 12. 方向修正：把 Tree Address 扩展到 o_proj
+
+### 12.1 为什么转向 o_proj？
+
+之前讨论中意识到：v5 虽然引入了 tree address，但前几轮实验仍停留在 **down_proj** 轴上。而项目要推进到更大 MAC 削减，down_proj 已经过 v3/v4 多轮挤压，边际收益递减。
+
+o_proj 占全模型 **5.5%** MAC，且 v4 预研显示部分层（尤其 **L27 残差模式** rel_mse 仅 0.18）非常有潜力。因此当前首要任务变成：**把已在 down_proj 上验证过的 tree address 扩展到 o_proj，跑端到端 fine-tune，看效果。**
+
+### 12.2 已完成的代码改造
+
+| 文件 | 改动 |
+|---|---|
+| `LLM_LUT/v5/engine.py` | 新增 `HybridOProjEngine`，支持 `direct` 和 `delta` 两种 reconstruction 模式 |
+| `LLM_LUT/v5/build_lut_o_proj.py` | 新增 o_proj LUT checkpoint 构建脚本，默认 tree address |
+| `LLM_LUT/v5/finetune_o_proj.py` | 新增 o_proj 专属 fine-tune 脚本，训练 o_proj.weight + LUT table |
+
+### 12.3 o_proj 与 down_proj 的关键差异
+
+| | down_proj | o_proj |
+|---|---|---|
+| 替换对象 | `mlp.down_proj` | `self_attn.o_proj` |
+| 输入维度 | intermediate_size (18944) | hidden_size (3584) |
+| 输出维度 | hidden_size (3584) | hidden_size (3584) |
+| group 划分 | 按输出 hidden_size 分 56 组 | 按输出 hidden_size 分 56 组 |
+| residual 含义 | `lut + mlp_input` | `direct`: `lut`；`delta`: `lut + attn_output` |
+| 占全模型 MAC | 29.1% | 5.5% |
+
+### 12.4 首发实验
+
+- **L27 delta（残差）**：v4 预研 rel_mse=0.18，最有希望。
+- **L17 direct（直接）**：v4 预研 rel_mse=0.39，早期层直接预测效果好。
+
+### 12.5 直接下一步
+
+跑 L27 o_proj residual 单点验证：
+
+```bash
+cd LLM_LUT/v5
+LD_LIBRARY_PATH="" HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 python build_lut_o_proj.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --configs "27:8" \
+    --address_mode tree --num_bits 10 --tree_candidates 128 --tree_min_samples 32 \
+    --mode delta \
+    --calib_size 512 --eval_size 128 \
+    --output_root ../v5/outputs_o_proj_l27
+
+LD_LIBRARY_PATH="" HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 python finetune_o_proj.py \
+    --model Qwen/Qwen2.5-7B-Instruct \
+    --configs "27:8" \
+    --checkpoint_root ../v5/outputs_o_proj_l27 \
+    --epochs 5 --lr 5e-5 --calib_size 512 --eval_size 128 \
+    --output_dir results/finetune_o_proj_l27_delta
+```
+
+根据 L27 结果，再决定是扩 o_proj 到 L17，还是回头做 down_proj + o_proj 混合。
+
+---
+
+*最后更新：2026-07-04*
