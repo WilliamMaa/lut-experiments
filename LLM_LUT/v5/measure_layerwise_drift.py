@@ -2,6 +2,9 @@
 Measure layerwise hidden-state drift between original model and a partially
 replaced model (down_proj / o_proj LUT).
 
+Uses a single model: captures student hidden states with engines installed,
+then uninstalls engines and captures teacher hidden states for the same batch.
+
 Usage:
     cd LLM_LUT/v5
     LD_LIBRARY_PATH="" HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=1 python measure_layerwise_drift.py \
@@ -22,7 +25,6 @@ from pathlib import Path
 from typing import List, Tuple
 
 import torch
-import torch.nn.functional as F
 from tqdm import tqdm
 
 from engine import HybridPartialEngine, HybridOProjEngine
@@ -126,33 +128,29 @@ def build_o_engine(model, layer_id, group_count, checkpoint_root, group_size):
     return engine
 
 
-def measure_pair(teacher_model, student_model, eval_loader, output_json):
-    """Measure per-layer hidden-state drift between teacher and student."""
-    device = teacher_model.device
-    num_layers = len(teacher_model.model.layers)
+def measure_drift(model, eval_loader, engines, output_json):
+    """Measure per-layer hidden-state drift between teacher (no engines) and student (engines)."""
+    device = model.device
+    num_layers = len(model.model.layers)
 
     sum_err = [0.0] * num_layers
     sum_sq_err = [0.0] * num_layers
     max_err = [0.0] * num_layers
     total_tokens = [0] * num_layers
 
-    teacher_hooks = []
-    student_hooks = []
-    teacher_hidden = {}
-    student_hidden = {}
+    hooks = []
+    hidden = {}
 
-    def make_hook(store, layer_idx):
+    def make_hook(layer_idx):
         def hook(module, input, output):
             h = output[0] if isinstance(output, tuple) else output
-            store[layer_idx] = h.detach()
+            hidden[layer_idx] = h.detach()
         return hook
 
     for i in range(num_layers):
-        teacher_hooks.append(teacher_model.model.layers[i].register_forward_hook(make_hook(teacher_hidden, i)))
-        student_hooks.append(student_model.model.layers[i].register_forward_hook(make_hook(student_hidden, i)))
+        hooks.append(model.model.layers[i].register_forward_hook(make_hook(i)))
 
-    teacher_model.eval()
-    student_model.eval()
+    model.eval()
 
     with torch.no_grad():
         for batch in tqdm(eval_loader, desc="Measure drift", leave=False):
@@ -160,23 +158,33 @@ def measure_pair(teacher_model, student_model, eval_loader, output_json):
             attention_mask = batch.get("attention_mask")
             if attention_mask is not None:
                 attention_mask = attention_mask.to(device)
+            mask = attention_mask[:, 1:].bool() if attention_mask is not None else torch.ones(
+                input_ids.shape[0], input_ids.shape[1] - 1, dtype=torch.bool, device=device
+            )
 
-            teacher_hidden.clear()
-            student_hidden.clear()
-
+            # Student forward: engines installed
+            for engine in engines:
+                engine.install()
+            hidden.clear()
             with torch.autocast(device_type=device.type, dtype=torch.float16):
-                _ = teacher_model(input_ids=input_ids, attention_mask=attention_mask)
-                _ = student_model(input_ids=input_ids, attention_mask=attention_mask)
+                _ = model(input_ids=input_ids, attention_mask=attention_mask)
+            student_hidden = {i: hidden[i].float() for i in range(num_layers)}
+            for engine in engines:
+                engine.uninstall()
+
+            # Teacher forward: no engines
+            hidden.clear()
+            with torch.autocast(device_type=device.type, dtype=torch.float16):
+                _ = model(input_ids=input_ids, attention_mask=attention_mask)
+            teacher_hidden = {i: hidden[i].float() for i in range(num_layers)}
 
             for i in range(num_layers):
-                h_t = teacher_hidden[i].float()
-                h_s = student_hidden[i].float()
-                mask = attention_mask[:, 1:].bool() if attention_mask is not None else torch.ones(
-                    h_t.shape[0], h_t.shape[1], dtype=torch.bool, device=device
-                )
-                # h shape [B, S, D]; mask [B, S]
-                h_t_flat = h_t[mask]
-                h_s_flat = h_s[mask]
+                h_t = teacher_hidden[i]
+                h_s = student_hidden[i]
+                # Both [B, S, D]; mask [B, S-1] aligns with shifted logits.
+                # Use the same mask for hidden states (S dimension).
+                h_t_flat = h_t[:, :-1, :][mask]
+                h_s_flat = h_s[:, :-1, :][mask]
 
                 diff_norm = torch.norm(h_s_flat - h_t_flat, p=2, dim=-1)
                 teacher_norm = torch.norm(h_t_flat, p=2, dim=-1).clamp_min(1e-8)
@@ -190,9 +198,7 @@ def measure_pair(teacher_model, student_model, eval_loader, output_json):
                 max_err[i] = max(max_err[i], rel_err.max().item())
                 total_tokens[i] += n
 
-    for h in teacher_hooks:
-        h.remove()
-    for h in student_hooks:
+    for h in hooks:
         h.remove()
 
     result = []
@@ -226,10 +232,10 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--down_configs", default="",
-                        help="Comma-separated layer:count for down_proj, e.g. '21:8,22:8,23:8'")
+                        help="Comma-separated layer:count for down_proj")
     parser.add_argument("--down_checkpoint_root", default="../v5/outputs_tree_21_23")
     parser.add_argument("--o_configs", default="",
-                        help="Comma-separated layer:count for o_proj, e.g. '17:8'")
+                        help="Comma-separated layer:count for o_proj")
     parser.add_argument("--o_checkpoint_root", default="../v5/outputs_o_proj_l17")
     parser.add_argument("--eval_size", type=int, default=128)
     parser.add_argument("--max_seq_len", type=int, default=512)
@@ -248,31 +254,23 @@ def main():
     down_configs = parse_configs(args.down_configs) if args.down_configs else []
     o_configs = parse_configs(args.o_configs) if args.o_configs else []
 
-    print("Loading teacher model...")
-    teacher, _, _, eval_loader = load_model_and_data(
+    print("Loading model and data...")
+    model, _, _, eval_loader = load_model_and_data(
         args.model, eval_size=args.eval_size, max_seq_len=args.max_seq_len,
         batch_size=args.batch_size, device_str=args.device, calib_size=0,
     )
 
-    print("Loading student model...")
-    student, _, _, _ = load_model_and_data(
-        args.model, eval_size=args.eval_size, max_seq_len=args.max_seq_len,
-        batch_size=args.batch_size, device_str=args.device, calib_size=0,
-    )
-
-    print("Building engines for student...")
+    print("Building engines...")
+    engines = []
     for layer_id, group_count in down_configs:
-        engine = build_down_engine(student, layer_id, group_count, args.down_checkpoint_root, args.group_size)
-        engine.install()
+        engine = build_down_engine(model, layer_id, group_count, args.down_checkpoint_root, args.group_size)
+        engines.append(engine)
     for layer_id, group_count in o_configs:
-        engine = build_o_engine(student, layer_id, group_count, args.o_checkpoint_root, args.group_size)
-        engine.install()
+        engine = build_o_engine(model, layer_id, group_count, args.o_checkpoint_root, args.group_size)
+        engines.append(engine)
 
-    measure_pair(teacher, student, eval_loader, args.output_json)
-
-    for layer_id, group_count in down_configs:
-        # uninstall is handled per engine; we didn't keep refs, but can uninstall all by finding hooks?
-        pass
+    measure_drift(model, eval_loader, engines, args.output_json)
+    print(f"\nSaved to {args.output_json}")
 
 
 if __name__ == "__main__":
