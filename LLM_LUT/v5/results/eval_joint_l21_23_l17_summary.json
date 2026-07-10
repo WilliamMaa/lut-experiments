@@ -1,0 +1,36 @@
+{
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "down_configs": [
+    [
+      21,
+      8
+    ],
+    [
+      22,
+      8
+    ],
+    [
+      23,
+      8
+    ]
+  ],
+  "o_configs": [
+    [
+      17,
+      8
+    ]
+  ],
+  "mac_reduction_ratio": 0.004331228894435472,
+  "lut_storage_bytes": 4194304,
+  "lut_storage_human": "4.00 MiB",
+  "original": {
+    "kl": 0.00017037003122474234,
+    "ppl": 19.554128646850586,
+    "acc": 0.5132605304212169
+  },
+  "joint_replacement": {
+    "kl": 0.5750362844499823,
+    "ppl": 26.334867477416992,
+    "acc": 0.514820592823713
+  }
+}

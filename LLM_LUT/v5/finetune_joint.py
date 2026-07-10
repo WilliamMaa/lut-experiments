@@ -132,7 +132,7 @@ def build_o_proj_engine_for_layer(model, layer_id: int, group_count: int,
 
 
 def finetune(model, calib_loader, eval_loader, down_engines, o_engines, epochs, lr, output_dir,
-             baseline_eval_probs):
+             baseline_eval_probs, freeze_down=False, freeze_o=False):
     device = model.device
 
     down_projs = [model.model.layers[e.layer_id].mlp.down_proj for e in down_engines]
@@ -142,14 +142,26 @@ def finetune(model, calib_loader, eval_loader, down_engines, o_engines, epochs, 
         p.requires_grad_(False)
 
     trainable_params = []
-    for dp in down_projs:
-        dp.weight.requires_grad_(True)
-        trainable_params.append(dp.weight)
-    for op in o_projs:
-        op.weight.requires_grad_(True)
-        trainable_params.append(op.weight)
+    if not freeze_down:
+        for dp in down_projs:
+            dp.weight.requires_grad_(True)
+            trainable_params.append(dp.weight)
+    else:
+        for dp in down_projs:
+            dp.weight.requires_grad_(False)
+    if not freeze_o:
+        for op in o_projs:
+            op.weight.requires_grad_(True)
+            trainable_params.append(op.weight)
+    else:
+        for op in o_projs:
+            op.weight.requires_grad_(False)
     for engine in down_engines + o_engines:
-        trainable_params.extend(engine.trainable_parameters())
+        if (engine in down_engines and not freeze_down) or (engine in o_engines and not freeze_o):
+            trainable_params.extend(engine.trainable_parameters())
+        else:
+            for _, lut_group in engine.group_configs.values():
+                lut_group.table.requires_grad_(False)
 
     optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0.0, eps=1e-8)
 
@@ -179,9 +191,15 @@ def finetune(model, calib_loader, eval_loader, down_engines, o_engines, epochs, 
         print(f"\n[Epoch {epoch}/{epochs}] Fine-tuning {len(down_engines)} down_proj + {len(o_engines)} o_proj layers...")
         model.train()
         for dp in down_projs:
-            dp.train()
+            if not freeze_down:
+                dp.train()
+            else:
+                dp.eval()
         for op in o_projs:
-            op.train()
+            if not freeze_o:
+                op.train()
+            else:
+                op.eval()
 
         total_loss = 0.0
         num_batches = 0
@@ -231,12 +249,14 @@ def finetune(model, calib_loader, eval_loader, down_engines, o_engines, epochs, 
             torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0, error_if_nonfinite=True)
             optimizer.step()
 
-            for dp in down_projs:
-                if not torch.isfinite(dp.weight).all():
-                    raise RuntimeError(f"down_proj.weight became NaN/Inf after batch {bi}")
-            for op in o_projs:
-                if not torch.isfinite(op.weight).all():
-                    raise RuntimeError(f"o_proj.weight became NaN/Inf after batch {bi}")
+            if not freeze_down:
+                for dp in down_projs:
+                    if not torch.isfinite(dp.weight).all():
+                        raise RuntimeError(f"down_proj.weight became NaN/Inf after batch {bi}")
+            if not freeze_o:
+                for op in o_projs:
+                    if not torch.isfinite(op.weight).all():
+                        raise RuntimeError(f"o_proj.weight became NaN/Inf after batch {bi}")
 
             total_loss += loss.item()
             num_batches += 1
@@ -308,6 +328,10 @@ def main():
     parser.add_argument("--output_dir", default="results/finetune_joint_down_o")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--isolate_gpu", action="store_true")
+    parser.add_argument("--freeze_down", action="store_true",
+                        help="Install down_proj engines but do not update their weights/LUTs")
+    parser.add_argument("--freeze_o", action="store_true",
+                        help="Install o_proj engines but do not update their weights/LUTs")
     args = parser.parse_args()
 
     if args.isolate_gpu and args.device.startswith("cuda:"):
@@ -359,7 +383,8 @@ def main():
 
     baseline_metrics, results = finetune(
         model, calib_loader, eval_loader, down_engines, o_engines,
-        args.epochs, args.lr, args.output_dir, baseline_eval_probs
+        args.epochs, args.lr, args.output_dir, baseline_eval_probs,
+        freeze_down=args.freeze_down, freeze_o=args.freeze_o
     )
 
     # Full-model MAC reduction: major linear layers

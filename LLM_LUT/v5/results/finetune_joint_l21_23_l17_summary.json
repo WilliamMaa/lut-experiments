@@ -1,0 +1,120 @@
+{
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "down_configs": [
+    [
+      21,
+      8
+    ],
+    [
+      22,
+      8
+    ],
+    [
+      23,
+      8
+    ]
+  ],
+  "o_configs": [
+    [
+      17,
+      8
+    ]
+  ],
+  "epochs": 5,
+  "lr": 5e-05,
+  "mac_reduction_ratio": 0.004331228894435472,
+  "lut_storage_bytes": 4194304,
+  "lut_storage_human": "4.00 MiB",
+  "before": {
+    "kl": 0.5750362844499823,
+    "ppl": 26.334867477416992,
+    "acc": 0.514820592823713
+  },
+  "after": [
+    {
+      "epoch": 1,
+      "train_loss": 0.378504,
+      "kl": 0.49729460559479177,
+      "ppl": 28.181015014648438,
+      "acc": 0.500780031201248,
+      "checkpoints": {
+        "l21_down_proj": "results/finetune_joint_l21_23_l17/l21_epoch1_down_proj.pt",
+        "l21_down_lut": "results/finetune_joint_l21_23_l17/l21_epoch1_down_lut",
+        "l22_down_proj": "results/finetune_joint_l21_23_l17/l22_epoch1_down_proj.pt",
+        "l22_down_lut": "results/finetune_joint_l21_23_l17/l22_epoch1_down_lut",
+        "l23_down_proj": "results/finetune_joint_l21_23_l17/l23_epoch1_down_proj.pt",
+        "l23_down_lut": "results/finetune_joint_l21_23_l17/l23_epoch1_down_lut",
+        "l17_o_proj": "results/finetune_joint_l21_23_l17/l17_epoch1_o_proj.pt",
+        "l17_o_lut": "results/finetune_joint_l21_23_l17/l17_epoch1_o_lut"
+      }
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.399192,
+      "kl": 0.3593515533290497,
+      "ppl": 22.59938621520996,
+      "acc": 0.5195007800312013,
+      "checkpoints": {
+        "l21_down_proj": "results/finetune_joint_l21_23_l17/l21_epoch2_down_proj.pt",
+        "l21_down_lut": "results/finetune_joint_l21_23_l17/l21_epoch2_down_lut",
+        "l22_down_proj": "results/finetune_joint_l21_23_l17/l22_epoch2_down_proj.pt",
+        "l22_down_lut": "results/finetune_joint_l21_23_l17/l22_epoch2_down_lut",
+        "l23_down_proj": "results/finetune_joint_l21_23_l17/l23_epoch2_down_proj.pt",
+        "l23_down_lut": "results/finetune_joint_l21_23_l17/l23_epoch2_down_lut",
+        "l17_o_proj": "results/finetune_joint_l21_23_l17/l17_epoch2_o_proj.pt",
+        "l17_o_lut": "results/finetune_joint_l21_23_l17/l17_epoch2_o_lut"
+      }
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.25091,
+      "kl": 0.30807965422329836,
+      "ppl": 22.54607582092285,
+      "acc": 0.5101404056162246,
+      "checkpoints": {
+        "l21_down_proj": "results/finetune_joint_l21_23_l17/l21_epoch3_down_proj.pt",
+        "l21_down_lut": "results/finetune_joint_l21_23_l17/l21_epoch3_down_lut",
+        "l22_down_proj": "results/finetune_joint_l21_23_l17/l22_epoch3_down_proj.pt",
+        "l22_down_lut": "results/finetune_joint_l21_23_l17/l22_epoch3_down_lut",
+        "l23_down_proj": "results/finetune_joint_l21_23_l17/l23_epoch3_down_proj.pt",
+        "l23_down_lut": "results/finetune_joint_l21_23_l17/l23_epoch3_down_lut",
+        "l17_o_proj": "results/finetune_joint_l21_23_l17/l17_epoch3_o_proj.pt",
+        "l17_o_lut": "results/finetune_joint_l21_23_l17/l17_epoch3_o_lut"
+      }
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.210207,
+      "kl": 0.2919328371955924,
+      "ppl": 20.449172973632812,
+      "acc": 0.5179407176287052,
+      "checkpoints": {
+        "l21_down_proj": "results/finetune_joint_l21_23_l17/l21_epoch4_down_proj.pt",
+        "l21_down_lut": "results/finetune_joint_l21_23_l17/l21_epoch4_down_lut",
+        "l22_down_proj": "results/finetune_joint_l21_23_l17/l22_epoch4_down_proj.pt",
+        "l22_down_lut": "results/finetune_joint_l21_23_l17/l22_epoch4_down_lut",
+        "l23_down_proj": "results/finetune_joint_l21_23_l17/l23_epoch4_down_proj.pt",
+        "l23_down_lut": "results/finetune_joint_l21_23_l17/l23_epoch4_down_lut",
+        "l17_o_proj": "results/finetune_joint_l21_23_l17/l17_epoch4_o_proj.pt",
+        "l17_o_lut": "results/finetune_joint_l21_23_l17/l17_epoch4_o_lut"
+      }
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.194875,
+      "kl": 0.2550602926783366,
+      "ppl": 20.383094787597656,
+      "acc": 0.516380655226209,
+      "checkpoints": {
+        "l21_down_proj": "results/finetune_joint_l21_23_l17/l21_epoch5_down_proj.pt",
+        "l21_down_lut": "results/finetune_joint_l21_23_l17/l21_epoch5_down_lut",
+        "l22_down_proj": "results/finetune_joint_l21_23_l17/l22_epoch5_down_proj.pt",
+        "l22_down_lut": "results/finetune_joint_l21_23_l17/l22_epoch5_down_lut",
+        "l23_down_proj": "results/finetune_joint_l21_23_l17/l23_epoch5_down_proj.pt",
+        "l23_down_lut": "results/finetune_joint_l21_23_l17/l23_epoch5_down_lut",
+        "l17_o_proj": "results/finetune_joint_l21_23_l17/l17_epoch5_o_proj.pt",
+        "l17_o_lut": "results/finetune_joint_l21_23_l17/l17_epoch5_o_lut"
+      }
+    }
+  ]
+}
