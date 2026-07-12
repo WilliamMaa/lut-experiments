@@ -9,7 +9,7 @@ set -e
 
 export LD_LIBRARY_PATH=""
 export HF_HUB_OFFLINE=1
-export CUDA_VISIBLE_DEVICES=1
+export CUDA_VISIBLE_DEVICES=3
 
 MODEL="Qwen/Qwen2.5-7B-Instruct"
 CALIB_SIZE=512

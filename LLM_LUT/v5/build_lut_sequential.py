@@ -93,7 +93,7 @@ def build_tree_address(calib_x, group_target, num_bits, channels_per_bit, seed,
 def build_down_proj_layer(model, tokenizer, layer_id, group_ids, group_size,
                           address_mode, num_bins, num_bits, channels_per_bit,
                           tree_candidates, tree_min_samples, tree_max_samples,
-                          calib_texts, eval_texts, max_seq_len, device):
+                          calib_texts, eval_texts, max_seq_len, device, output_root):
     """Build down_proj LUTs for a single layer on the current student model."""
     data = capture_mlp_residual(model, tokenizer, layer_id, calib_texts, eval_texts,
                                 max_seq_len, device)
@@ -104,7 +104,7 @@ def build_down_proj_layer(model, tokenizer, layer_id, group_ids, group_size,
     hidden_size = data["hidden_size"]
 
     group_results = []
-    save_dir = os.path.join("checkpoints", f"l{layer_id}", f"g{len(group_ids)}")
+    save_dir = os.path.join(output_root, "checkpoints", f"l{layer_id}", f"g{len(group_ids)}")
     Path(save_dir).mkdir(parents=True, exist_ok=True)
 
     for gid in tqdm(group_ids, desc=f"L{layer_id} down_proj groups", leave=False):
@@ -193,7 +193,7 @@ def build_down_proj_layer(model, tokenizer, layer_id, group_ids, group_size,
 def build_o_proj_layer(model, tokenizer, layer_id, group_ids, group_size,
                        address_mode, num_bins, num_bits, channels_per_bit,
                        tree_candidates, tree_min_samples, tree_max_samples,
-                       mode, calib_texts, eval_texts, max_seq_len, device):
+                       mode, calib_texts, eval_texts, max_seq_len, device, output_root):
     """Build o_proj LUTs for a single layer on the current student model."""
     data = capture_o_proj_residual(model, tokenizer, layer_id, calib_texts, eval_texts,
                                    max_seq_len, device)
@@ -209,7 +209,7 @@ def build_o_proj_layer(model, tokenizer, layer_id, group_ids, group_size,
         target = calib_out
 
     group_results = []
-    save_dir = os.path.join("checkpoints", f"l{layer_id}", f"g{len(group_ids)}")
+    save_dir = os.path.join(output_root, "checkpoints", f"l{layer_id}", f"g{len(group_ids)}")
     Path(save_dir).mkdir(parents=True, exist_ok=True)
 
     for gid in tqdm(group_ids, desc=f"L{layer_id} o_proj groups", leave=False):
@@ -322,14 +322,13 @@ def main():
         if layer_id in o_by_layer:
             group_ids = o_by_layer[layer_id]
             print(f"  Building o_proj groups {group_ids} ({args.address_mode}, {args.o_mode})")
-            layer_results, rel_save_dir = build_o_proj_layer(
+            layer_results, save_dir = build_o_proj_layer(
                 model, tokenizer, layer_id, group_ids, args.group_size,
                 args.address_mode, args.num_bins, args.num_bits, args.channels_per_bit,
                 args.tree_candidates, args.tree_min_samples, args.tree_max_samples,
                 args.o_mode, calib_texts, eval_texts, args.max_seq_len, device,
+                output_root,
             )
-            # Save absolute path in summary
-            save_dir = os.path.join(output_root, rel_save_dir)
             o_results.append({
                 "layer_id": layer_id,
                 "group_ids": group_ids,
@@ -360,13 +359,13 @@ def main():
         if layer_id in down_by_layer:
             group_ids = down_by_layer[layer_id]
             print(f"  Building down_proj groups {group_ids} ({args.address_mode})")
-            layer_results, rel_save_dir = build_down_proj_layer(
+            layer_results, save_dir = build_down_proj_layer(
                 model, tokenizer, layer_id, group_ids, args.group_size,
                 args.address_mode, args.num_bins, args.num_bits, args.channels_per_bit,
                 args.tree_candidates, args.tree_min_samples, args.tree_max_samples,
                 calib_texts, eval_texts, args.max_seq_len, device,
+                output_root,
             )
-            save_dir = os.path.join(output_root, rel_save_dir)
             down_results.append({
                 "layer_id": layer_id,
                 "group_ids": group_ids,
