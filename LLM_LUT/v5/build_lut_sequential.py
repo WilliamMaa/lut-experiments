@@ -72,6 +72,22 @@ def parse_configs(arg_str: str) -> List[Tuple[int, int, List[int]]]:
     return configs
 
 
+def parse_o_modes(arg_str: str) -> Dict[int, str]:
+    """Parse per-layer o_proj modes, e.g. '15:direct,16:direct,27:delta'."""
+    modes = {}
+    if not arg_str:
+        return modes
+    for part in arg_str.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        layer_str, mode = part.split(":")
+        if mode not in ("direct", "delta"):
+            raise ValueError(f"Unknown o_proj mode: {mode}")
+        modes[int(layer_str)] = mode
+    return modes
+
+
 def build_tree_address(calib_x, group_target, num_bits, channels_per_bit, seed,
                        num_candidates, min_samples, max_samples):
     address = AddressGreedyTree(
@@ -278,7 +294,9 @@ def main():
     parser.add_argument("--tree_min_samples", type=int, default=32)
     parser.add_argument("--tree_max_samples", type=int, default=16384)
     parser.add_argument("--o_mode", default="direct", choices=["direct", "delta"],
-                        help="o_proj reconstruction mode")
+                        help="Default o_proj reconstruction mode")
+    parser.add_argument("--o_modes", default="",
+                        help="Per-layer o_proj modes, e.g. '15:direct,16:direct,27:delta'")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -290,6 +308,7 @@ def main():
     # Determine layer order
     down_by_layer = {lid: gids for lid, _, gids in down_configs}
     o_by_layer = {lid: gids for lid, _, gids in o_configs}
+    o_modes = parse_o_modes(args.o_modes)
     all_layers = sorted(set(down_by_layer.keys()) | set(o_by_layer.keys()))
 
     print("Loading model...")
@@ -321,24 +340,25 @@ def main():
         # Within a layer: o_proj first, then down_proj
         if layer_id in o_by_layer:
             group_ids = o_by_layer[layer_id]
-            print(f"  Building o_proj groups {group_ids} ({args.address_mode}, {args.o_mode})")
+            mode = o_modes.get(layer_id, args.o_mode)
+            print(f"  Building o_proj groups {group_ids} ({args.address_mode}, {mode})")
             layer_results, save_dir = build_o_proj_layer(
                 model, tokenizer, layer_id, group_ids, args.group_size,
                 args.address_mode, args.num_bins, args.num_bits, args.channels_per_bit,
                 args.tree_candidates, args.tree_min_samples, args.tree_max_samples,
-                args.o_mode, calib_texts, eval_texts, args.max_seq_len, device,
+                mode, calib_texts, eval_texts, args.max_seq_len, device,
                 output_root,
             )
             o_results.append({
                 "layer_id": layer_id,
                 "group_ids": group_ids,
-                "mode": args.o_mode,
+                "mode": mode,
                 "save_dir": save_dir,
                 "groups": layer_results,
             })
 
             # Install o_proj engine
-            engine = HybridOProjEngine(model, layer_id, group_size=args.group_size, mode=args.o_mode)
+            engine = HybridOProjEngine(model, layer_id, group_size=args.group_size, mode=mode)
             for gid in group_ids:
                 ckpt_path = os.path.join(save_dir, f"replacement_l{layer_id}g{gid}.pt")
                 ckpt = torch.load(ckpt_path, map_location="cpu")
