@@ -5,7 +5,8 @@
 
 set -e
 
-OUT="LLM_LUT/v5/results/sensitivity_scan.json"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+OUT="$SCRIPT_DIR/results/sensitivity_scan.json"
 
 if [ -f "$OUT" ]; then
     echo "Removing $OUT ..."
