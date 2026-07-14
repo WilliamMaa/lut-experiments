@@ -143,6 +143,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--output_json", default="results/sensitivity_scan.json")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from existing output_json if interrupted")
     args = parser.parse_args()
 
     modules = parse_modules(args.modules)
@@ -159,6 +161,16 @@ def main():
     )
     device = model.device
 
+    # Resume handling
+    existing_results = None
+    completed_modules = set()
+    if args.resume and os.path.exists(args.output_json):
+        print(f"Found existing {args.output_json}, resuming...")
+        with open(args.output_json, "r") as f:
+            existing_results = json.load(f)
+        completed_modules = set(existing_results.get("scans", {}).keys())
+        print(f"Already completed modules: {sorted(completed_modules)}")
+
     print("Computing baseline metrics...")
     model.eval()
     with torch.no_grad():
@@ -167,22 +179,34 @@ def main():
     print(f"Baseline: PPL={baseline_metrics['ppl']:.2f}, Acc={baseline_metrics['next_token_acc']:.4f}, "
           f"KL={baseline_metrics.get('avg_kl', 0):.4f}")
 
-    results = {
-        "model": args.model,
-        "modules": modules,
-        "layers": layers,
-        "group_size": args.group_size,
-        "calib_size": args.calib_size,
-        "eval_size": args.eval_size,
-        "baseline": {
+    if existing_results is not None:
+        results = existing_results
+        # Update baseline in case eval params changed
+        results["baseline"] = {
             "ppl": baseline_metrics["ppl"],
             "acc": baseline_metrics["next_token_acc"],
             "kl": baseline_metrics.get("avg_kl", 0.0),
-        },
-        "scans": {},
-    }
+        }
+    else:
+        results = {
+            "model": args.model,
+            "modules": modules,
+            "layers": layers,
+            "group_size": args.group_size,
+            "calib_size": args.calib_size,
+            "eval_size": args.eval_size,
+            "baseline": {
+                "ppl": baseline_metrics["ppl"],
+                "acc": baseline_metrics["next_token_acc"],
+                "kl": baseline_metrics.get("avg_kl", 0.0),
+            },
+            "scans": {},
+        }
 
     for module_name in modules:
+        if module_name in completed_modules:
+            print(f"\nSkipping already completed module: {module_name}")
+            continue
         print(f"\n{'='*60}")
         print(f"Scanning module: {module_name}")
         print(f"{'='*60}")
@@ -224,25 +248,26 @@ def main():
 
         results["scans"][module_name] = module_results
 
-    # Global ranking: best replacement score = -delta_ppl / mac_saved
-    all_candidates = []
-    for module_name, cand_list in results["scans"].items():
-        for c in cand_list:
-            c["score_ppl_per_mac"] = -c["delta_ppl"] / max(c["mac_saved_per_token"], 1)
-            c["score_acc_per_mac"] = -c["delta_acc"] / max(c["mac_saved_per_token"], 1)
-            all_candidates.append(c)
+        # Save after each module so we can resume if interrupted
+        all_candidates = []
+        for mn, cand_list in results["scans"].items():
+            for c in cand_list:
+                c["score_ppl_per_mac"] = -c["delta_ppl"] / max(c["mac_saved_per_token"], 1)
+                c["score_acc_per_mac"] = -c["delta_acc"] / max(c["mac_saved_per_token"], 1)
+                all_candidates.append(c)
 
-    all_candidates.sort(key=lambda x: x["score_ppl_per_mac"], reverse=True)
-    results["global_ranking_ppl"] = all_candidates[:200]
+        all_candidates.sort(key=lambda x: x["score_ppl_per_mac"], reverse=True)
+        results["global_ranking_ppl"] = all_candidates[:200]
 
-    all_candidates.sort(key=lambda x: x["score_acc_per_mac"], reverse=True)
-    results["global_ranking_acc"] = all_candidates[:200]
+        all_candidates.sort(key=lambda x: x["score_acc_per_mac"], reverse=True)
+        results["global_ranking_acc"] = all_candidates[:200]
 
-    Path(args.output_json).parent.mkdir(parents=True, exist_ok=True)
-    with open(args.output_json, "w") as f:
-        json.dump(results, f, indent=2)
+        Path(args.output_json).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.output_json, "w") as f:
+            json.dump(results, f, indent=2)
+        print(f"  Saved progress to {args.output_json}")
 
-    print(f"\nSaved results to {args.output_json}")
+    print(f"\nFinal results saved to {args.output_json}")
     print("\nTop 10 by PPL-per-MAC:")
     for i, c in enumerate(results["global_ranking_ppl"][:10], 1):
         print(f"  {i:2d}. {c['module']} L{c['layer']}g{c['group_id']}: "
