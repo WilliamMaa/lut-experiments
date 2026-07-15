@@ -24,6 +24,7 @@ Usage:
 import os
 import json
 import argparse
+import gc
 from pathlib import Path
 from typing import List, Tuple, Dict
 
@@ -90,6 +91,79 @@ def parse_o_modes(arg_str: str) -> Dict[int, str]:
             raise ValueError(f"Unknown o_proj mode: {mode}")
         modes[int(layer_str)] = mode
     return modes
+
+
+def build_address_from_ckpt(ckpt: dict):
+    """Build an address generator from a checkpoint dict."""
+    addr_type = ckpt.get("address_type", "tree")
+    if addr_type == "2d":
+        return Address2D(
+            addr_idx=ckpt["addr_idx"],
+            addr_mean=ckpt["addr_mean"],
+            addr_std=ckpt["addr_std"],
+            num_bins=ckpt["num_bins"],
+            addr_clip=ckpt.get("addr_clip", 3.0),
+        )
+    if addr_type == "high_order":
+        address = AddressHighOrderRandom(
+            input_dim=ckpt.get("input_dim", 1),
+            num_tables=ckpt["num_tables"],
+            num_bits=ckpt["num_bits"],
+            channels_per_bit=ckpt["channels_per_bit"],
+            addr_mean=ckpt["addr_mean"],
+            addr_std=ckpt["addr_std"],
+        )
+        address.channel_idx = ckpt["channel_idx"]
+        address.signs = ckpt["signs"]
+        address.input_dim = int(ckpt.get("input_dim", address.channel_idx.max().item() + 1))
+        return address
+    # tree
+    address = AddressGreedyTree(
+        input_dim=ckpt.get("input_dim", 1),
+        num_bits=ckpt["num_bits"],
+        channels_per_bit=ckpt["channels_per_bit"],
+        tree_state=ckpt["tree_state"],
+    )
+    return address
+
+
+def install_o_proj_engine(model, layer_id, group_ids, save_dir, mode, group_size, device):
+    """Install a previously built o_proj engine from checkpoint files."""
+    engine = HybridOProjEngine(model, layer_id, group_size=group_size, mode=mode)
+    for gid in group_ids:
+        ckpt_path = os.path.join(save_dir, f"replacement_l{layer_id}g{gid}.pt")
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        address = build_address_from_ckpt(ckpt)
+        table = ckpt["lut_table"]
+        lut_group = LUTGroup(table.shape[0], table.shape[1], table.shape[2], init_table=table)
+        lut_group = lut_group.to(device)
+        engine.add_group(gid, address, lut_group)
+    engine.install()
+    return engine
+
+
+def install_down_proj_engine(model, layer_id, group_ids, save_dir, group_size, device):
+    """Install a previously built down_proj engine from checkpoint files."""
+    engine = HybridPartialEngine(model, layer_id, group_size=group_size)
+    for gid in group_ids:
+        ckpt_path = os.path.join(save_dir, f"replacement_l{layer_id}g{gid}.pt")
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        address = build_address_from_ckpt(ckpt)
+        table = ckpt["lut_table"]
+        lut_group = LUTGroup(table.shape[0], table.shape[1], table.shape[2], init_table=table)
+        lut_group = lut_group.to(device)
+        engine.add_group(gid, address, lut_group)
+    engine.install()
+    return engine
+
+
+def is_layer_complete(layer_id, group_ids, output_root):
+    """Check whether all group checkpoints exist for a layer."""
+    if not group_ids:
+        return True
+    save_dir = os.path.join(output_root, "checkpoints", f"l{layer_id}", f"g{len(group_ids)}")
+    return all(os.path.exists(os.path.join(save_dir, f"replacement_l{layer_id}g{gid}.pt"))
+               for gid in group_ids)
 
 
 def build_tree_address(calib_x, group_target, num_bits, channels_per_bit, seed,
@@ -301,6 +375,8 @@ def main():
                         help="Default o_proj reconstruction mode")
     parser.add_argument("--o_modes", default="",
                         help="Per-layer o_proj modes, e.g. '15:direct,16:direct,27:delta'")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from existing checkpoints; skip completed layers")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -332,9 +408,17 @@ def main():
     output_root = args.output_root
     Path(output_root).mkdir(parents=True, exist_ok=True)
 
+    summary_path = os.path.join(output_root, "summary.json")
     installed_engines = []
     down_results = []
     o_results = []
+
+    if args.resume and os.path.exists(summary_path):
+        print(f"Resuming from {summary_path}")
+        with open(summary_path, "r") as f:
+            prev = json.load(f)
+        down_results = prev.get("down_results", [])
+        o_results = prev.get("o_results", [])
 
     for layer_id in all_layers:
         print(f"\n{'='*60}")
@@ -345,76 +429,69 @@ def main():
         if layer_id in o_by_layer:
             group_ids = o_by_layer[layer_id]
             mode = o_modes.get(layer_id, args.o_mode)
-            print(f"  Building o_proj groups {group_ids} ({args.address_mode}, {mode})")
-            layer_results, save_dir = build_o_proj_layer(
-                model, tokenizer, layer_id, group_ids, args.group_size,
-                args.address_mode, args.num_bins, args.num_bits, args.channels_per_bit,
-                args.tree_candidates, args.tree_min_samples, args.tree_max_samples,
-                mode, calib_texts, eval_texts, args.max_seq_len, device,
-                output_root,
-            )
-            o_results.append({
-                "layer_id": layer_id,
-                "group_ids": group_ids,
-                "mode": mode,
-                "save_dir": save_dir,
-                "groups": layer_results,
-            })
+            save_dir = os.path.join(output_root, "checkpoints", f"l{layer_id}", f"g{len(group_ids)}")
 
-            # Install o_proj engine
-            engine = HybridOProjEngine(model, layer_id, group_size=args.group_size, mode=mode)
-            for gid in group_ids:
-                ckpt_path = os.path.join(save_dir, f"replacement_l{layer_id}g{gid}.pt")
-                ckpt = torch.load(ckpt_path, map_location="cpu")
-                address = AddressGreedyTree(
-                    input_dim=ckpt["input_dim"],
-                    num_bits=ckpt["num_bits"],
-                    channels_per_bit=ckpt["channels_per_bit"],
-                    tree_state=ckpt["tree_state"],
+            if args.resume and is_layer_complete(layer_id, group_ids, output_root):
+                print(f"  Resuming o_proj groups {group_ids} ({mode}) from {save_dir}")
+                engine = install_o_proj_engine(model, layer_id, group_ids, save_dir, mode, args.group_size, device)
+                installed_engines.append(engine)
+                print(f"  Installed o_proj engine for L{layer_id}")
+            else:
+                print(f"  Building o_proj groups {group_ids} ({args.address_mode}, {mode})")
+                layer_results, save_dir = build_o_proj_layer(
+                    model, tokenizer, layer_id, group_ids, args.group_size,
+                    args.address_mode, args.num_bins, args.num_bits, args.channels_per_bit,
+                    args.tree_candidates, args.tree_min_samples, args.tree_max_samples,
+                    mode, calib_texts, eval_texts, args.max_seq_len, device,
+                    output_root,
                 )
-                table = ckpt["lut_table"]
-                lut_group = LUTGroup(table.shape[0], table.shape[1], table.shape[2], init_table=table)
-                lut_group = lut_group.to(device)
-                engine.add_group(gid, address, lut_group)
-            engine.install()
-            installed_engines.append(engine)
-            print(f"  Installed o_proj engine for L{layer_id}")
+                # Remove any previous result for this layer to keep summary clean on re-run
+                o_results = [r for r in o_results if r["layer_id"] != layer_id]
+                o_results.append({
+                    "layer_id": layer_id,
+                    "group_ids": group_ids,
+                    "mode": mode,
+                    "save_dir": save_dir,
+                    "groups": layer_results,
+                })
+
+                engine = install_o_proj_engine(model, layer_id, group_ids, save_dir, mode, args.group_size, device)
+                installed_engines.append(engine)
+                print(f"  Installed o_proj engine for L{layer_id}")
+            gc.collect()
+            torch.cuda.empty_cache()
 
         if layer_id in down_by_layer:
             group_ids = down_by_layer[layer_id]
-            print(f"  Building down_proj groups {group_ids} ({args.address_mode})")
-            layer_results, save_dir = build_down_proj_layer(
-                model, tokenizer, layer_id, group_ids, args.group_size,
-                args.address_mode, args.num_bins, args.num_bits, args.channels_per_bit,
-                args.tree_candidates, args.tree_min_samples, args.tree_max_samples,
-                calib_texts, eval_texts, args.max_seq_len, device,
-                output_root,
-            )
-            down_results.append({
-                "layer_id": layer_id,
-                "group_ids": group_ids,
-                "save_dir": save_dir,
-                "groups": layer_results,
-            })
+            save_dir = os.path.join(output_root, "checkpoints", f"l{layer_id}", f"g{len(group_ids)}")
 
-            # Install down_proj engine
-            engine = HybridPartialEngine(model, layer_id, group_size=args.group_size)
-            for gid in group_ids:
-                ckpt_path = os.path.join(save_dir, f"replacement_l{layer_id}g{gid}.pt")
-                ckpt = torch.load(ckpt_path, map_location="cpu")
-                address = AddressGreedyTree(
-                    input_dim=ckpt["input_dim"],
-                    num_bits=ckpt["num_bits"],
-                    channels_per_bit=ckpt["channels_per_bit"],
-                    tree_state=ckpt["tree_state"],
+            if args.resume and is_layer_complete(layer_id, group_ids, output_root):
+                print(f"  Resuming down_proj groups {group_ids} from {save_dir}")
+                engine = install_down_proj_engine(model, layer_id, group_ids, save_dir, args.group_size, device)
+                installed_engines.append(engine)
+                print(f"  Installed down_proj engine for L{layer_id}")
+            else:
+                print(f"  Building down_proj groups {group_ids} ({args.address_mode})")
+                layer_results, save_dir = build_down_proj_layer(
+                    model, tokenizer, layer_id, group_ids, args.group_size,
+                    args.address_mode, args.num_bins, args.num_bits, args.channels_per_bit,
+                    args.tree_candidates, args.tree_min_samples, args.tree_max_samples,
+                    calib_texts, eval_texts, args.max_seq_len, device,
+                    output_root,
                 )
-                table = ckpt["lut_table"]
-                lut_group = LUTGroup(table.shape[0], table.shape[1], table.shape[2], init_table=table)
-                lut_group = lut_group.to(device)
-                engine.add_group(gid, address, lut_group)
-            engine.install()
-            installed_engines.append(engine)
-            print(f"  Installed down_proj engine for L{layer_id}")
+                down_results = [r for r in down_results if r["layer_id"] != layer_id]
+                down_results.append({
+                    "layer_id": layer_id,
+                    "group_ids": group_ids,
+                    "save_dir": save_dir,
+                    "groups": layer_results,
+                })
+
+                engine = install_down_proj_engine(model, layer_id, group_ids, save_dir, args.group_size, device)
+                installed_engines.append(engine)
+                print(f"  Installed down_proj engine for L{layer_id}")
+            gc.collect()
+            torch.cuda.empty_cache()
 
     # Uninstall all engines after build (checkpoints already saved)
     for engine in installed_engines:

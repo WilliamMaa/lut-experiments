@@ -47,7 +47,8 @@ python build_lut_sequential.py \
     --calib_size "$CALIB_SIZE" \
     --eval_size "$EVAL_SIZE" \
     --max_seq_len "$MAX_SEQ_LEN" \
-    --output_root "$OUTPUT_ROOT"
+    --output_root "$OUTPUT_ROOT" \
+    --resume
 
 # ------------------------------------------------------------------
 # 2. Joint fine-tune
