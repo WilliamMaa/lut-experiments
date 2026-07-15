@@ -43,8 +43,18 @@ def tokenize_texts(tokenizer, texts, max_seq_len):
     )
 
 
+def _run_forward_batches(model, tokens, batch_size, device):
+    """Run model forward in small batches to reduce peak GPU memory."""
+    n = tokens["input_ids"].shape[0]
+    for i in range(0, n, batch_size):
+        batch = {k: v[i:i + batch_size].to(device) for k, v in tokens.items()}
+        with torch.no_grad():
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                _ = model(**batch)
+
+
 def capture_mlp_residual(model, tokenizer, layer_id, calib_texts, eval_texts,
-                         max_seq_len, device):
+                         max_seq_len, device, batch_size=32):
     """Capture MLP input (residual) and down_proj output for a layer."""
     layer = model.model.layers[layer_id]
     mlp = layer.mlp
@@ -52,14 +62,21 @@ def capture_mlp_residual(model, tokenizer, layer_id, calib_texts, eval_texts,
     hidden_size = down_proj.weight.shape[0]
     intermediate_size = down_proj.weight.shape[1]
 
-    captured = {"x": [], "down_out": []}
+    captured = {"calib_x": [], "calib_down": [], "eval_x": [], "eval_down": []}
 
     def mlp_hook(module, input, output):
         x = input[0] if isinstance(input, tuple) else input
         captured["x"].append(x.detach())
         captured["down_out"].append(output.detach())
 
-    handle = mlp.register_forward_hook(mlp_hook)
+    def make_hook(key_x, key_out):
+        def hook(module, input, output):
+            x = input[0] if isinstance(input, tuple) else input
+            captured[key_x].append(x.detach())
+            captured[key_out].append(output.detach())
+        return hook
+
+    handle = mlp.register_forward_hook(make_hook("calib_x", "calib_down"))
     calib_texts_plain = [t["text"] if isinstance(t, dict) else t for t in calib_texts]
     eval_texts_plain = [t["text"] if isinstance(t, dict) else t for t in eval_texts]
     calib_tok = tokenize_texts(tokenizer, calib_texts_plain, max_seq_len)
@@ -67,10 +84,10 @@ def capture_mlp_residual(model, tokenizer, layer_id, calib_texts, eval_texts,
 
     try:
         model.eval()
-        with torch.no_grad():
-            with torch.autocast(device_type="cuda", dtype=torch.float16):
-                _ = model(**{k: v.to(device) for k, v in calib_tok.items()})
-                _ = model(**{k: v.to(device) for k, v in eval_tok.items()})
+        _run_forward_batches(model, calib_tok, batch_size, device)
+        handle.remove()
+        handle = mlp.register_forward_hook(make_hook("eval_x", "eval_down"))
+        _run_forward_batches(model, eval_tok, batch_size, device)
     finally:
         handle.remove()
 
@@ -78,10 +95,10 @@ def capture_mlp_residual(model, tokenizer, layer_id, calib_texts, eval_texts,
         return torch.cat([t.view(-1, t.shape[-1]) for t in seq], dim=0)
 
     return {
-        "calib_x": flatten(captured["x"][0::2]),
-        "calib_down": flatten(captured["down_out"][0::2]),
-        "eval_x": flatten(captured["x"][1::2]),
-        "eval_down": flatten(captured["down_out"][1::2]),
+        "calib_x": flatten(captured["calib_x"]),
+        "calib_down": flatten(captured["calib_down"]),
+        "eval_x": flatten(captured["eval_x"]),
+        "eval_down": flatten(captured["eval_down"]),
         "hidden_size": hidden_size,
         "intermediate_size": intermediate_size,
     }

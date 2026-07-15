@@ -187,10 +187,11 @@ def build_tree_address(calib_x, group_target, num_bits, channels_per_bit, seed,
 def build_down_proj_layer(model, tokenizer, layer_id, group_ids, group_size,
                           address_mode, num_bins, num_bits, channels_per_bit,
                           tree_candidates, tree_min_samples, tree_max_samples,
-                          calib_texts, eval_texts, max_seq_len, device, output_root):
+                          calib_texts, eval_texts, max_seq_len, device, output_root,
+                          capture_batch_size=32):
     """Build down_proj LUTs for a single layer on the current student model."""
     data = capture_mlp_residual(model, tokenizer, layer_id, calib_texts, eval_texts,
-                                max_seq_len, device)
+                                max_seq_len, device, batch_size=capture_batch_size)
     calib_x = data["calib_x"]
     calib_down = data["calib_down"]
     eval_x = data["eval_x"]
@@ -287,10 +288,11 @@ def build_down_proj_layer(model, tokenizer, layer_id, group_ids, group_size,
 def build_o_proj_layer(model, tokenizer, layer_id, group_ids, group_size,
                        address_mode, num_bins, num_bits, channels_per_bit,
                        tree_candidates, tree_min_samples, tree_max_samples,
-                       mode, calib_texts, eval_texts, max_seq_len, device, output_root):
+                       mode, calib_texts, eval_texts, max_seq_len, device, output_root,
+                       capture_batch_size=32):
     """Build o_proj LUTs for a single layer on the current student model."""
     data = capture_o_proj_residual(model, tokenizer, layer_id, calib_texts, eval_texts,
-                                   max_seq_len, device)
+                                   max_seq_len, device, batch_size=capture_batch_size)
     calib_x = data["calib_x"]
     calib_out = data["calib_out"]
     eval_x = data["eval_x"]
@@ -377,6 +379,8 @@ def main():
                         help="Per-layer o_proj modes, e.g. '15:direct,16:direct,27:delta'")
     parser.add_argument("--resume", action="store_true",
                         help="Resume from existing checkpoints; skip completed layers")
+    parser.add_argument("--capture_batch_size", type=int, default=32,
+                        help="Batch size for capture forward passes (reduce if OOM)")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -443,7 +447,7 @@ def main():
                     args.address_mode, args.num_bins, args.num_bits, args.channels_per_bit,
                     args.tree_candidates, args.tree_min_samples, args.tree_max_samples,
                     mode, calib_texts, eval_texts, args.max_seq_len, device,
-                    output_root,
+                    output_root, capture_batch_size=args.capture_batch_size,
                 )
                 # Remove any previous result for this layer to keep summary clean on re-run
                 o_results = [r for r in o_results if r["layer_id"] != layer_id]
@@ -477,7 +481,7 @@ def main():
                     args.address_mode, args.num_bins, args.num_bits, args.channels_per_bit,
                     args.tree_candidates, args.tree_min_samples, args.tree_max_samples,
                     calib_texts, eval_texts, args.max_seq_len, device,
-                    output_root,
+                    output_root, capture_batch_size=args.capture_batch_size,
                 )
                 down_results = [r for r in down_results if r["layer_id"] != layer_id]
                 down_results.append({
