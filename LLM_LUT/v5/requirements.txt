@@ -1,0 +1,6 @@
+# LLM_LUT/v5 latest-run code dependencies
+# Install in a Python 3.10+ env with CUDA 12.x support
+torch>=2.0
+transformers>=4.40
+tqdm
+numpy

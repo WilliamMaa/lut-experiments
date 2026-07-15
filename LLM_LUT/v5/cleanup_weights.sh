@@ -42,7 +42,10 @@ for d in "${OLD_OUTPUT_DIRS[@]}"; do
 done
 
 echo "=== Cleaning any leftover .pt / .bin / .safetensors under outputs_* ==="
-for f in outputs_*/*.pt outputs_*/*.bin outputs_*/*.safetensors 2>/dev/null; do
+shopt -s nullglob
+files=(outputs_*/*.pt outputs_*/*.bin outputs_*/*.safetensors)
+shopt -u nullglob
+for f in "${files[@]}"; do
     [ -e "$f" ] || continue
     run_cmd rm -f "$f"
 done
