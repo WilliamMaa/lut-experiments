@@ -38,6 +38,8 @@ def parse_configs(arg_str: str) -> List[Tuple[int, int]]:
         if not part:
             continue
         layer_str, count_str = part.split(":")
+        # Allow group ids after count, e.g. layer:count;id1;id2 or layer:count:id1;id2
+        count_str = count_str.split(";")[0]
         configs.append((int(layer_str), int(count_str)))
     return configs
 

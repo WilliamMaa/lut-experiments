@@ -61,8 +61,12 @@ def parse_configs(arg_str: str) -> List[Tuple[int, int, List[int]]]:
             continue
         tokens = part.split(":")
         layer_id = int(tokens[0])
-        count = int(tokens[1])
-        if len(tokens) >= 3:
+        # Support both layer:count and layer:count;id1;id2;... (and legacy layer:count:id1;id2)
+        rest_after_layer = tokens[1].split(";")
+        count = int(rest_after_layer[0])
+        if len(rest_after_layer) >= 2:
+            group_ids = [int(x) for x in rest_after_layer[1:]]
+        elif len(tokens) >= 3:
             group_ids = [int(x) for x in tokens[2].split(";")]
         else:
             group_ids = list(range(count))
