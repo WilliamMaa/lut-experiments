@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from engine import HybridPartialEngine, HybridOProjEngine
+from hybrid_gate_proj_engine import HybridGateProjEngine
 from address import Address2D, AddressHighOrderRandom, AddressGreedyTree
 from lut import LUTGroup
 from utils import load_model_and_data, collect_baseline_logits
@@ -87,7 +88,7 @@ def build_address(ckpt: dict):
 
 def build_down_engine_for_layer(model, layer_id: int, group_count: int,
                                 checkpoint_root: str, group_size: int) -> HybridPartialEngine:
-    ckpt_dir = os.path.join(checkpoint_root, "checkpoints", f"l{layer_id}", f"g{group_count}")
+    ckpt_dir = os.path.join(checkpoint_root, "checkpoints", f"l{layer_id}", "down_proj", f"g{group_count}")
     pattern = os.path.join(ckpt_dir, f"replacement_l{layer_id}g*.pt")
     paths = sorted(glob.glob(pattern))
     if not paths:
@@ -110,7 +111,7 @@ def build_down_engine_for_layer(model, layer_id: int, group_count: int,
 
 def build_o_proj_engine_for_layer(model, layer_id: int, group_count: int,
                                   checkpoint_root: str, group_size: int) -> HybridOProjEngine:
-    ckpt_dir = os.path.join(checkpoint_root, "checkpoints", f"l{layer_id}", f"g{group_count}")
+    ckpt_dir = os.path.join(checkpoint_root, "checkpoints", f"l{layer_id}", "o_proj", f"g{group_count}")
     pattern = os.path.join(ckpt_dir, f"replacement_l{layer_id}g*.pt")
     paths = sorted(glob.glob(pattern))
     if not paths:
@@ -133,11 +134,35 @@ def build_o_proj_engine_for_layer(model, layer_id: int, group_count: int,
     return engine
 
 
-def finetune(model, calib_loader, eval_loader, down_engines, o_engines, epochs, lr, output_dir,
-             baseline_eval_probs, freeze_down=False, freeze_o=False):
+def build_gate_proj_engine_for_layer(model, layer_id: int, group_count: int,
+                                     checkpoint_root: str, group_size: int) -> HybridGateProjEngine:
+    ckpt_dir = os.path.join(checkpoint_root, "checkpoints", f"l{layer_id}", "gate_proj", f"g{group_count}")
+    pattern = os.path.join(ckpt_dir, f"replacement_l{layer_id}g*.pt")
+    paths = sorted(glob.glob(pattern))
+    if not paths:
+        raise ValueError(f"No gate_proj checkpoints for L{layer_id} G{group_count} in {ckpt_dir}")
+
+    engine = HybridGateProjEngine(model, layer_id, group_size=group_size)
+    for p in paths:
+        name = os.path.basename(p)
+        prefix = f"replacement_l{layer_id}g"
+        suffix = ".pt"
+        gid = int(name[len(prefix):-len(suffix)])
+        ckpt = torch.load(p, map_location="cpu")
+        address = build_address(ckpt)
+        table = ckpt["lut_table"]
+        lut_group = LUTGroup(table.shape[0], table.shape[1], table.shape[2], init_table=table)
+        lut_group = lut_group.to(model.device)
+        engine.add_group(gid, address, lut_group)
+    return engine
+
+
+def finetune(model, calib_loader, eval_loader, down_engines, gate_engines, o_engines, epochs, lr, output_dir,
+             baseline_eval_probs, freeze_down=False, freeze_gate=False, freeze_o=False):
     device = model.device
 
     down_projs = [model.model.layers[e.layer_id].mlp.down_proj for e in down_engines]
+    gate_projs = [model.model.layers[e.layer_id].mlp.gate_proj for e in gate_engines]
     o_projs = [model.model.layers[e.layer_id].self_attn.o_proj for e in o_engines]
 
     for p in model.parameters():
@@ -151,6 +176,13 @@ def finetune(model, calib_loader, eval_loader, down_engines, o_engines, epochs, 
     else:
         for dp in down_projs:
             dp.weight.requires_grad_(False)
+    if not freeze_gate:
+        for gp in gate_projs:
+            gp.weight.requires_grad_(True)
+            trainable_params.append(gp.weight)
+    else:
+        for gp in gate_projs:
+            gp.weight.requires_grad_(False)
     if not freeze_o:
         for op in o_projs:
             op.weight.requires_grad_(True)
@@ -158,8 +190,10 @@ def finetune(model, calib_loader, eval_loader, down_engines, o_engines, epochs, 
     else:
         for op in o_projs:
             op.weight.requires_grad_(False)
-    for engine in down_engines + o_engines:
-        if (engine in down_engines and not freeze_down) or (engine in o_engines and not freeze_o):
+    for engine in down_engines + gate_engines + o_engines:
+        if (engine in down_engines and not freeze_down) or \
+           (engine in gate_engines and not freeze_gate) or \
+           (engine in o_engines and not freeze_o):
             trainable_params.extend(engine.trainable_parameters())
         else:
             for _, lut_group in engine.group_configs.values():
@@ -171,13 +205,16 @@ def finetune(model, calib_loader, eval_loader, down_engines, o_engines, epochs, 
     baseline_logits = collect_baseline_logits(model, calib_loader)
 
     down_original_dtypes = [dp.weight.dtype for dp in down_projs]
+    gate_original_dtypes = [gp.weight.dtype for gp in gate_projs]
     o_original_dtypes = [op.weight.dtype for op in o_projs]
     for dp in down_projs:
         dp.weight.data = dp.weight.data.float()
+    for gp in gate_projs:
+        gp.weight.data = gp.weight.data.float()
     for op in o_projs:
         op.weight.data = op.weight.data.float()
 
-    for engine in down_engines + o_engines:
+    for engine in down_engines + gate_engines + o_engines:
         engine.install()
 
     print("\n[Pre-train eval] Baseline evaluation (LUT model, before fine-tuning)...")
@@ -190,13 +227,18 @@ def finetune(model, calib_loader, eval_loader, down_engines, o_engines, epochs, 
 
     results = []
     for epoch in range(1, epochs + 1):
-        print(f"\n[Epoch {epoch}/{epochs}] Fine-tuning {len(down_engines)} down_proj + {len(o_engines)} o_proj layers...")
+        print(f"\n[Epoch {epoch}/{epochs}] Fine-tuning {len(down_engines)} down + {len(gate_engines)} gate + {len(o_engines)} o layers...")
         model.train()
         for dp in down_projs:
             if not freeze_down:
                 dp.train()
             else:
                 dp.eval()
+        for gp in gate_projs:
+            if not freeze_gate:
+                gp.train()
+            else:
+                gp.eval()
         for op in o_projs:
             if not freeze_o:
                 op.train()
@@ -255,6 +297,10 @@ def finetune(model, calib_loader, eval_loader, down_engines, o_engines, epochs, 
                 for dp in down_projs:
                     if not torch.isfinite(dp.weight).all():
                         raise RuntimeError(f"down_proj.weight became NaN/Inf after batch {bi}")
+            if not freeze_gate:
+                for gp in gate_projs:
+                    if not torch.isfinite(gp.weight).all():
+                        raise RuntimeError(f"gate_proj.weight became NaN/Inf after batch {bi}")
             if not freeze_o:
                 for op in o_projs:
                     if not torch.isfinite(op.weight).all():
@@ -269,6 +315,8 @@ def finetune(model, calib_loader, eval_loader, down_engines, o_engines, epochs, 
         model.eval()
         for dp in down_projs:
             dp.eval()
+        for gp in gate_projs:
+            gp.eval()
         for op in o_projs:
             op.eval()
         with torch.no_grad():
@@ -286,6 +334,16 @@ def finetune(model, calib_loader, eval_loader, down_engines, o_engines, epochs, 
             lut_dir = os.path.join(output_dir, f"l{lid}_epoch{epoch}_down_lut")
             engine.save_group_checkpoints(lut_dir)
             epoch_paths[f"l{lid}_down_lut"] = lut_dir
+
+        for engine, orig_dtype in zip(gate_engines, gate_original_dtypes):
+            lid = engine.layer_id
+            gp = model.model.layers[lid].mlp.gate_proj
+            w_path = os.path.join(output_dir, f"l{lid}_epoch{epoch}_gate_proj.pt")
+            torch.save(gp.weight.data.to(orig_dtype).cpu(), w_path)
+            epoch_paths[f"l{lid}_gate_proj"] = w_path
+            lut_dir = os.path.join(output_dir, f"l{lid}_epoch{epoch}_gate_lut")
+            engine.save_group_checkpoints(lut_dir)
+            epoch_paths[f"l{lid}_gate_lut"] = lut_dir
 
         for engine, orig_dtype in zip(o_engines, o_original_dtypes):
             lid = engine.layer_id
@@ -306,7 +364,7 @@ def finetune(model, calib_loader, eval_loader, down_engines, o_engines, epochs, 
             "checkpoints": epoch_paths,
         })
 
-    for engine in down_engines + o_engines:
+    for engine in down_engines + gate_engines + o_engines:
         engine.uninstall()
     return baseline_metrics, results
 
@@ -314,12 +372,17 @@ def finetune(model, calib_loader, eval_loader, down_engines, o_engines, epochs, 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="Qwen/Qwen2.5-7B-Instruct")
-    parser.add_argument("--down_configs", required=True,
+    parser.add_argument("--down_configs", default="",
                         help="Comma-separated layer:count for down_proj, e.g. '21:8,22:8,23:8'")
     parser.add_argument("--down_checkpoint_root", default="../v5/outputs_tree_21_23")
-    parser.add_argument("--o_configs", required=True,
+    parser.add_argument("--o_configs", default="",
                         help="Comma-separated layer:count for o_proj, e.g. '17:8'")
     parser.add_argument("--o_checkpoint_root", default="../v5/outputs_o_proj_l17")
+    parser.add_argument("--gate_configs", default="",
+                        help="Comma-separated layer:count for gate_proj, e.g. '20:16,21:16'")
+    parser.add_argument("--gate_checkpoint_root", default="../v5/outputs_gate_proj")
+    parser.add_argument("--freeze_gate", action="store_true",
+                        help="Install gate_proj engines but do not update their weights/LUTs")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--calib_size", type=int, default=512)
@@ -342,14 +405,16 @@ def main():
         args.device = "cuda:0"
 
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
-    down_configs = parse_configs(args.down_configs)
-    o_configs = parse_configs(args.o_configs)
+    down_configs = parse_configs(args.down_configs) if args.down_configs else []
+    gate_configs = parse_configs(args.gate_configs) if args.gate_configs else []
+    o_configs = parse_configs(args.o_configs) if args.o_configs else []
 
     print("=" * 70)
-    print("v5 Joint down_proj + o_proj Hybrid LUT Fine-Tune")
+    print("v5 Joint down_proj + gate_proj + o_proj Hybrid LUT Fine-Tune")
     print("=" * 70)
     print(f"Model: {args.model}")
     print(f"down_proj configs: {down_configs}")
+    print(f"gate_proj configs: {gate_configs}")
     print(f"o_proj configs: {o_configs}")
     print(f"Epochs={args.epochs}, LR={args.lr}")
     print("=" * 70)
@@ -371,6 +436,13 @@ def main():
         )
         down_engines.append(engine)
 
+    gate_engines = []
+    for layer_id, group_count in gate_configs:
+        engine = build_gate_proj_engine_for_layer(
+            model, layer_id, group_count, args.gate_checkpoint_root, args.group_size
+        )
+        gate_engines.append(engine)
+
     o_engines = []
     for layer_id, group_count in o_configs:
         engine = build_o_proj_engine_for_layer(
@@ -384,27 +456,33 @@ def main():
         baseline_eval_probs = compute_baseline_probs(model, eval_loader)
 
     baseline_metrics, results = finetune(
-        model, calib_loader, eval_loader, down_engines, o_engines,
+        model, calib_loader, eval_loader, down_engines, gate_engines, o_engines,
         args.epochs, args.lr, args.output_dir, baseline_eval_probs,
-        freeze_down=args.freeze_down, freeze_o=args.freeze_o
+        freeze_down=args.freeze_down, freeze_gate=args.freeze_gate, freeze_o=args.freeze_o
     )
 
     # Full-model MAC reduction: major linear layers
     per_layer_total = 4 * hidden_size * hidden_size + 3 * hidden_size * intermediate_size
     full_model_total = num_layers * per_layer_total
     down_eliminated = sum(count * args.group_size * intermediate_size for _, count in down_configs)
+    gate_eliminated = sum(count * args.group_size * hidden_size for _, count in gate_configs)
     o_eliminated = sum(count * args.group_size * hidden_size for _, count in o_configs)
-    mac_reduction = (down_eliminated + o_eliminated) / full_model_total
+    mac_reduction = (down_eliminated + gate_eliminated + o_eliminated) / full_model_total
 
-    # LUT storage from both roots
+    # LUT storage from all roots
     total_bytes = 0
     for layer_id, group_count in down_configs:
-        ckpt_dir = os.path.join(args.down_checkpoint_root, "checkpoints", f"l{layer_id}", f"g{group_count}")
+        ckpt_dir = os.path.join(args.down_checkpoint_root, "checkpoints", f"l{layer_id}", "down_proj", f"g{group_count}")
+        for p in glob.glob(os.path.join(ckpt_dir, "*.pt")):
+            ckpt = torch.load(p, map_location="cpu")
+            total_bytes += ckpt["lut_table"].numel() * 2
+    for layer_id, group_count in gate_configs:
+        ckpt_dir = os.path.join(args.gate_checkpoint_root, "checkpoints", f"l{layer_id}", "gate_proj", f"g{group_count}")
         for p in glob.glob(os.path.join(ckpt_dir, "*.pt")):
             ckpt = torch.load(p, map_location="cpu")
             total_bytes += ckpt["lut_table"].numel() * 2
     for layer_id, group_count in o_configs:
-        ckpt_dir = os.path.join(args.o_checkpoint_root, "checkpoints", f"l{layer_id}", f"g{group_count}")
+        ckpt_dir = os.path.join(args.o_checkpoint_root, "checkpoints", f"l{layer_id}", "o_proj", f"g{group_count}")
         for p in glob.glob(os.path.join(ckpt_dir, "*.pt")):
             ckpt = torch.load(p, map_location="cpu")
             total_bytes += ckpt["lut_table"].numel() * 2
@@ -412,6 +490,7 @@ def main():
     summary = {
         "model": args.model,
         "down_configs": down_configs,
+        "gate_configs": gate_configs,
         "o_configs": o_configs,
         "epochs": args.epochs,
         "lr": args.lr,

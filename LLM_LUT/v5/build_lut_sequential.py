@@ -37,6 +37,7 @@ from data import load_jsonl
 from address import Address2D, AddressHighOrderRandom, AddressGreedyTree
 from lut import LUTGroup
 from engine import HybridPartialEngine, HybridOProjEngine
+from hybrid_gate_proj_engine import HybridGateProjEngine
 
 # Import capture/build helpers from existing scripts
 from build_lut import (
@@ -48,6 +49,9 @@ from build_lut import (
 from build_lut_o_proj import (
     capture_o_proj_residual,
     evaluate_group as evaluate_o_group,
+)
+from build_lut_gate_proj import (
+    build_gate_proj_layer,
 )
 
 
@@ -142,6 +146,21 @@ def install_o_proj_engine(model, layer_id, group_ids, save_dir, mode, group_size
     return engine
 
 
+def install_gate_proj_engine(model, layer_id, group_ids, save_dir, group_size, device):
+    """Install a previously built gate_proj engine from checkpoint files."""
+    engine = HybridGateProjEngine(model, layer_id, group_size=group_size)
+    for gid in group_ids:
+        ckpt_path = os.path.join(save_dir, f"replacement_l{layer_id}g{gid}.pt")
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        address = build_address_from_ckpt(ckpt)
+        table = ckpt["lut_table"]
+        lut_group = LUTGroup(table.shape[0], table.shape[1], table.shape[2], init_table=table)
+        lut_group = lut_group.to(device)
+        engine.add_group(gid, address, lut_group)
+    engine.install()
+    return engine
+
+
 def install_down_proj_engine(model, layer_id, group_ids, save_dir, group_size, device):
     """Install a previously built down_proj engine from checkpoint files."""
     engine = HybridPartialEngine(model, layer_id, group_size=group_size)
@@ -157,11 +176,26 @@ def install_down_proj_engine(model, layer_id, group_ids, save_dir, group_size, d
     return engine
 
 
-def is_layer_complete(layer_id, group_ids, output_root):
-    """Check whether all group checkpoints exist for a layer."""
+def install_gate_proj_engine(model, layer_id, group_ids, save_dir, group_size, device):
+    """Install a previously built gate_proj engine from checkpoint files."""
+    engine = HybridGateProjEngine(model, layer_id, group_size=group_size)
+    for gid in group_ids:
+        ckpt_path = os.path.join(save_dir, f"replacement_l{layer_id}g{gid}.pt")
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        address = build_address_from_ckpt(ckpt)
+        table = ckpt["lut_table"]
+        lut_group = LUTGroup(table.shape[0], table.shape[1], table.shape[2], init_table=table)
+        lut_group = lut_group.to(device)
+        engine.add_group(gid, address, lut_group)
+    engine.install()
+    return engine
+
+
+def is_layer_complete(layer_id, group_ids, output_root, module):
+    """Check whether all group checkpoints exist for a layer/module."""
     if not group_ids:
         return True
-    save_dir = os.path.join(output_root, "checkpoints", f"l{layer_id}", f"g{len(group_ids)}")
+    save_dir = os.path.join(output_root, "checkpoints", f"l{layer_id}", module, f"g{len(group_ids)}")
     return all(os.path.exists(os.path.join(save_dir, f"replacement_l{layer_id}g{gid}.pt"))
                for gid in group_ids)
 
@@ -199,7 +233,7 @@ def build_down_proj_layer(model, tokenizer, layer_id, group_ids, group_size,
     hidden_size = data["hidden_size"]
 
     group_results = []
-    save_dir = os.path.join(output_root, "checkpoints", f"l{layer_id}", f"g{len(group_ids)}")
+    save_dir = os.path.join(output_root, "checkpoints", f"l{layer_id}", "down_proj", f"g{len(group_ids)}")
     Path(save_dir).mkdir(parents=True, exist_ok=True)
 
     for gid in tqdm(group_ids, desc=f"L{layer_id} down_proj groups", leave=False):
@@ -305,7 +339,7 @@ def build_o_proj_layer(model, tokenizer, layer_id, group_ids, group_size,
         target = calib_out
 
     group_results = []
-    save_dir = os.path.join(output_root, "checkpoints", f"l{layer_id}", f"g{len(group_ids)}")
+    save_dir = os.path.join(output_root, "checkpoints", f"l{layer_id}", "o_proj", f"g{len(group_ids)}")
     Path(save_dir).mkdir(parents=True, exist_ok=True)
 
     for gid in tqdm(group_ids, desc=f"L{layer_id} o_proj groups", leave=False):
@@ -360,6 +394,8 @@ def main():
                         help="layer:count[:group_ids] for down_proj")
     parser.add_argument("--o_configs", default="",
                         help="layer:count[:group_ids] for o_proj")
+    parser.add_argument("--gate_configs", default="",
+                        help="layer:count[:group_ids] for gate_proj")
     parser.add_argument("--address_mode", default="tree", choices=["2d", "high_order", "tree"])
     parser.add_argument("--num_bins", type=int, default=64)
     parser.add_argument("--num_bits", type=int, default=10)
@@ -388,12 +424,14 @@ def main():
 
     down_configs = parse_configs(args.down_configs) if args.down_configs else []
     o_configs = parse_configs(args.o_configs) if args.o_configs else []
+    gate_configs = parse_configs(args.gate_configs) if args.gate_configs else []
 
     # Determine layer order
     down_by_layer = {lid: gids for lid, _, gids in down_configs}
     o_by_layer = {lid: gids for lid, _, gids in o_configs}
+    gate_by_layer = {lid: gids for lid, _, gids in gate_configs}
     o_modes = parse_o_modes(args.o_modes)
-    all_layers = sorted(set(down_by_layer.keys()) | set(o_by_layer.keys()))
+    all_layers = sorted(set(down_by_layer.keys()) | set(o_by_layer.keys()) | set(gate_by_layer.keys()))
 
     print("Loading model...")
     model = AutoModelForCausalLM.from_pretrained(
@@ -416,6 +454,7 @@ def main():
     installed_engines = []
     down_results = []
     o_results = []
+    gate_results = []
 
     if args.resume and os.path.exists(summary_path):
         print(f"Resuming from {summary_path}")
@@ -423,19 +462,20 @@ def main():
             prev = json.load(f)
         down_results = prev.get("down_results", [])
         o_results = prev.get("o_results", [])
+        gate_results = prev.get("gate_results", [])
 
     for layer_id in all_layers:
         print(f"\n{'='*60}")
         print(f"[Layer {layer_id}] Sequential build")
         print(f"{'='*60}")
 
-        # Within a layer: o_proj first, then down_proj
+        # Within a layer: o_proj -> gate_proj -> down_proj (forward order)
         if layer_id in o_by_layer:
             group_ids = o_by_layer[layer_id]
             mode = o_modes.get(layer_id, args.o_mode)
-            save_dir = os.path.join(output_root, "checkpoints", f"l{layer_id}", f"g{len(group_ids)}")
+            save_dir = os.path.join(output_root, "checkpoints", f"l{layer_id}", "o_proj", f"g{len(group_ids)}")
 
-            if args.resume and is_layer_complete(layer_id, group_ids, output_root):
+            if args.resume and is_layer_complete(layer_id, group_ids, output_root, "o_proj"):
                 print(f"  Resuming o_proj groups {group_ids} ({mode}) from {save_dir}")
                 engine = install_o_proj_engine(model, layer_id, group_ids, save_dir, mode, args.group_size, device)
                 installed_engines.append(engine)
@@ -465,11 +505,43 @@ def main():
             gc.collect()
             torch.cuda.empty_cache()
 
+        if layer_id in gate_by_layer:
+            group_ids = gate_by_layer[layer_id]
+            save_dir = os.path.join(output_root, "checkpoints", f"l{layer_id}", "gate_proj", f"g{len(group_ids)}")
+
+            if args.resume and is_layer_complete(layer_id, group_ids, output_root, "gate_proj"):
+                print(f"  Resuming gate_proj groups {group_ids} from {save_dir}")
+                engine = install_gate_proj_engine(model, layer_id, group_ids, save_dir, args.group_size, device)
+                installed_engines.append(engine)
+                print(f"  Installed gate_proj engine for L{layer_id}")
+            else:
+                print(f"  Building gate_proj groups {group_ids} ({args.address_mode})")
+                layer_results, save_dir = build_gate_proj_layer(
+                    model, tokenizer, layer_id, group_ids, args.group_size,
+                    args.address_mode, args.num_bins, args.num_bits, args.channels_per_bit,
+                    args.tree_candidates, args.tree_min_samples, args.tree_max_samples,
+                    calib_texts, eval_texts, args.max_seq_len, device,
+                    output_root, capture_batch_size=args.capture_batch_size,
+                )
+                gate_results = [r for r in gate_results if r["layer_id"] != layer_id]
+                gate_results.append({
+                    "layer_id": layer_id,
+                    "group_ids": group_ids,
+                    "save_dir": save_dir,
+                    "groups": layer_results,
+                })
+
+                engine = install_gate_proj_engine(model, layer_id, group_ids, save_dir, args.group_size, device)
+                installed_engines.append(engine)
+                print(f"  Installed gate_proj engine for L{layer_id}")
+            gc.collect()
+            torch.cuda.empty_cache()
+
         if layer_id in down_by_layer:
             group_ids = down_by_layer[layer_id]
-            save_dir = os.path.join(output_root, "checkpoints", f"l{layer_id}", f"g{len(group_ids)}")
+            save_dir = os.path.join(output_root, "checkpoints", f"l{layer_id}", "down_proj", f"g{len(group_ids)}")
 
-            if args.resume and is_layer_complete(layer_id, group_ids, output_root):
+            if args.resume and is_layer_complete(layer_id, group_ids, output_root, "down_proj"):
                 print(f"  Resuming down_proj groups {group_ids} from {save_dir}")
                 engine = install_down_proj_engine(model, layer_id, group_ids, save_dir, args.group_size, device)
                 installed_engines.append(engine)
@@ -511,9 +583,11 @@ def main():
             "group_size": args.group_size,
             "down_configs": down_configs,
             "o_configs": o_configs,
+            "gate_configs": gate_configs,
             "o_mode": args.o_mode,
             "down_results": down_results,
             "o_results": o_results,
+            "gate_results": gate_results,
         }, f, indent=2)
 
     print(f"\nSaved summary: {summary_path}")
