@@ -112,18 +112,15 @@ class HybridGateProjEngine:
         B, S, hidden_size = hidden.shape
         device = hidden.device
         dtype = hidden.dtype
-        compute_dtype = torch.float32
+        compute_dtype = dtype  # avoid full FP32 intermediate tensor
 
         with torch.autocast(device_type=device.type, enabled=False):
-            hidden_f32 = hidden.to(compute_dtype)
-            x_f32 = self._cached_x.to(compute_dtype)
-
-            # Active linear for non-replaced groups
+            # Active linear for non-replaced groups (cast weight to activation dtype)
             active_weight = self.gate_proj.weight[self._active_indices, :].to(compute_dtype)
             active_bias = None
             if self.gate_proj.bias is not None:
                 active_bias = self.gate_proj.bias[self._active_indices].to(compute_dtype)
-            active_out = F.linear(hidden_f32, active_weight, active_bias)
+            active_out = F.linear(hidden, active_weight, active_bias)
 
             if not torch.isfinite(active_out).all():
                 raise RuntimeError(f"[v5 L{self.layer_id} gate_proj] active_out has NaN/Inf")
@@ -133,7 +130,7 @@ class HybridGateProjEngine:
             for gid in self._replaced_groups:
                 address, lut_group = self.group_configs[gid]
                 indices = self._cached_indices[gid]
-                lut_out = lut_group(indices)
+                lut_out = lut_group(indices).to(compute_dtype)
                 lut_outputs.append(lut_out)
 
             if lut_outputs:

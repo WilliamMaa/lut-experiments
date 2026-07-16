@@ -158,7 +158,8 @@ def build_gate_proj_engine_for_layer(model, layer_id: int, group_count: int,
 
 
 def finetune(model, calib_loader, eval_loader, down_engines, gate_engines, o_engines, epochs, lr, output_dir,
-             baseline_eval_probs, freeze_down=False, freeze_gate=False, freeze_o=False):
+             baseline_eval_probs, freeze_down=False, freeze_gate=False, freeze_o=False,
+             accumulation_steps=1):
     device = model.device
 
     down_projs = [model.model.layers[e.layer_id].mlp.down_proj for e in down_engines]
@@ -200,6 +201,12 @@ def finetune(model, calib_loader, eval_loader, down_engines, gate_engines, o_eng
                 lut_group.table.requires_grad_(False)
 
     optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0.0, eps=1e-8)
+
+    if accumulation_steps > 1:
+        print(f"[Config] gradient_accumulation_steps={accumulation_steps}, "
+              f"effective batch size = {accumulation_steps} micro-batches")
+
+    optimizer.zero_grad(set_to_none=True)
 
     print("\n[Pre-compute] Collecting baseline logits on calibration set...")
     baseline_logits = collect_baseline_logits(model, calib_loader)
@@ -247,6 +254,9 @@ def finetune(model, calib_loader, eval_loader, down_engines, gate_engines, o_eng
 
         total_loss = 0.0
         num_batches = 0
+        num_batches_total = len(calib_loader)
+
+        optimizer.zero_grad(set_to_none=True)
 
         for bi, batch in enumerate(tqdm(calib_loader, desc=f"Train epoch {epoch}", leave=False)):
             input_ids = batch["input_ids"].to(device)
@@ -254,7 +264,7 @@ def finetune(model, calib_loader, eval_loader, down_engines, gate_engines, o_eng
             if attention_mask is not None:
                 attention_mask = attention_mask.to(device)
 
-            optimizer.zero_grad(set_to_none=True)
+            is_step = (bi + 1) % accumulation_steps == 0 or (bi + 1) == num_batches_total
 
             with torch.autocast(device_type=device.type, dtype=torch.float16):
                 outputs = model(input_ids=input_ids, attention_mask=attention_mask)
@@ -262,7 +272,6 @@ def finetune(model, calib_loader, eval_loader, down_engines, gate_engines, o_eng
 
             if not torch.isfinite(logits).all():
                 print(f"[WARN] Batch {bi}: non-finite logits")
-                optimizer.zero_grad(set_to_none=True)
                 continue
 
             target_logits = baseline_logits[bi].to(device)
@@ -278,6 +287,7 @@ def finetune(model, calib_loader, eval_loader, down_engines, gate_engines, o_eng
                 print(f"[WARN] Batch {bi}: non-finite loss")
                 continue
 
+            loss = loss / accumulation_steps
             loss.backward()
 
             grads_finite = True
@@ -290,23 +300,25 @@ def finetune(model, calib_loader, eval_loader, down_engines, gate_engines, o_eng
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
-            torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0, error_if_nonfinite=True)
-            optimizer.step()
+            if is_step:
+                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0, error_if_nonfinite=True)
+                optimizer.step()
+                optimizer.zero_grad(set_to_none=True)
 
-            if not freeze_down:
-                for dp in down_projs:
-                    if not torch.isfinite(dp.weight).all():
-                        raise RuntimeError(f"down_proj.weight became NaN/Inf after batch {bi}")
-            if not freeze_gate:
-                for gp in gate_projs:
-                    if not torch.isfinite(gp.weight).all():
-                        raise RuntimeError(f"gate_proj.weight became NaN/Inf after batch {bi}")
-            if not freeze_o:
-                for op in o_projs:
-                    if not torch.isfinite(op.weight).all():
-                        raise RuntimeError(f"o_proj.weight became NaN/Inf after batch {bi}")
+                if not freeze_down:
+                    for dp in down_projs:
+                        if not torch.isfinite(dp.weight).all():
+                            raise RuntimeError(f"down_proj.weight became NaN/Inf after batch {bi}")
+                if not freeze_gate:
+                    for gp in gate_projs:
+                        if not torch.isfinite(gp.weight).all():
+                            raise RuntimeError(f"gate_proj.weight became NaN/Inf after batch {bi}")
+                if not freeze_o:
+                    for op in o_projs:
+                        if not torch.isfinite(op.weight).all():
+                            raise RuntimeError(f"o_proj.weight became NaN/Inf after batch {bi}")
 
-            total_loss += loss.item()
+            total_loss += loss.item() * accumulation_steps
             num_batches += 1
 
         avg_loss = total_loss / max(num_batches, 1)
@@ -389,6 +401,8 @@ def main():
     parser.add_argument("--eval_size", type=int, default=128)
     parser.add_argument("--max_seq_len", type=int, default=512)
     parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1,
+                        help="Accumulate gradients over N micro-batches before optimizer.step()")
     parser.add_argument("--group_size", type=int, default=64)
     parser.add_argument("--output_dir", default="results/finetune_joint_down_o")
     parser.add_argument("--device", default="cuda:0")
@@ -458,7 +472,8 @@ def main():
     baseline_metrics, results = finetune(
         model, calib_loader, eval_loader, down_engines, gate_engines, o_engines,
         args.epochs, args.lr, args.output_dir, baseline_eval_probs,
-        freeze_down=args.freeze_down, freeze_gate=args.freeze_gate, freeze_o=args.freeze_o
+        freeze_down=args.freeze_down, freeze_gate=args.freeze_gate, freeze_o=args.freeze_o,
+        accumulation_steps=args.gradient_accumulation_steps
     )
 
     # Full-model MAC reduction: major linear layers

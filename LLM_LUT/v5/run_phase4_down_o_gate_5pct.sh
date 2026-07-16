@@ -7,12 +7,14 @@ set -e
 export LD_LIBRARY_PATH=""
 export HF_HUB_OFFLINE=1
 export CUDA_VISIBLE_DEVICES=1
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 MODEL="Qwen/Qwen2.5-7B-Instruct"
 CALIB_SIZE=512
 EVAL_SIZE=128
 MAX_SEQ_LEN=512
-BATCH_SIZE=4
+BATCH_SIZE=1
+GRADIENT_ACCUMULATION_STEPS=2
 
 DOWN_CONFIGS="15:9;1;9;28;30;38;47;49;52;53,16:3;7;17;40,17:3;2;13;18,18:8;6;7;9;18;22;26;29;47,19:2;4;46,20:14;1;4;6;8;9;22;24;28;37;38;45;48;52;54,21:6;1;5;11;18;34;41,22:3;4;7;54,23:1;34,24:2;2;7,27:1;48"
 O_CONFIGS="15:16;3;12;13;15;16;17;18;21;24;27;33;34;39;40;47;55,16:15;1;3;6;10;15;18;21;24;25;27;31;37;39;49;53,17:15;0;7;15;17;18;21;23;25;30;34;39;43;44;46;49,18:24;1;4;6;8;10;16;17;19;22;28;29;33;37;38;39;41;43;44;46;49;50;52;53;55,19:18;1;4;6;10;12;13;15;22;24;28;29;31;37;39;40;47;50;52,20:16;9;11;19;20;21;23;25;30;35;38;39;40;43;45;46;49,21:15;3;4;8;9;10;12;18;19;20;28;32;33;34;41;45,22:5;12;13;22;45;54,23:18;1;2;4;6;8;9;15;22;28;33;34;36;40;44;46;53;54;55,24:6;6;16;24;42;44;45,25:16;1;2;4;17;19;20;22;26;35;36;37;40;44;53;54;55,26:7;9;10;12;31;40;42;47,27:16;1;3;5;9;12;16;17;19;21;27;28;30;31;45;47;53"
@@ -37,7 +39,7 @@ python build_lut_sequential.py     --model "$MODEL"     --down_configs "$DOWN_CO
 # ------------------------------------------------------------------
 echo ""
 echo "[2/2] Joint fine-tune..."
-python finetune_joint.py     --model "$MODEL"     --down_configs "$DOWN_CONFIGS"     --down_checkpoint_root "$OUTPUT_ROOT"     --o_configs "$O_CONFIGS"     --o_checkpoint_root "$OUTPUT_ROOT"     --gate_configs "$GATE_CONFIGS"     --gate_checkpoint_root "$OUTPUT_ROOT"     --epochs 10     --lr 5e-5     --calib_size "$CALIB_SIZE"     --eval_size "$EVAL_SIZE"     --max_seq_len "$MAX_SEQ_LEN"     --batch_size "$BATCH_SIZE"     --output_dir "$FINETUNE_OUT"
+python finetune_joint.py     --model "$MODEL"     --down_configs "$DOWN_CONFIGS"     --down_checkpoint_root "$OUTPUT_ROOT"     --o_configs "$O_CONFIGS"     --o_checkpoint_root "$OUTPUT_ROOT"     --gate_configs "$GATE_CONFIGS"     --gate_checkpoint_root "$OUTPUT_ROOT"     --freeze_gate     --epochs 10     --lr 5e-5     --calib_size "$CALIB_SIZE"     --eval_size "$EVAL_SIZE"     --max_seq_len "$MAX_SEQ_LEN"     --batch_size "$BATCH_SIZE"     --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS"     --output_dir "$FINETUNE_OUT"
 
 echo ""
 echo "=========================================="
