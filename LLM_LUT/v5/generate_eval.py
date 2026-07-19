@@ -116,7 +116,8 @@ def install_epoch(model, configs, proj_type, epoch, checkpoint_dir, group_size, 
 
 def generate_for_prompts(model, tokenizer, prompts, max_new_tokens):
     results = []
-    for prompt in prompts:
+    for i, prompt in enumerate(prompts, 1):
+        print(f"      [{i}/{len(prompts)}] Generating: {prompt[:50]}...")
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         with torch.no_grad():
             with torch.autocast(device_type=model.device.type, dtype=torch.float16):
@@ -127,6 +128,7 @@ def generate_for_prompts(model, tokenizer, prompts, max_new_tokens):
                     pad_token_id=tokenizer.pad_token_id,
                 )
         generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        print(f"      -> {generated[:120]}...")
         results.append({"prompt": prompt, "output": generated})
     return results
 
