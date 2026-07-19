@@ -183,6 +183,7 @@ class AddressGreedyTree:
         self._leaf_counter = 0
         if tree_state is not None:
             self.root = self._deserialize(tree_state)
+            self._build_lookup_arrays()
 
     def build(self, x: torch.Tensor, target: torch.Tensor,
               num_candidates: int = 64, min_samples: int = 32,
@@ -206,6 +207,7 @@ class AddressGreedyTree:
         self.root = self._build_node(x, target, depth=0,
                                      num_candidates=num_candidates,
                                      min_samples=min_samples)
+        self._build_lookup_arrays()
 
     def _build_node(self, x, target, depth, num_candidates, min_samples):
         N = x.shape[0]
@@ -265,22 +267,92 @@ class AddressGreedyTree:
             right=right,
         )
 
+    def _build_lookup_arrays(self):
+        """Flatten the tree into vectorized lookup tensors for fast inference."""
+        if self.root is None:
+            raise ValueError("Tree root is None")
+        from collections import deque
+        queue = deque([self.root])
+        node_list = []
+        counter = 0
+        while queue:
+            node = queue.popleft()
+            node.node_id = counter
+            counter += 1
+            node_list.append(node)
+            if not node.is_leaf:
+                queue.append(node.left)
+                queue.append(node.right)
+        num_nodes = counter
+        self.num_nodes = num_nodes
+        self.node_is_leaf = torch.zeros(num_nodes, dtype=torch.bool)
+        self.node_leaf_index = torch.full((num_nodes,), -1, dtype=torch.long)
+        self.node_channel_idx = torch.zeros(num_nodes, self.channels_per_bit, dtype=torch.long)
+        self.node_signs = torch.zeros(num_nodes, self.channels_per_bit, dtype=torch.float32)
+        self.node_threshold = torch.zeros(num_nodes, dtype=torch.float32)
+        self.node_left = torch.zeros(num_nodes, dtype=torch.long)
+        self.node_right = torch.zeros(num_nodes, dtype=torch.long)
+        for node in node_list:
+            i = node.node_id
+            self.node_is_leaf[i] = node.is_leaf
+            if node.is_leaf:
+                self.node_leaf_index[i] = node.leaf_index
+            else:
+                self.node_channel_idx[i] = node.channel_idx
+                self.node_signs[i] = node.signs
+                self.node_threshold[i] = node.threshold
+                self.node_left[i] = node.left.node_id
+                self.node_right[i] = node.right.node_id
+
     def compute_indices(self, x: torch.Tensor) -> torch.Tensor:
         """
+        Vectorized tree traversal.
+
         Args:
             x: [B, S, input_dim]
         Returns:
             indices: [B, S, 1] leaf index
         """
         B, S, _ = x.shape
+        device = x.device
         N = B * S
         x_flat = x.view(N, self.input_dim)
-        out = torch.empty(N, dtype=torch.long, device=x.device)
-        all_idx = torch.arange(N, device=x.device)
-        self._traverse(self.root, x_flat, all_idx, out)
+        out = torch.empty(N, dtype=torch.long, device=device)
+        active = torch.ones(N, dtype=torch.bool, device=device)
+        node_ids = torch.zeros(N, dtype=torch.long, device=device)
+
+        node_is_leaf = self.node_is_leaf.to(device)
+        node_leaf_index = self.node_leaf_index.to(device)
+        node_channel_idx = self.node_channel_idx.to(device)
+        node_signs = self.node_signs.to(device, dtype=x.dtype)
+        node_threshold = self.node_threshold.to(device)
+        node_left = self.node_left.to(device)
+        node_right = self.node_right.to(device)
+
+        for _ in range(self.num_bits + 1):
+            if not active.any():
+                break
+            cur_ids = node_ids[active]
+            is_leaf = node_is_leaf[cur_ids]
+            if is_leaf.any():
+                active_idx = torch.where(active)[0]
+                leaf_idx = active_idx[is_leaf]
+                out[leaf_idx] = node_leaf_index[cur_ids[is_leaf]]
+                active[leaf_idx] = False
+            if not active.any():
+                break
+            cur_ids = node_ids[active]
+            active_idx = torch.where(active)[0]
+            ch = node_channel_idx[cur_ids]  # [M, K]
+            signs = node_signs[cur_ids]
+            selected = x_flat[active_idx.unsqueeze(1), ch]  # [M, K]
+            proj = (selected * signs).sum(dim=-1)
+            go_left = proj <= node_threshold[cur_ids]
+            node_ids[active] = torch.where(go_left, node_left[cur_ids], node_right[cur_ids])
         return out.view(B, S, 1)
 
     def _traverse(self, node: _TreeNode, x: torch.Tensor, idx: torch.Tensor, out: torch.Tensor):
+        """Deprecated recursive traversal; kept for reference."""
         if node.is_leaf:
             out[idx] = node.leaf_index
             return
