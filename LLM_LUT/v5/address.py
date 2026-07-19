@@ -146,10 +146,12 @@ class AddressHighOrderRandom:
 
 
 class _TreeNode:
-    __slots__ = ("channel_idx", "signs", "threshold", "left", "right", "is_leaf", "leaf_index")
+    __slots__ = ("node_id", "channel_idx", "signs", "threshold", "left", "right", "is_leaf", "leaf_index")
 
     def __init__(self, channel_idx=None, signs=None, threshold=None,
-                 left=None, right=None, is_leaf=False, leaf_index=None):
+                 left=None, right=None, is_leaf=False, leaf_index=None,
+                 node_id=None):
+        self.node_id = node_id
         self.channel_idx = channel_idx
         self.signs = signs
         self.threshold = threshold
