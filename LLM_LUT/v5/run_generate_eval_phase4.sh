@@ -11,7 +11,7 @@ export CUDA_VISIBLE_DEVICES=1
 MODEL="Qwen/Qwen2.5-7B-Instruct"
 CHECKPOINT_DIR="results/finetune_joint_phase4_down_o_gate_5pct"
 EPOCHS="8,10"
-MAX_NEW_TOKENS=100
+MAX_NEW_TOKENS=20
 
 # Same configs as run_phase4_down_o_gate_5pct.sh
 DOWN_CONFIGS="15:9;1;9;28;30;38;47;49;52;53,16:3;7;17;40,17:3;2;13;18,18:8;6;7;9;18;22;26;29;47,19:2;4;46,20:14;1;4;6;8;9;22;24;28;37;38;45;48;52;54,21:6;1;5;11;18;34;41,22:3;4;7;54,23:1;34,24:2;2;7,27:1;48"

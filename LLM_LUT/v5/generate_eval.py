@@ -26,7 +26,8 @@ import argparse
 import time
 
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from threading import Thread
 
 from finetune_joint import parse_configs, build_address
 from engine import HybridPartialEngine, HybridOProjEngine
@@ -123,19 +124,26 @@ def generate_for_prompts(model, tokenizer, prompts, max_new_tokens):
         print(f"      [{i}/{len(prompts)}] Generating: {prompt[:50]}...")
         t0 = time.time()
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
-        with torch.no_grad():
-            with torch.autocast(device_type=model.device.type, dtype=torch.float16):
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=max_new_tokens,
-                    do_sample=False,
-                    use_cache=True,
-                    pad_token_id=tokenizer.pad_token_id,
-                )
-        generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        print(f"      -> {generated[:120]}...")
+        streamer = TextIteratorStreamer(tokenizer, skip_prompt=True, skip_special_tokens=True)
+        generation_kwargs = dict(
+            inputs,
+            streamer=streamer,
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            use_cache=True,
+            pad_token_id=tokenizer.pad_token_id,
+        )
+        thread = Thread(target=model.generate, kwargs=generation_kwargs)
+        thread.start()
+        generated = ""
+        for new_text in streamer:
+            generated += new_text
+            print(new_text, end="", flush=True)
+        thread.join()
+        print()
+        full_text = prompt + generated
         print(f"      -> took {time.time() - t0:.1f}s")
-        results.append({"prompt": prompt, "output": generated})
+        results.append({"prompt": prompt, "output": full_text})
     return results
 
 
@@ -206,6 +214,15 @@ def main():
         engines.extend(install_epoch(model, down_configs, "down_proj", epoch, args.checkpoint_dir, args.group_size, device))
         engines.extend(install_epoch(model, gate_configs, "gate_proj", epoch, args.checkpoint_dir, args.group_size, device))
         engines.extend(install_epoch(model, o_configs, "o_proj", epoch, args.checkpoint_dir, args.group_size, device))
+
+        # Quick sanity forward pass before expensive generation.
+        print("      Sanity forward pass with LUT engines...")
+        t_fwd = time.time()
+        with torch.no_grad():
+            with torch.autocast(device_type=device.type, dtype=torch.float16):
+                dummy_ids = tokenizer(prompts[0], return_tensors="pt").input_ids.to(device)
+                _ = model(dummy_ids)
+        print(f"      Sanity forward pass OK in {time.time() - t_fwd:.1f}s")
 
         epoch_results = generate_for_prompts(model, tokenizer, prompts, args.max_new_tokens)
         all_results["epochs"][str(epoch)] = epoch_results

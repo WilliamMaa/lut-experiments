@@ -340,4 +340,44 @@ LD_LIBRARY_PATH="" HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES=0 python finetune_o_pro
 
 ---
 
-*最后更新：2026-07-04*
+## 13. Phase 4：down_proj + o_proj + gate_proj 扩展到 ~5% MAC
+
+### 13.1 配置
+
+- **目标**：在单卡可跑的前提下，把全模型 MAC 削减从 ~3.66% 拉到 ~5%。
+- **替换规模**：down 52 group + o 187 group + gate 961 group，共 1200 group。
+- **实际 MAC 削减**：4.57%（比 5% 目标略低，因为 gate_proj 单组 MAC 较小）。
+- **LUT 存储**：150 MiB。
+
+### 13.2 关键改动
+
+- **OOM 解决**：
+  - `finetune_joint.py` 增加 `gradient_accumulation_steps`，`BATCH_SIZE=1` + accumulation=2。
+  - `hybrid_gate_proj_engine.py` 把 gate 路径中间张量从 FP32 改回模型 dtype（FP16），避免 18944 维 FP32 张量占满显存。
+- **生成卡顿解决**：
+  - `address.py` 中 `AddressGreedyTree.compute_indices` 原本用 Python 递归遍历树，生成时 `use_cache=True` 每次只过 1 个 token，开销爆炸。
+  - 改为向量化 tree traversal：预先把 tree 展平成 tensor 数组，每次用矩阵索引处理所有样本。
+- **新增脚本**：
+  - `generate_eval.py`：加载指定 epoch 的权重和 LUT，对 baseline/epoch 8/epoch 10 跑同一份 prompts，输出 JSON 对比。
+  - `run_generate_eval_phase4.sh`：一键运行生成评估。
+
+### 13.3 指标
+
+| | KL | PPL | Acc |
+|---|---|---|---|
+| 微调前 | 2.06 | 12.58 | 0.566 |
+| Epoch 8 | 0.42 | **21.68** | **0.493** |
+| Epoch 10 | 0.39 | 21.90 | 0.491 |
+
+落在项目定义的“可用”区间（PPL < 35，Acc > 0.45）。生成质量需等待 `run_generate_eval_phase4.sh` 输出后人工判断。
+
+### 13.4 下一步
+
+- 跑生成评估，对比 baseline、epoch 8、epoch 10 的实际生成效果。
+- 根据生成质量决定：
+  - 是否把 gate 也加入训练（目前 `--freeze_gate`）；
+  - 是否继续扩到 ~10% MAC（加入 q_proj）。
+
+---
+
+*最后更新：2026-07-16*
