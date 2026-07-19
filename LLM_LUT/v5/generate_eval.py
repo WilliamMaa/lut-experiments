@@ -23,6 +23,7 @@ import os
 import glob
 import json
 import argparse
+import time
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -43,6 +44,8 @@ def load_model_and_tokenizer(model_name, device):
     )
     model.to(device)
     model.eval()
+    model.config.use_cache = True
+    model.generation_config.pad_token_id = tokenizer.pad_token_id
     return model, tokenizer
 
 
@@ -118,6 +121,7 @@ def generate_for_prompts(model, tokenizer, prompts, max_new_tokens):
     results = []
     for i, prompt in enumerate(prompts, 1):
         print(f"      [{i}/{len(prompts)}] Generating: {prompt[:50]}...")
+        t0 = time.time()
         inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
         with torch.no_grad():
             with torch.autocast(device_type=model.device.type, dtype=torch.float16):
@@ -125,10 +129,12 @@ def generate_for_prompts(model, tokenizer, prompts, max_new_tokens):
                     **inputs,
                     max_new_tokens=max_new_tokens,
                     do_sample=False,
+                    use_cache=True,
                     pad_token_id=tokenizer.pad_token_id,
                 )
         generated = tokenizer.decode(outputs[0], skip_special_tokens=True)
         print(f"      -> {generated[:120]}...")
+        print(f"      -> took {time.time() - t0:.1f}s")
         results.append({"prompt": prompt, "output": generated})
     return results
 
