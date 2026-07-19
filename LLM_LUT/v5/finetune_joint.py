@@ -159,7 +159,7 @@ def build_gate_proj_engine_for_layer(model, layer_id: int, group_count: int,
 
 def finetune(model, calib_loader, eval_loader, down_engines, gate_engines, o_engines, epochs, lr, output_dir,
              baseline_eval_probs, freeze_down=False, freeze_gate=False, freeze_o=False,
-             accumulation_steps=1):
+             accumulation_steps=1, lut_only=False):
     device = model.device
 
     down_projs = [model.model.layers[e.layer_id].mlp.down_proj for e in down_engines]
@@ -170,35 +170,46 @@ def finetune(model, calib_loader, eval_loader, down_engines, gate_engines, o_eng
         p.requires_grad_(False)
 
     trainable_params = []
-    if not freeze_down:
-        for dp in down_projs:
-            dp.weight.requires_grad_(True)
-            trainable_params.append(dp.weight)
-    else:
+    if lut_only:
+        # Only train LUT tables, freeze all original projection weights.
         for dp in down_projs:
             dp.weight.requires_grad_(False)
-    if not freeze_gate:
-        for gp in gate_projs:
-            gp.weight.requires_grad_(True)
-            trainable_params.append(gp.weight)
-    else:
         for gp in gate_projs:
             gp.weight.requires_grad_(False)
-    if not freeze_o:
-        for op in o_projs:
-            op.weight.requires_grad_(True)
-            trainable_params.append(op.weight)
-    else:
         for op in o_projs:
             op.weight.requires_grad_(False)
-    for engine in down_engines + gate_engines + o_engines:
-        if (engine in down_engines and not freeze_down) or \
-           (engine in gate_engines and not freeze_gate) or \
-           (engine in o_engines and not freeze_o):
+        for engine in down_engines + gate_engines + o_engines:
             trainable_params.extend(engine.trainable_parameters())
+    else:
+        if not freeze_down:
+            for dp in down_projs:
+                dp.weight.requires_grad_(True)
+                trainable_params.append(dp.weight)
         else:
-            for _, lut_group in engine.group_configs.values():
-                lut_group.table.requires_grad_(False)
+            for dp in down_projs:
+                dp.weight.requires_grad_(False)
+        if not freeze_gate:
+            for gp in gate_projs:
+                gp.weight.requires_grad_(True)
+                trainable_params.append(gp.weight)
+        else:
+            for gp in gate_projs:
+                gp.weight.requires_grad_(False)
+        if not freeze_o:
+            for op in o_projs:
+                op.weight.requires_grad_(True)
+                trainable_params.append(op.weight)
+        else:
+            for op in o_projs:
+                op.weight.requires_grad_(False)
+        for engine in down_engines + gate_engines + o_engines:
+            if (engine in down_engines and not freeze_down) or \
+               (engine in gate_engines and not freeze_gate) or \
+               (engine in o_engines and not freeze_o):
+                trainable_params.extend(engine.trainable_parameters())
+            else:
+                for _, lut_group in engine.group_configs.values():
+                    lut_group.table.requires_grad_(False)
 
     optimizer = torch.optim.AdamW(trainable_params, lr=lr, weight_decay=0.0, eps=1e-8)
 
@@ -395,6 +406,8 @@ def main():
     parser.add_argument("--gate_checkpoint_root", default="../v5/outputs_gate_proj")
     parser.add_argument("--freeze_gate", action="store_true",
                         help="Install gate_proj engines but do not update their weights/LUTs")
+    parser.add_argument("--lut_only", action="store_true",
+                        help="Only train LUT tables, freeze all original projection weights")
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--calib_size", type=int, default=512)
@@ -473,7 +486,8 @@ def main():
         model, calib_loader, eval_loader, down_engines, gate_engines, o_engines,
         args.epochs, args.lr, args.output_dir, baseline_eval_probs,
         freeze_down=args.freeze_down, freeze_gate=args.freeze_gate, freeze_o=args.freeze_o,
-        accumulation_steps=args.gradient_accumulation_steps
+        accumulation_steps=args.gradient_accumulation_steps,
+        lut_only=args.lut_only,
     )
 
     # Full-model MAC reduction: major linear layers
