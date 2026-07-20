@@ -13,7 +13,7 @@
 
 ## 需要的输入数据
 
-和 `docs/exp11.py` 保持一致，只需要两类文件：
+和 `docs/exp11.py` 保持一致，至少需要两类文件。如果已经有预计算的 FFN 输出，还可以加上第三类，避免重复 forward Teacher：
 
 ### 1. Teacher 专家权重（`--teacher_weight_path`）
 
@@ -23,12 +23,19 @@
   - `up_proj.weight`
   - `down_proj.weight`
 - 键名如果带有 `expert.` 前缀（例如 `expert.gate_proj.weight`），脚本会自动去掉。
+- 即使使用预计算输出，目前仍需要加载 Teacher 以获取 `hidden_size` / `intermediate_size`。
 
 ### 2. FFN 输入数据集（`--dataset_dir`）
 
 - 一个目录，里面包含若干 `.pt` 文件。
 - 每个 `.pt` 文件是一个 `float` tensor，形状为 `[N, hidden_size]`，表示该专家的 N 个 FFN 输入 token。
-- 脚本会把这些输入喂给 Teacher 专家，得到真实的 FFN 输出作为 target。
+
+### 3. （可选）预计算 FFN 输出数据集（`--output_dataset_dir`）
+
+- 如果目录里已经有 `input` 对应的 `output`，可以直接复用，不用每次 forward Teacher。
+- 每个 `.pt` 文件必须是 `[N, hidden_size]`，且 **文件名**与 `--dataset_dir` 中的输入文件一一对应。
+- 例如 `input/0000.pt` 对应 `output/0000.pt`，形状相同。
+- 如果指定了 `--output_dataset_dir`，脚本会直接读取预计算输出；否则把输入喂给 Teacher 得到 target。
 
 数据切分规则和 `exp11.py` 一样：
 - 除最后 100 个 `.pt` 文件外的所有文件 → **calibration（构建 LUT）**
@@ -46,22 +53,31 @@
 
 ## 运行示例
 
+### 方式一：只提供输入，脚本自己 forward Teacher 得到 target（较慢）
+
 ```bash
 cd LLM_LUT/v6
 python build_lut_ffn_output.py \
-  --teacher_weight_path /path/to/expert.pt \
-  --dataset_dir /path/to/input_qwen_layer1_ffn_3y_0711 \
-  --output_root ./outputs_ffn_lut_4groups \
+  --teacher_weight_path /root/data1/rce/OLMo-core/tmp/qwen_35b_last_moe.pt \
+  --dataset_dir /data/ai2/datasets/lut_distill_dataset/input_qwen3_layer1_ffn_3y_0711 \
+  --output_root ./outputs_ffn_lut_layer1_4groups \
   --group_size 64 \
   --group_ids "0,1,2,3" \
   --num_bits 12 \
-  --channels_per_bit 4 \
-  --tree_candidates 64 \
-  --tree_min_samples 16 \
-  --tree_max_samples 65536 \
-  --calib_size 65536 \
-  --eval_size 8192 \
-  --batch_size 256 \
+  --device cuda:0
+```
+
+### 方式二：有预计算输出，直接复用（更快）
+
+```bash
+python build_lut_ffn_output.py \
+  --teacher_weight_path /root/data1/rce/OLMo-core/tmp/qwen_35b_last_moe.pt \
+  --dataset_dir /data/ai2/datasets/lut_distill_dataset/input_qwen3_layer1_ffn_3y_0711 \
+  --output_dataset_dir /data/ai2/datasets/lut_distill_dataset/output_qwen3_layer1_ffn_3y_0711 \
+  --output_root ./outputs_ffn_lut_layer1_4groups \
+  --group_size 64 \
+  --group_ids "0,1,2,3" \
+  --num_bits 12 \
   --device cuda:0
 ```
 
@@ -69,6 +85,10 @@ python build_lut_ffn_output.py \
 
 | 参数 | 含义 | 默认值 |
 |---|---|---|
+| `--teacher_weight_path` | 专家权重 `.pt` 路径 | 必填 |
+| `--dataset_dir` | 输入 `.pt` 目录 | 必填 |
+| `--output_dataset_dir` | 预计算输出 `.pt` 目录（可选） | `None` |
+| `--output_root` | 输出目录 | 必填 |
 | `--group_size` | 每个输出 group 的通道数 | 64 |
 | `--group_ids` | 要替换的输出 group 编号，逗号分隔 | `0,1,2,3` |
 | `--num_bits` | tree 深度，表项数为 `2^num_bits` | 12 |
@@ -78,7 +98,8 @@ python build_lut_ffn_output.py \
 | `--tree_max_samples` | tree 构建时最多使用的 calibration 样本数 | 65536 |
 | `--calib_size` | 用于构建 LUT 的样本数 | 65536 |
 | `--eval_size` | 用于评估的样本数 | 8192 |
-| `--batch_size` | 读取数据时每次喂给 Teacher 的 batch size | 256 |
+| `--batch_size` | 读取数据时每次处理的 batch size | 256 |
+| `--device` | 使用的单卡 | `cuda:0` |
 
 ---
 

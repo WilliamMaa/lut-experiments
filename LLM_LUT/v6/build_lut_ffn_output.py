@@ -338,38 +338,60 @@ class LUTGroup(nn.Module):
 
 # =============================================================================
 # 3. 数据流：复用 exp11.py 的 .pt 输入格式
+#    可选：如果目录里已有预计算的 FFN 输出，直接读 output，不再 forward Teacher
 # =============================================================================
 def collect_calibration_and_eval(
-    train_files, test_files, teacher,
+    train_input_files, test_input_files, teacher,
     calib_size: int, eval_size: int, batch_size: int, device: torch.device,
+    train_output_files=None, test_output_files=None,
 ):
     """
-    从 train_files 里取 calib_size 条、test_files 里取 eval_size 条。
-    输入 tensor 形状 [N, hidden_size]，脚本通过 Teacher 得到真实 FFN 输出。
+    从 train_input_files 里取 calib_size 条、test_input_files 里取 eval_size 条。
+    如果 train/test_output_files 提供，则直接读取预计算的 FFN 输出；
+    否则通过 Teacher 前向得到真实 FFN 输出。
     """
     weight_dtype = next(teacher.parameters()).dtype
+    use_precomputed_outputs = train_output_files is not None
 
-    def collect_from_files(file_paths, needed, desc):
+    def collect_from_files(input_paths, output_paths, needed, desc):
         inputs = []
         targets = []
         collected = 0
         pbar = tqdm(total=needed, desc=desc, unit="sample")
-        for fpath in sorted(file_paths):
+        for idx, in_path in enumerate(sorted(input_paths)):
             if collected >= needed:
                 break
             try:
-                tensor = torch.load(fpath, map_location="cpu")
+                x_tensor = torch.load(in_path, map_location="cpu")
             except Exception as e:
-                print(f"  skip {fpath}: {e}")
+                print(f"  skip {in_path}: {e}")
                 continue
-            if tensor.dim() != 2:
-                raise ValueError(f"{fpath} has shape {tensor.shape}, expected [N, hidden]")
-            for i in range(0, tensor.shape[0], batch_size):
+            if x_tensor.dim() != 2:
+                raise ValueError(f"{in_path} has shape {x_tensor.shape}, expected [N, hidden]")
+
+            if use_precomputed_outputs:
+                out_path = output_paths[idx]
+                try:
+                    y_tensor = torch.load(out_path, map_location="cpu")
+                except Exception as e:
+                    print(f"  skip {out_path}: {e}")
+                    continue
+                if y_tensor.shape != x_tensor.shape:
+                    raise ValueError(
+                        f"Shape mismatch: {in_path} {x_tensor.shape} vs {out_path} {y_tensor.shape}"
+                    )
+            else:
+                y_tensor = None
+
+            for i in range(0, x_tensor.shape[0], batch_size):
                 if collected >= needed:
                     break
-                x = tensor[i:i + batch_size].to(device, dtype=weight_dtype)
-                with torch.no_grad():
-                    y = teacher(x).float().cpu()
+                x = x_tensor[i:i + batch_size].to(device, dtype=weight_dtype)
+                if y_tensor is not None:
+                    y = y_tensor[i:i + batch_size].float().cpu()
+                else:
+                    with torch.no_grad():
+                        y = teacher(x).float().cpu()
                 x = x.float().cpu()
                 inputs.append(x)
                 targets.append(y)
@@ -379,11 +401,11 @@ def collect_calibration_and_eval(
                 break
         pbar.close()
         if collected == 0:
-            raise RuntimeError(f"No valid samples found in {file_paths[:3]}...")
+            raise RuntimeError(f"No valid samples found in {input_paths[:3]}...")
         return torch.cat(inputs, dim=0)[:needed], torch.cat(targets, dim=0)[:needed]
 
-    calib_x, calib_y = collect_from_files(train_files, calib_size, desc="calibration")
-    eval_x, eval_y = collect_from_files(test_files, eval_size, desc="eval")
+    calib_x, calib_y = collect_from_files(train_input_files, train_output_files, calib_size, desc="calibration")
+    eval_x, eval_y = collect_from_files(test_input_files, test_output_files, eval_size, desc="eval")
     return calib_x, calib_y, eval_x, eval_y
 
 
@@ -495,6 +517,7 @@ def main():
     )
     parser.add_argument("--teacher_weight_path", required=True, help="Path to expert .pt weights")
     parser.add_argument("--dataset_dir", required=True, help="Dir containing .pt input tensors")
+    parser.add_argument("--output_dataset_dir", default=None, help="Optional dir containing precomputed .pt FFN output tensors")
     parser.add_argument("--output_root", required=True, help="Output directory for checkpoints and summary")
     parser.add_argument("--group_size", type=int, default=64)
     parser.add_argument("--group_ids", type=str, default="0,1,2,3",
@@ -520,12 +543,38 @@ def main():
     if not group_ids:
         raise ValueError("--group_ids must contain at least one integer")
 
-    all_files = sorted(glob.glob(os.path.join(args.dataset_dir, "*.pt")))
-    if not all_files:
+    # -------------------------------------------------------------------------
+    # 输入 / 输出数据配对
+    # -------------------------------------------------------------------------
+    input_files = sorted(glob.glob(os.path.join(args.dataset_dir, "*.pt")))
+    if not input_files:
         raise FileNotFoundError(f"No .pt files found in {args.dataset_dir}")
-    print(f"Found {len(all_files)} .pt files, using first {len(all_files)-100} for calibration, last 100 for eval")
-    train_files = all_files[:-100]
-    test_files = all_files[-100:]
+
+    if args.output_dataset_dir:
+        output_files = {
+            os.path.basename(p): p
+            for p in glob.glob(os.path.join(args.output_dataset_dir, "*.pt"))
+        }
+        paired = [(inp, output_files.get(os.path.basename(inp))) for inp in input_files]
+        paired = [pair for pair in paired if pair[1] is not None]
+        if not paired:
+            raise FileNotFoundError(
+                f"No matching .pt files between {args.dataset_dir} and {args.output_dataset_dir}"
+            )
+        input_files = [p[0] for p in paired]
+        output_files = [p[1] for p in paired]
+        print(f"Found {len(paired)} paired input/output .pt files")
+        train_input_files = input_files[:-100]
+        test_input_files = input_files[-100:]
+        train_output_files = output_files[:-100]
+        test_output_files = output_files[-100:]
+    else:
+        print(f"Found {len(input_files)} .pt input files, "
+              f"using first {len(input_files)-100} for calibration, last 100 for eval")
+        train_input_files = input_files[:-100]
+        test_input_files = input_files[-100:]
+        train_output_files = None
+        test_output_files = None
 
     teacher, hidden_size, intermediate_size = load_real_teacher(args.teacher_weight_path, device)
     print(f"Teacher: hidden_size={hidden_size}, intermediate_size={intermediate_size}")
@@ -537,8 +586,9 @@ def main():
 
     print("\nCollecting calibration / evaluation samples ...")
     calib_x, calib_y, eval_x, eval_y = collect_calibration_and_eval(
-        train_files, test_files, teacher,
+        train_input_files, test_input_files, teacher,
         args.calib_size, args.eval_size, args.batch_size, device,
+        train_output_files, test_output_files,
     )
     print(f"Calibration: {calib_x.shape}, Eval: {eval_x.shape}")
 
@@ -591,6 +641,7 @@ def main():
     summary = {
         "teacher_weight_path": args.teacher_weight_path,
         "dataset_dir": args.dataset_dir,
+        "output_dataset_dir": args.output_dataset_dir,
         "output_root": args.output_root,
         "hidden_size": hidden_size,
         "intermediate_size": intermediate_size,
