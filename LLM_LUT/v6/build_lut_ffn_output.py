@@ -607,6 +607,15 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
 
+    if args.tree_max_samples <= 0:
+        raise ValueError(f"--tree_max_samples must be positive, got {args.tree_max_samples}")
+    if args.tree_min_samples <= 0:
+        raise ValueError(f"--tree_min_samples must be positive, got {args.tree_min_samples}")
+    if args.calib_size <= 0:
+        raise ValueError(f"--calib_size must be positive, got {args.calib_size}")
+    if args.batch_size <= 0:
+        raise ValueError(f"--batch_size must be positive, got {args.batch_size}")
+
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
