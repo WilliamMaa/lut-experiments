@@ -508,6 +508,27 @@ def compute_lut_storage_bytes(num_entries, group_size, num_tables=1):
     return num_tables * num_entries * group_size * 2
 
 
+def parse_group_ids(s: str, max_group: int):
+    """解析 group_ids，支持逗号分隔和连字符范围，例如 '0,1,2' 或 '0-7' 或 '0-3,8,10-15'。"""
+    ids = set()
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start, end = part.split("-")
+            ids.update(range(int(start), int(end) + 1))
+        else:
+            ids.add(int(part))
+    ids = sorted(ids)
+    if not ids:
+        raise ValueError("--group_ids must contain at least one integer")
+    for gid in ids:
+        if not (0 <= gid < max_group):
+            raise ValueError(f"group_id {gid} out of range [0, {max_group})")
+    return ids
+
+
 # =============================================================================
 # 5. 主函数
 # =============================================================================
@@ -520,8 +541,8 @@ def main():
     parser.add_argument("--output_dataset_dir", default=None, help="Optional dir containing precomputed .pt FFN output tensors")
     parser.add_argument("--output_root", required=True, help="Output directory for checkpoints and summary")
     parser.add_argument("--group_size", type=int, default=64)
-    parser.add_argument("--group_ids", type=str, default="0,1,2,3",
-                        help="Comma-separated output group ids to replace, e.g. '0,1,2,3'")
+    parser.add_argument("--group_ids", type=str, default="0-3",
+                        help="Output group ids to replace, e.g. '0,1,2,3' or '0-7' or '0-3,8,10-15'")
     parser.add_argument("--num_bits", type=int, default=12,
                         help="Tree depth => 2^num_bits entries per group")
     parser.add_argument("--channels_per_bit", type=int, default=4)
@@ -539,9 +560,7 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
 
-    group_ids = [int(x.strip()) for x in args.group_ids.split(",") if x.strip()]
-    if not group_ids:
-        raise ValueError("--group_ids must contain at least one integer")
+    # group_ids will be parsed after we know max_group from teacher dimensions
 
     # -------------------------------------------------------------------------
     # 输入 / 输出数据配对
@@ -580,9 +599,8 @@ def main():
     print(f"Teacher: hidden_size={hidden_size}, intermediate_size={intermediate_size}")
 
     max_group = hidden_size // args.group_size
-    for gid in group_ids:
-        if not (0 <= gid < max_group):
-            raise ValueError(f"group_id {gid} out of range [0, {max_group})")
+    group_ids = parse_group_ids(args.group_ids, max_group)
+    print(f"Replacing {len(group_ids)} groups: {group_ids}")
 
     print("\nCollecting calibration / evaluation samples ...")
     calib_x, calib_y, eval_x, eval_y = collect_calibration_and_eval(

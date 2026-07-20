@@ -90,7 +90,7 @@ python build_lut_ffn_output.py \
 | `--output_dataset_dir` | 预计算输出 `.pt` 目录（可选） | `None` |
 | `--output_root` | 输出目录 | 必填 |
 | `--group_size` | 每个输出 group 的通道数 | 64 |
-| `--group_ids` | 要替换的输出 group 编号，逗号分隔 | `0,1,2,3` |
+| `--group_ids` | 要替换的输出 group 编号，支持逗号或连字符范围，如 `0,1,2,3`、`0-7`、`0-3,8,10-15` | `0-3` |
 | `--num_bits` | tree 深度，表项数为 `2^num_bits` | 12 |
 | `--channels_per_bit` | 每个 tree 分裂节点随机选用的输入通道数 | 4 |
 | `--tree_candidates` | 每个分裂节点尝试的随机投影数 | 64 |
@@ -100,6 +100,55 @@ python build_lut_ffn_output.py \
 | `--eval_size` | 用于评估的样本数 | 8192 |
 | `--batch_size` | 读取数据时每次处理的 batch size | 256 |
 | `--device` | 使用的单卡 | `cuda:0` |
+
+---
+
+## 放大实验
+
+当前 4 group、num_bits=12 的结果只替换了约 **4.2%** 的 FFN MAC，表也只有 **2 MiB**。从 `00-ideas.md` 的目标看，还有很大放大空间：
+
+1. **先加单 group 容量**：把 `num_bits` 从 12 提到 14/16，看单 group 的 cosine similarity 能不能从 0.7 拉到 0.95 以上。
+2. **再扩替换比例**：在这个模型上（hidden=2048, intermediate=512, 32 个 group）：
+   - 8 个 group → 约 8.3% MAC reduction
+   - 10 个 group → 约 10.4% MAC reduction（`00-ideas.md` 的主目标）
+   - 16 个 group → 约 16.7% MAC reduction
+   - 19 个 group → 约 20.0% MAC reduction
+
+表存储按 FP16 估算：
+- num_bits=14：每个 group 2 MiB
+- num_bits=16：每个 group 8 MiB
+
+所以即使 10 个 group + num_bits=16，也只有 **80 MiB**，远低于 1 GiB 预算。
+
+### 放大示例
+
+**8 groups，num_bits=14，目标 ~8.3% MAC reduction**：
+
+```bash
+python build_lut_ffn_output.py \
+  --teacher_weight_path /root/data1/rce/OLMo-core/tmp/qwen_35b_last_moe.pt \
+  --dataset_dir /data/ai2/datasets/lut_distill_dataset/input_qwen3_layer1_ffn_3y_0711 \
+  --output_root ./outputs_ffn_lut_layer1_8groups_nb14 \
+  --group_size 64 \
+  --group_ids "0-7" \
+  --num_bits 14 \
+  --device cuda:0
+```
+
+**10 groups，num_bits=16，目标 ~10.4% MAC reduction**：
+
+```bash
+python build_lut_ffn_output.py \
+  --teacher_weight_path /root/data1/rce/OLMo-core/tmp/qwen_35b_last_moe.pt \
+  --dataset_dir /data/ai2/datasets/lut_distill_dataset/input_qwen3_layer1_ffn_3y_0711 \
+  --output_root ./outputs_ffn_lut_layer1_10groups_nb16 \
+  --group_size 64 \
+  --group_ids "0-9" \
+  --num_bits 16 \
+  --device cuda:0
+```
+
+**建议推进顺序**：先跑 `num_bits=16` 的 4 groups，看单 group 精度是否接近 0.95；如果还不够，再考虑 `tree_max_samples` 或 `channels_per_bit`；如果够了，再扩到 10 groups 做模型级输出评估。
 
 ---
 

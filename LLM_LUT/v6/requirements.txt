@@ -1,0 +1,11 @@
+# Python 3.10 environment
+# Only the core packages needed by build_lut_ffn_output.py
+
+# 根据远端 CUDA 驱动版本选择 torch 安装命令：
+#   CUDA 12.4  ->  pip install torch --index-url https://download.pytorch.org/whl/cu124
+#   CUDA 12.1  ->  pip install torch --index-url https://download.pytorch.org/whl/cu121
+#   CPU 环境   ->  pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+numpy
+torch>=2.0.0
+tqdm>=4.65.0

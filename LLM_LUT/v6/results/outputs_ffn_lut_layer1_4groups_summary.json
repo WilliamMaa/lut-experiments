@@ -1,0 +1,76 @@
+{
+  "teacher_weight_path": "/root/data1/rce/OLMo-core/tmp/qwen_35b_last_moe.pt",
+  "dataset_dir": "/data/ai2/datasets/lut_distill_dataset/input_qwen3_layer1_ffn_3y_0711",
+  "output_dataset_dir": null,
+  "output_root": "./outputs_ffn_lut_layer1_4groups",
+  "hidden_size": 2048,
+  "intermediate_size": 512,
+  "group_size": 64,
+  "group_ids": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "num_bits": 12,
+  "channels_per_bit": 4,
+  "tree_candidates": 64,
+  "tree_min_samples": 16,
+  "tree_max_samples": 65536,
+  "num_entries_per_group": 4096,
+  "actual_leaves_per_group": {
+    "0": 4062,
+    "1": 4061,
+    "2": 4052,
+    "3": 4062
+  },
+  "table_bytes_per_group": 524288,
+  "total_table_bytes": 2097152,
+  "total_table_mib": 2.0,
+  "replaced_channels": 256,
+  "replaced_ratio": 0.125,
+  "saved_mac_per_token": 131072,
+  "total_ffn_mac_per_token": 3145728,
+  "mac_reduction_ratio": 0.041666666666666664,
+  "group_metrics": [
+    {
+      "group_id": 0,
+      "mse": 8.115429955068976e-05,
+      "rmse": 0.009008568118779463,
+      "relative_mse": 0.5507059637131086,
+      "relative_l2": 0.7413537614882861,
+      "cosine_similarity": 0.6873989701271057
+    },
+    {
+      "group_id": 1,
+      "mse": 9.136978042079136e-05,
+      "rmse": 0.00955875412492608,
+      "relative_mse": 0.5454857366389726,
+      "relative_l2": 0.7385275874828483,
+      "cosine_similarity": 0.6943830251693726
+    },
+    {
+      "group_id": 2,
+      "mse": 0.00012403004802763462,
+      "rmse": 0.011136877840204347,
+      "relative_mse": 0.4184187921110926,
+      "relative_l2": 0.6465123841547648,
+      "cosine_similarity": 0.748019814491272
+    },
+    {
+      "group_id": 3,
+      "mse": 8.981376595329493e-05,
+      "rmse": 0.009477012501484576,
+      "relative_mse": 0.46954717873251733,
+      "relative_l2": 0.6834098725915779,
+      "cosine_similarity": 0.7317956686019897
+    }
+  ],
+  "full_output_metrics": {
+    "mse": 1.2073996913386509e-05,
+    "rmse": 0.003474765735036897,
+    "relative_mse": 0.04667983151691693,
+    "relative_l2": 0.2160478787321314,
+    "cosine_similarity": 0.9718906283378601
+  }
+}
