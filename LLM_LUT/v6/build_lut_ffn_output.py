@@ -455,6 +455,13 @@ def build_lut_for_group(calib_x, calib_y, group_id, group_size, args, device):
     g_end = g_start + group_size
     group_target = calib_y[:, g_start:g_end]
 
+    group_mean = None
+    if args.target_mode == "residual_mean":
+        group_mean = group_target.mean(dim=0)
+        group_target_for_lut = group_target - group_mean
+    else:
+        group_target_for_lut = group_target
+
     seed = args.seed * 10000 + group_id
     address = AddressGreedyTree(
         input_dim=calib_x.shape[-1],
@@ -465,7 +472,7 @@ def build_lut_for_group(calib_x, calib_y, group_id, group_size, args, device):
     print(f"  building tree for group {group_id} ...")
     t0 = time.time()
     address.build(
-        calib_x, group_target,
+        calib_x, group_target_for_lut,
         num_candidates=args.tree_candidates,
         min_samples=args.tree_min_samples,
         max_samples=args.tree_max_samples,
@@ -479,17 +486,19 @@ def build_lut_for_group(calib_x, calib_y, group_id, group_size, args, device):
         group_size=group_size,
         device=calib_x.device,
     )
-    lut.initialize_from_calibration(indices, group_target)
-    return address, lut
+    lut.initialize_from_calibration(indices, group_target_for_lut)
+    return address, lut, group_mean
 
 
 @torch.no_grad()
-def evaluate_group(address, lut, eval_x, eval_y, group_id, group_size, device):
+def evaluate_group(address, lut, group_mean, eval_x, eval_y, group_id, group_size, device):
     eval_x = eval_x.to(device)
     eval_y = eval_y.to(device)
     lut = lut.to(device)
     indices = address.compute_indices(eval_x.unsqueeze(0)).view(-1, 1)
     pred_group = lut(indices).squeeze(1)
+    if group_mean is not None:
+        pred_group = pred_group + group_mean.to(device)
     g_start = group_id * group_size
     g_end = g_start + group_size
     true_group = eval_y[:, g_start:g_end]
@@ -510,7 +519,7 @@ def evaluate_group(address, lut, eval_x, eval_y, group_id, group_size, device):
 
 
 @torch.no_grad()
-def evaluate_full_output(addresses, luts, group_ids, eval_x, eval_y, group_size, device):
+def evaluate_full_output(addresses, luts, group_means, group_ids, eval_x, eval_y, group_size, device):
     """把所有被替换 group 拼回完整 FFN 输出，再和真实输出比。"""
     eval_x = eval_x.to(device)
     eval_y = eval_y.to(device)
@@ -521,6 +530,8 @@ def evaluate_full_output(addresses, luts, group_ids, eval_x, eval_y, group_size,
         lut = luts[gid].to(device)
         indices = address.compute_indices(eval_x.unsqueeze(0)).view(-1, 1)
         pred_group = lut(indices).squeeze(1)
+        if group_means[gid] is not None:
+            pred_group = pred_group + group_means[gid].to(device)
         g_start = gid * group_size
         g_end = g_start + group_size
         pred_y[:, g_start:g_end] = pred_group
@@ -587,6 +598,8 @@ def main():
     parser.add_argument("--tree_min_samples", type=int, default=16)
     parser.add_argument("--tree_max_samples", type=int, default=65536,
                         help="Subsample calibration data for tree building")
+    parser.add_argument("--target_mode", type=str, default="direct", choices=["direct", "residual_mean"],
+                        help="direct: LUT stores full FFN output; residual_mean: LUT stores output - group_mean")
     parser.add_argument("--calib_size", type=int, default=65536)
     parser.add_argument("--eval_size", type=int, default=8192)
     parser.add_argument("--batch_size", type=int, default=256)
@@ -654,17 +667,19 @@ def main():
 
     addresses = {}
     luts = {}
+    group_means = {}
     group_metrics = []
 
     for gid in group_ids:
         print(f"\n[Group {gid}] building LUT ...")
-        address, lut = build_lut_for_group(calib_x, calib_y, gid, args.group_size, args, device)
-        metrics = evaluate_group(address, lut, eval_x, eval_y, gid, args.group_size, device)
+        address, lut, group_mean = build_lut_for_group(calib_x, calib_y, gid, args.group_size, args, device)
+        metrics = evaluate_group(address, lut, group_mean, eval_x, eval_y, gid, args.group_size, device)
         print(f"  group {gid}: cos_sim={metrics['cosine_similarity']:.4f}, "
               f"rel_l2={metrics['relative_l2']:.2%}, rel_mse={metrics['relative_mse']:.4f}")
 
         addresses[gid] = address
         luts[gid] = lut
+        group_means[gid] = group_mean
         group_metrics.append({"group_id": gid, **metrics})
 
         ckpt_path = ckpt_dir / f"replacement_g{gid}.pt"
@@ -673,14 +688,16 @@ def main():
             "group_size": args.group_size,
             "num_bits": args.num_bits,
             "channels_per_bit": args.channels_per_bit,
+            "target_mode": args.target_mode,
             "address_type": "tree",
             "tree_state": address.serialize(),
             "lut_table": lut.table.detach().cpu().half(),  # FP16 for storage
+            "group_mean": group_mean.detach().cpu().half() if group_mean is not None else None,
         }, ckpt_path)
         print(f"  saved checkpoint: {ckpt_path}")
 
     print("\n[Full output] evaluating all replaced groups together ...")
-    full_metrics = evaluate_full_output(addresses, luts, group_ids, eval_x, eval_y, args.group_size, device)
+    full_metrics = evaluate_full_output(addresses, luts, group_means, group_ids, eval_x, eval_y, args.group_size, device)
     print(f"  full output: cos_sim={full_metrics['cosine_similarity']:.4f}, "
           f"rel_l2={full_metrics['relative_l2']:.2%}")
 
@@ -707,6 +724,7 @@ def main():
         "tree_candidates": args.tree_candidates,
         "tree_min_samples": args.tree_min_samples,
         "tree_max_samples": args.tree_max_samples,
+        "target_mode": args.target_mode,
         "num_entries_per_group": num_entries,
         "actual_leaves_per_group": {str(gid): addresses[gid]._leaf_counter for gid in group_ids},
         "table_bytes_per_group": table_bytes_per_group,

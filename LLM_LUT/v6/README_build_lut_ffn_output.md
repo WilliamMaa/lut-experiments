@@ -99,6 +99,7 @@ python build_lut_ffn_output.py \
 | `--tree_candidates` | 每个分裂节点尝试的随机投影数 | 64 |
 | `--tree_min_samples` | 节点不再分裂的最小样本数 | 16 |
 | `--tree_max_samples` | tree 构建时最多使用的 calibration 样本数 | 65536 |
+| `--target_mode` | `direct`：LUT 存完整 FFN 输出；`residual_mean`：LUT 存 `输出 - group 均值` | `direct` |
 | `--calib_size` | 用于构建 LUT 的样本数 | 65536 |
 | `--eval_size` | 用于评估的样本数 | 8192 |
 | `--batch_size` | 读取数据时每次处理的 batch size | 256 |
@@ -111,7 +112,8 @@ python build_lut_ffn_output.py \
 当前 4 group、num_bits=12 的结果只替换了约 **4.2%** 的 FFN MAC，表也只有 **2 MiB**。从 `00-ideas.md` 的目标看，还有很大放大空间：
 
 1. **先加单 group 容量**：把 `num_bits` 从 12 提到 14/16，看单 group 的 cosine similarity 能不能从 0.7 拉到 0.95 以上。
-2. **再扩替换比例**：在这个模型上（hidden=2048, intermediate=512, 32 个 group）：
+2. **如果直接预测完整输出困难，尝试 `residual_mean`**：LUT 只学 `输出 - group 均值`，因为均值部分占方差很大，去掉后残差更容易拟合。
+3. **再扩替换比例**：在这个模型上（hidden=2048, intermediate=512, 32 个 group）：
    - 8 个 group → 约 8.3% MAC reduction
    - 10 个 group → 约 10.4% MAC reduction（`00-ideas.md` 的主目标）
    - 16 个 group → 约 16.7% MAC reduction
@@ -124,6 +126,25 @@ python build_lut_ffn_output.py \
 所以即使 10 个 group + num_bits=16，也只有 **80 MiB**，远低于 1 GiB 预算。
 
 ### 放大示例
+
+**4 groups，num_bits=16，用 residual_mean 目标**：
+
+```bash
+python build_lut_ffn_output.py \
+  --teacher_weight_path /root/data1/rce/OLMo-core/tmp/qwen_35b_last_moe.pt \
+  --dataset_dir /data/ai2/datasets/lut_distill_dataset/input_qwen3_layer1_ffn_1000w_0711 \
+  --output_dataset_dir /data/ai2/datasets/lut_distill_dataset/output_qwen3_layer1_ffn_1000w_0711 \
+  --output_root ./outputs_ffn_lut_layer1_4groups_1000w_nb16_residual \
+  --group_size 64 \
+  --group_ids "0-3" \
+  --num_bits 16 \
+  --tree_max_samples 200000 \
+  --tree_min_samples 4 \
+  --calib_size 200000 \
+  --eval_size 20000 \
+  --target_mode residual_mean \
+  --device cuda:0
+```
 
 **8 groups，num_bits=14，目标 ~8.3% MAC reduction**：
 
@@ -151,7 +172,7 @@ python build_lut_ffn_output.py \
   --device cuda:0
 ```
 
-**建议推进顺序**：先跑 `num_bits=16` 的 4 groups，看单 group 精度是否接近 0.95；如果还不够，再考虑 `tree_max_samples` 或 `channels_per_bit`；如果够了，再扩到 10 groups 做模型级输出评估。
+**建议推进顺序**：先跑 `num_bits=16` 的 4 groups + `residual_mean`，看单 group 精度是否接近 0.95；如果还不够，再考虑 `tree_max_samples` 或 `channels_per_bit`；如果够了，再扩到 10 groups 做模型级输出评估。
 
 ---
 
