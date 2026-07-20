@@ -28,7 +28,10 @@
 ### 2. FFN 输入数据集（`--dataset_dir`）
 
 - 一个目录，里面包含若干 `.pt` 文件。
-- 每个 `.pt` 文件是一个 `float` tensor，形状为 `[N, hidden_size]`，表示该专家的 N 个 FFN 输入 token。
+- 每个 `.pt` 文件是一个 `float` tensor，形状可以是：
+  - `[hidden_size]`：单个 FFN 输入 token
+  - `[N, hidden_size]`：N 个 FFN 输入 token 的 batch
+- 对应的预计算输出文件形状需与输入文件一致。
 
 ### 3. （可选）预计算 FFN 输出数据集（`--output_dataset_dir`）
 

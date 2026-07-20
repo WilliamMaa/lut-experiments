@@ -358,21 +358,34 @@ def collect_calibration_and_eval(
         targets = []
         collected = 0
         pbar = tqdm(total=needed, desc=desc, unit="sample")
+
+        x_buffer = []
+        y_buffer = []
+        buffer_len = 0
+
+        def load_tensor_2d(path, name):
+            tensor = torch.load(path, map_location="cpu")
+            if tensor.dim() == 1:
+                tensor = tensor.unsqueeze(0)
+            elif tensor.dim() != 2:
+                raise ValueError(
+                    f"{name} {path} has shape {tensor.shape}, expected [N, hidden] or [hidden]"
+                )
+            return tensor
+
         for idx, in_path in enumerate(sorted(input_paths)):
             if collected >= needed:
                 break
             try:
-                x_tensor = torch.load(in_path, map_location="cpu")
+                x_tensor = load_tensor_2d(in_path, "input")
             except Exception as e:
                 print(f"  skip {in_path}: {e}")
                 continue
-            if x_tensor.dim() != 2:
-                raise ValueError(f"{in_path} has shape {x_tensor.shape}, expected [N, hidden]")
 
             if use_precomputed_outputs:
                 out_path = output_paths[idx]
                 try:
-                    y_tensor = torch.load(out_path, map_location="cpu")
+                    y_tensor = load_tensor_2d(out_path, "output")
                 except Exception as e:
                     print(f"  skip {out_path}: {e}")
                     continue
@@ -383,22 +396,46 @@ def collect_calibration_and_eval(
             else:
                 y_tensor = None
 
-            for i in range(0, x_tensor.shape[0], batch_size):
-                if collected >= needed:
-                    break
-                x = x_tensor[i:i + batch_size].to(device, dtype=weight_dtype)
+            x_buffer.append(x_tensor)
+            if y_tensor is not None:
+                y_buffer.append(y_tensor)
+            buffer_len += x_tensor.shape[0]
+
+            while buffer_len >= batch_size:
+                cat_x = torch.cat(x_buffer, dim=0)
+                n_take = min(batch_size, cat_x.shape[0])
+                x_batch = cat_x[:n_take].to(device, dtype=weight_dtype)
                 if y_tensor is not None:
-                    y = y_tensor[i:i + batch_size].float().cpu()
+                    cat_y = torch.cat(y_buffer, dim=0)
+                    y_batch = cat_y[:n_take].float().cpu()
                 else:
                     with torch.no_grad():
-                        y = teacher(x).float().cpu()
-                x = x.float().cpu()
-                inputs.append(x)
-                targets.append(y)
-                collected += x.shape[0]
-                pbar.update(x.shape[0])
-            if collected >= needed:
-                break
+                        y_batch = teacher(x_batch).float().cpu()
+                x_batch = x_batch.float().cpu()
+                inputs.append(x_batch)
+                targets.append(y_batch)
+                collected += n_take
+                pbar.update(n_take)
+
+                leftover_x = cat_x[n_take:]
+                leftover_y = cat_y[n_take:] if y_tensor is not None else None
+                x_buffer = [leftover_x] if leftover_x.shape[0] > 0 else []
+                y_buffer = [leftover_y] if (leftover_y is not None and leftover_y.shape[0] > 0) else []
+                buffer_len = leftover_x.shape[0] if leftover_x.shape[0] > 0 else 0
+
+        if buffer_len > 0:
+            x_batch = torch.cat(x_buffer, dim=0).to(device, dtype=weight_dtype)
+            if y_buffer:
+                y_batch = torch.cat(y_buffer, dim=0).float().cpu()
+            else:
+                with torch.no_grad():
+                    y_batch = teacher(x_batch).float().cpu()
+            x_batch = x_batch.float().cpu()
+            inputs.append(x_batch)
+            targets.append(y_batch)
+            collected += x_batch.shape[0]
+            pbar.update(x_batch.shape[0])
+
         pbar.close()
         if collected == 0:
             raise RuntimeError(f"No valid samples found in {input_paths[:3]}...")
