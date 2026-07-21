@@ -35,6 +35,10 @@ from build_lut_ffn_output import (
     estimate_eval_files_needed,
     collect_calibration_and_eval,
     LUTGroup,
+    AddressHighOrderRandom,
+    Address2D,
+    AddressGreedyTree,
+    _TreeNode,
 )
 
 
