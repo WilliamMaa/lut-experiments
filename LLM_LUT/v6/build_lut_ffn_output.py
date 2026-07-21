@@ -17,6 +17,7 @@ import glob
 import json
 import math
 import time
+import itertools
 import argparse
 from pathlib import Path
 from collections import deque
@@ -277,6 +278,142 @@ class AddressGreedyTree:
         )
 
 
+class Address2D:
+    """Original v3/v4 style: 2 selected channels -> 2D bins -> flattened index."""
+
+    def __init__(self, addr_idx: torch.Tensor, addr_mean: torch.Tensor,
+                 addr_std: torch.Tensor, num_bins: int = 64, addr_clip: float = 3.0):
+        self.addr_idx = addr_idx.cpu().long()
+        self.addr_mean = addr_mean.cpu()
+        self.addr_std = addr_std.cpu()
+        self.num_bins = num_bins
+        self.addr_clip = addr_clip
+        self.num_entries = num_bins * num_bins
+        self.num_tables = 1
+
+    def compute_indices(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, S, hidden_size]
+        Returns:
+            indices: [B, S, 1] flattened 2D bin index
+        """
+        B, S, _ = x.shape
+        device = x.device
+        idx = self.addr_idx.to(device)
+        addr = x.index_select(-1, idx)  # [B, S, 2]
+
+        mean = self.addr_mean.to(device, x.dtype).view(1, 1, -1)
+        std = self.addr_std.to(device, x.dtype).view(1, 1, -1).clamp_min(1e-6)
+
+        z = (addr - mean) / std
+        z = z.clamp(-self.addr_clip, self.addr_clip)
+        qf = (z + self.addr_clip) / (2.0 * self.addr_clip) * (self.num_bins - 1)
+        b = torch.round(qf).long().clamp(0, self.num_bins - 1)
+        flat = b[:, :, 0] * self.num_bins + b[:, :, 1]
+        return flat.unsqueeze(-1)  # [B, S, 1]
+
+
+class AddressHighOrderRandom:
+    """
+    Fixed random high-order address.
+    For each of M tables and B bits, randomly select K input channels and random
+    signs, project x, standardize, and threshold to get a binary bit.
+    The B bits form an integer index in [0, 2^B).
+    """
+
+    def __init__(self, input_dim: int, num_tables: int, num_bits: int,
+                 channels_per_bit: int = 4, seed: int = 0,
+                 addr_mean: Optional[torch.Tensor] = None,
+                 addr_std: Optional[torch.Tensor] = None):
+        self.input_dim = input_dim
+        self.num_tables = num_tables
+        self.num_bits = num_bits
+        self.channels_per_bit = channels_per_bit
+        self.num_entries = 2 ** num_bits
+
+        gen = torch.Generator().manual_seed(seed)
+        self.channel_idx = torch.randint(
+            0, input_dim, (num_tables, num_bits, channels_per_bit), generator=gen
+        ).long()
+        self.signs = (torch.randint(0, 2, (num_tables, num_bits, channels_per_bit), generator=gen).float() * 2 - 1)
+
+        if addr_mean is None:
+            addr_mean = torch.zeros(num_tables, num_bits)
+        if addr_std is None:
+            addr_std = torch.ones(num_tables, num_bits)
+        self.addr_mean = addr_mean.cpu()
+        self.addr_std = addr_std.cpu().clamp_min(1e-6)
+        self.powers = (2 ** torch.arange(num_bits)).long()
+
+    def compute_indices(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: [B, S, input_dim]
+        Returns:
+            indices: [B, S, num_tables] integer index per table
+        """
+        B, S, _ = x.shape
+        device = x.device
+        N = B * S
+        x_flat = x.view(N, self.input_dim)
+        idx = self.channel_idx.to(device)
+        selected = x_flat[:, idx]  # [N, num_tables, num_bits, channels_per_bit]
+        signs = self.signs.to(device, x.dtype)
+        proj = (selected * signs).sum(dim=-1)  # [N, num_tables, num_bits]
+
+        mean = self.addr_mean.to(device, x.dtype).view(1, self.num_tables, self.num_bits)
+        std = self.addr_std.to(device, x.dtype).view(1, self.num_tables, self.num_bits)
+        z = (proj - mean) / std
+        bits = (z > 0).long()  # [N, num_tables, num_bits]
+
+        powers = self.powers.to(device).view(1, 1, self.num_bits)
+        indices = (bits * powers).sum(dim=-1)  # [N, num_tables]
+        return indices.view(B, S, self.num_tables)
+
+    def fit_calibration(self, x: torch.Tensor):
+        """Re-compute addr_mean/std from calibration data."""
+        with torch.no_grad():
+            B, S, _ = x.shape
+            N = B * S
+            x_flat = x.view(N, self.input_dim)
+            idx = self.channel_idx.to(x_flat.device)
+            selected = x_flat[:, idx]
+            signs = self.signs.to(x_flat.device, x_flat.dtype)
+            proj = (selected * signs).sum(dim=-1)  # [N, num_tables, num_bits]
+            self.addr_mean = proj.mean(dim=0).cpu()
+            self.addr_std = proj.std(dim=0).cpu().clamp_min(1e-6)
+
+
+def select_2d_address(calib_x, target, group_size, num_bins, num_candidates=8):
+    """Pick a good 2-channel address pair using the first group target."""
+    hidden_size = calib_x.shape[-1]
+    channel_var = calib_x.var(dim=0)
+    top_channels = torch.topk(channel_var, k=min(num_candidates * 2, hidden_size)).indices.tolist()
+    pairs = list(itertools.combinations(top_channels[:num_candidates], 2))[:20]
+
+    out_group = target[:, :group_size]
+    best_rmse = float("inf")
+    best_pair = None
+    for c1, c2 in pairs:
+        addr_idx = torch.tensor([c1, c2], device=calib_x.device)
+        addr = Address2D(addr_idx,
+                         calib_x[:, addr_idx].mean(dim=0),
+                         calib_x[:, addr_idx].std(dim=0),
+                         num_bins=num_bins)
+        indices = addr.compute_indices(calib_x.unsqueeze(0)).view(-1, 1)
+        lut = LUTGroup(1, addr.num_entries, group_size, device=calib_x.device)
+        lut.initialize_from_calibration(indices, out_group)
+        rec = lut(indices).squeeze(1)
+        rmse = F.mse_loss(rec, out_group.float(), reduction="mean").item() ** 0.5
+        if rmse < best_rmse:
+            best_rmse = rmse
+            best_pair = (c1, c2)
+    if best_pair is None:
+        best_pair = (0, 1)
+    return torch.tensor(best_pair, device=calib_x.device), best_rmse
+
+
 class LUTGroup(nn.Module):
     """
     可训练（或离线初始化）的 LUT 表。
@@ -466,25 +603,44 @@ def build_lut_for_group(calib_x, calib_y, group_id, group_size, args, device):
         group_target_for_lut = group_target
 
     seed = args.seed * 10000 + group_id
-    address = AddressGreedyTree(
-        input_dim=calib_x.shape[-1],
-        num_bits=args.num_bits,
-        channels_per_bit=args.channels_per_bit,
-        seed=seed,
-    )
-    print(f"  building tree for group {group_id} ...")
-    t0 = time.time()
-    address.build(
-        calib_x, group_target_for_lut,
-        num_candidates=args.tree_candidates,
-        min_samples=args.tree_min_samples,
-        max_samples=args.tree_max_samples,
-    )
-    print(f"  tree built in {time.time() - t0:.2f}s, leaves={address._leaf_counter}")
 
-    indices = address.compute_indices(calib_x.unsqueeze(0)).view(-1, 1)
+    if args.address_mode == "2d":
+        addr_idx, _ = select_2d_address(calib_x, group_target_for_lut, group_size, args.num_bins)
+        address = Address2D(
+            addr_idx,
+            calib_x[:, addr_idx].mean(dim=0),
+            calib_x[:, addr_idx].std(dim=0),
+            num_bins=args.num_bins,
+        )
+    elif args.address_mode == "high_order":
+        address = AddressHighOrderRandom(
+            input_dim=calib_x.shape[-1],
+            num_tables=args.num_tables,
+            num_bits=args.num_bits,
+            channels_per_bit=args.channels_per_bit,
+            seed=seed,
+        )
+        address.fit_calibration(calib_x.unsqueeze(0))
+    else:  # tree
+        address = AddressGreedyTree(
+            input_dim=calib_x.shape[-1],
+            num_bits=args.num_bits,
+            channels_per_bit=args.channels_per_bit,
+            seed=seed,
+        )
+        print(f"  building tree for group {group_id} ...")
+        t0 = time.time()
+        address.build(
+            calib_x, group_target_for_lut,
+            num_candidates=args.tree_candidates,
+            min_samples=args.tree_min_samples,
+            max_samples=args.tree_max_samples,
+        )
+        print(f"  tree built in {time.time() - t0:.2f}s, leaves={address._leaf_counter}")
+
+    indices = address.compute_indices(calib_x.unsqueeze(0)).view(-1, address.num_tables)
     lut = LUTGroup(
-        num_tables=1,
+        num_tables=address.num_tables,
         num_entries=address.num_entries,
         group_size=group_size,
         device=calib_x.device,
@@ -498,7 +654,7 @@ def evaluate_group(address, lut, group_mean, target_mode, eval_x, eval_y, group_
     eval_x = eval_x.to(device)
     eval_y = eval_y.to(device)
     lut = lut.to(device)
-    indices = address.compute_indices(eval_x.unsqueeze(0)).view(-1, 1)
+    indices = address.compute_indices(eval_x.unsqueeze(0)).view(-1, address.num_tables)
     pred_group = lut(indices).squeeze(1)
 
     g_start = group_id * group_size
@@ -536,7 +692,7 @@ def evaluate_full_output(addresses, luts, group_means, target_mode, group_ids, e
     for gid in group_ids:
         address = addresses[gid]
         lut = luts[gid].to(device)
-        indices = address.compute_indices(eval_x.unsqueeze(0)).view(-1, 1)
+        indices = address.compute_indices(eval_x.unsqueeze(0)).view(-1, address.num_tables)
         pred_group = lut(indices).squeeze(1)
 
         g_start = gid * group_size
@@ -605,8 +761,14 @@ def main():
     parser.add_argument("--group_ids", type=str, default="0-3",
                         help="Output group ids to replace, e.g. '0,1,2,3' or '0-7' or '0-3,8,10-15'")
     parser.add_argument("--num_bits", type=int, default=12,
-                        help="Tree depth => 2^num_bits entries per group")
+                        help="Tree depth or bits per table => 2^num_bits entries per table")
     parser.add_argument("--channels_per_bit", type=int, default=4)
+    parser.add_argument("--address_mode", type=str, default="tree", choices=["tree", "high_order", "2d"],
+                        help="Address generator mode")
+    parser.add_argument("--num_tables", type=int, default=1,
+                        help="Number of tables for high_order address (total entries = num_tables * 2^num_bits)")
+    parser.add_argument("--num_bins", type=int, default=64,
+                        help="Bins per axis for 2d address (entries = num_bins^2)")
     parser.add_argument("--tree_candidates", type=int, default=64)
     parser.add_argument("--tree_min_samples", type=int, default=16)
     parser.add_argument("--tree_max_samples", type=int, default=65536,
@@ -711,8 +873,7 @@ def main():
             "num_bits": args.num_bits,
             "channels_per_bit": args.channels_per_bit,
             "target_mode": args.target_mode,
-            "address_type": "tree",
-            "tree_state": address.serialize(),
+            "address": address,
             "lut_table": lut.table.detach().cpu().half(),  # FP16 for storage
             "group_mean": group_mean.detach().cpu().half() if group_mean is not None else None,
         }, ckpt_path)
@@ -724,13 +885,19 @@ def main():
           f"rel_l2={full_metrics['relative_l2']:.2%}")
 
     num_entries = 2 ** args.num_bits
-    table_bytes_per_group = compute_lut_storage_bytes(num_entries, args.group_size, num_tables=1)
+    num_tables = addresses[group_ids[0]].num_tables
+    table_bytes_per_group = compute_lut_storage_bytes(num_entries, args.group_size, num_tables=num_tables)
     total_table_bytes = table_bytes_per_group * len(group_ids)
     replaced_channels = len(group_ids) * args.group_size
 
     total_ffn_mac = 3 * hidden_size * intermediate_size
     saved_mac = replaced_channels * intermediate_size  # skip down_proj slice for replaced groups
     mac_reduction_ratio = saved_mac / total_ffn_mac
+
+    def count_leaves(addr):
+        if isinstance(addr, AddressGreedyTree):
+            return addr._leaf_counter
+        return addr.num_entries
 
     summary = {
         "teacher_weight_path": args.teacher_weight_path,
@@ -741,14 +908,17 @@ def main():
         "intermediate_size": intermediate_size,
         "group_size": args.group_size,
         "group_ids": group_ids,
+        "address_mode": args.address_mode,
+        "num_tables": num_tables,
+        "num_bins": args.num_bins,
         "num_bits": args.num_bits,
         "channels_per_bit": args.channels_per_bit,
         "tree_candidates": args.tree_candidates,
         "tree_min_samples": args.tree_min_samples,
         "tree_max_samples": args.tree_max_samples,
         "target_mode": args.target_mode,
-        "num_entries_per_group": num_entries,
-        "actual_leaves_per_group": {str(gid): addresses[gid]._leaf_counter for gid in group_ids},
+        "num_entries_per_group": num_entries * num_tables,
+        "actual_leaves_per_group": {str(gid): count_leaves(addresses[gid]) for gid in group_ids},
         "table_bytes_per_group": table_bytes_per_group,
         "total_table_bytes": total_table_bytes,
         "total_table_mib": total_table_bytes / (1024 * 1024),

@@ -94,9 +94,12 @@ python build_lut_ffn_output.py \
 | `--output_root` | 输出目录 | 必填 |
 | `--group_size` | 每个输出 group 的通道数 | 64 |
 | `--group_ids` | 要替换的输出 group 编号，支持逗号或连字符范围，如 `0,1,2,3`、`0-7`、`0-3,8,10-15` | `0-3` |
-| `--num_bits` | tree 深度，表项数为 `2^num_bits` | 12 |
-| `--channels_per_bit` | 每个 tree 分裂节点随机选用的输入通道数 | 4 |
-| `--tree_candidates` | 每个分裂节点尝试的随机投影数 | 64 |
+| `--num_bits` | tree 深度 / 每表 bit 数，表项数为 `2^num_bits` | 12 |
+| `--channels_per_bit` | 每个地址位随机选用的输入通道数 | 4 |
+| `--address_mode` | 地址生成器：`tree`（决策树）、`high_order`（随机高阶投影）、`2d`（两通道分箱） | `tree` |
+| `--num_tables` | `high_order` 模式下的表数（总表项 = `num_tables * 2^num_bits`） | 1 |
+| `--num_bins` | `2d` 模式下每轴 bins 数（表项 = `num_bins^2`） | 64 |
+| `--tree_candidates` | 每个 tree 分裂节点尝试的随机投影数 | 64 |
 | `--tree_min_samples` | 节点不再分裂的最小样本数 | 16 |
 | `--tree_max_samples` | tree 构建时最多使用的 calibration 样本数 | 65536 |
 | `--target_mode` | `direct`：LUT 存完整 FFN 输出；`residual_mean`：LUT 存 `输出 - group 均值`；`residual_input`：LUT 存 `输出 - 输入残差` | `direct` |
@@ -111,7 +114,7 @@ python build_lut_ffn_output.py \
 
 当前 4 group、num_bits=12 的结果只替换了约 **4.2%** 的 FFN MAC，表也只有 **2 MiB**。从 `00-ideas.md` 的目标看，还有很大放大空间：
 
-1. **先加单 group 容量**：把 `num_bits` 从 12 提到 14/16，看单 group 的 cosine similarity 能不能从 0.7 拉到 0.95 以上。
+1. **先换地址生成器**：`tree` 在这个模型上效果不佳（单 group cos_sim ~0.5），可以先试 `high_order` 随机高阶投影地址。
 2. **如果直接预测完整输出困难，尝试 `residual_input`（v5 的做法）**：LUT 只学 `FFN 输出 - 输入残差`，也就是 MLP 那一部分残差。对 Transformer 来说，输入残差通常是一个很好的 baseline，比 group 均值更稳。
 3. **再扩替换比例**：在这个模型上（hidden=2048, intermediate=512, 32 个 group）：
    - 8 个 group → 约 8.3% MAC reduction
@@ -119,13 +122,31 @@ python build_lut_ffn_output.py \
    - 16 个 group → 约 16.7% MAC reduction
    - 19 个 group → 约 20.0% MAC reduction
 
-表存储按 FP16 估算：
-- num_bits=14：每个 group 2 MiB
-- num_bits=16：每个 group 8 MiB
-
-所以即使 10 个 group + num_bits=16，也只有 **80 MiB**，远低于 1 GiB 预算。
+表存储按 FP16 估算（high_order 模式下乘以 `num_tables`）：
+- `num_bits=12`，`num_tables=4`：每个 group 2 MiB
+- `num_bits=14`，`num_tables=4`：每个 group 8 MiB
+- `num_bits=16`，`num_tables=1`：每个 group 8 MiB
 
 ### 放大示例
+
+**4 groups，high_order 地址，num_bits=12，num_tables=4**：
+
+```bash
+python build_lut_ffn_output.py \
+  --teacher_weight_path /root/data1/rce/OLMo-core/tmp/qwen_35b_last_moe.pt \
+  --dataset_dir /data/ai2/datasets/lut_distill_dataset/input_qwen3_layer1_ffn_1000w_0711 \
+  --output_dataset_dir /data/ai2/datasets/lut_distill_dataset/output_qwen3_layer1_ffn_1000w_0711 \
+  --output_root ./outputs_ffn_lut_layer1_4groups_1000w_high_order_nb12_t4 \
+  --group_size 64 \
+  --group_ids "0-3" \
+  --address_mode high_order \
+  --num_bits 12 \
+  --num_tables 4 \
+  --channels_per_bit 4 \
+  --calib_size 200000 \
+  --eval_size 20000 \
+  --device cuda:0
+```
 
 **4 groups，num_bits=16，用 residual_input 目标（v5 风格）**：
 
@@ -172,7 +193,11 @@ python build_lut_ffn_output.py \
   --device cuda:0
 ```
 
-**建议推进顺序**：先跑 `num_bits=16` 的 4 groups + `residual_input`，看单 group 精度是否接近 0.95；如果还不够，再尝试 `AddressHighOrderRandom` 或 `Coarse + Residual`；如果够了，再扩到 10 groups。
+**建议推进顺序**：
+1. 先跑 `high_order` + `num_bits=12` + `num_tables=4` + `direct` 目标，看单 group cos_sim 是否比 `tree` 好。
+2. 如果好，再试 `high_order` + `residual_input`。
+3. 如果单 group 到 0.9 以上，再扩到 10 groups。
+4. 如果 `high_order` 也不行，再试 `Coarse + Residual` 或多表组合。
 
 ---
 
@@ -182,9 +207,10 @@ python build_lut_ffn_output.py \
 
 `outputs/checkpoints/replacement_g{gid}.pt` 包含：
 
-- `tree_state`: 可序列化的 tree 地址生成器
-- `lut_table`: FP16 的 LUT 表，形状 `[1, 2^num_bits, group_size]`
-- `group_id`, `group_size`, `num_bits`, `channels_per_bit`
+- `address`: 地址生成器对象（tree / high_order / 2d 之一）
+- `lut_table`: FP16 的 LUT 表，形状 `[num_tables, num_entries, group_size]`
+- `group_id`, `group_size`, `num_bits`, `channels_per_bit`, `target_mode`
+- `group_mean`: 用于 `residual_mean` 目标
 
 ### 2. 汇总结果
 
