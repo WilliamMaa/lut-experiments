@@ -208,7 +208,7 @@ def main():
         g_end = g_start + group_size
         true_group = eval_y[:, g_start:g_end].to(device)
         eval_x_device = eval_x.to(device)
-        calib_x_device = calib_x.to(device)
+        calib_x_device = calib_x  # 保持 CPU，避免把 2M×2048 的 calibration 数据搬上 GPU
 
         ckpt = torch.load(ckpt_dir / f"replacement_g{gid}.pt", map_location="cpu", weights_only=False)
         addresses = ckpt["addresses"]
@@ -290,10 +290,10 @@ def main():
             combined_metrics = coarse_metrics
 
         # 5. bin 诊断（基于 calibration 数据）
-        calib_group_target = calib_y[:, g_start:g_end].to(device)
+        calib_group_target = calib_y[:, g_start:g_end]  # CPU 即可
         # 对 direct / residual_mean / residual_input 使用 group_target_for_lut 更合适
         if target_mode == "residual_mean":
-            calib_group_target_for_lut = calib_group_target - gm.to(device)
+            calib_group_target_for_lut = calib_group_target - gm
         elif target_mode == "residual_input":
             calib_group_target_for_lut = calib_group_target - calib_x_device[:, g_start:g_end]
         else:
