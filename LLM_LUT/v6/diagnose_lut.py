@@ -206,7 +206,7 @@ def main():
         eval_x_device = eval_x.to(device)
         calib_x_device = calib_x.to(device)
 
-        ckpt = torch.load(ckpt_dir / f"replacement_g{gid}.pt", map_location="cpu")
+        ckpt = torch.load(ckpt_dir / f"replacement_g{gid}.pt", map_location="cpu", weights_only=False)
         addresses = ckpt["addresses"]
         tables = ckpt["lut_tables"]
         group_mean_ckpt = ckpt.get("group_mean")
