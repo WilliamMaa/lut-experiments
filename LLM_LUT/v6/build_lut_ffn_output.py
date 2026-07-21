@@ -456,7 +456,10 @@ def build_lut_for_group(calib_x, calib_y, group_id, group_size, args, device):
     group_target = calib_y[:, g_start:g_end]
 
     group_mean = None
-    if args.target_mode == "residual_mean":
+    if args.target_mode == "residual_input":
+        baseline = calib_x[:, g_start:g_end]
+        group_target_for_lut = group_target - baseline
+    elif args.target_mode == "residual_mean":
         group_mean = group_target.mean(dim=0)
         group_target_for_lut = group_target - group_mean
     else:
@@ -491,16 +494,21 @@ def build_lut_for_group(calib_x, calib_y, group_id, group_size, args, device):
 
 
 @torch.no_grad()
-def evaluate_group(address, lut, group_mean, eval_x, eval_y, group_id, group_size, device):
+def evaluate_group(address, lut, group_mean, target_mode, eval_x, eval_y, group_id, group_size, device):
     eval_x = eval_x.to(device)
     eval_y = eval_y.to(device)
     lut = lut.to(device)
     indices = address.compute_indices(eval_x.unsqueeze(0)).view(-1, 1)
     pred_group = lut(indices).squeeze(1)
-    if group_mean is not None:
-        pred_group = pred_group + group_mean.to(device)
+
     g_start = group_id * group_size
     g_end = g_start + group_size
+
+    if target_mode == "residual_input":
+        pred_group = pred_group + eval_x[:, g_start:g_end]
+    elif target_mode == "residual_mean":
+        pred_group = pred_group + group_mean.to(device)
+
     true_group = eval_y[:, g_start:g_end]
 
     mse = F.mse_loss(pred_group, true_group).item()
@@ -519,7 +527,7 @@ def evaluate_group(address, lut, group_mean, eval_x, eval_y, group_id, group_siz
 
 
 @torch.no_grad()
-def evaluate_full_output(addresses, luts, group_means, group_ids, eval_x, eval_y, group_size, device):
+def evaluate_full_output(addresses, luts, group_means, target_mode, group_ids, eval_x, eval_y, group_size, device):
     """把所有被替换 group 拼回完整 FFN 输出，再和真实输出比。"""
     eval_x = eval_x.to(device)
     eval_y = eval_y.to(device)
@@ -530,10 +538,15 @@ def evaluate_full_output(addresses, luts, group_means, group_ids, eval_x, eval_y
         lut = luts[gid].to(device)
         indices = address.compute_indices(eval_x.unsqueeze(0)).view(-1, 1)
         pred_group = lut(indices).squeeze(1)
-        if group_means[gid] is not None:
-            pred_group = pred_group + group_means[gid].to(device)
+
         g_start = gid * group_size
         g_end = g_start + group_size
+
+        if target_mode == "residual_input":
+            pred_group = pred_group + eval_x[:, g_start:g_end]
+        elif target_mode == "residual_mean":
+            pred_group = pred_group + group_means[gid].to(device)
+
         pred_y[:, g_start:g_end] = pred_group
 
     mse = F.mse_loss(pred_y, eval_y).item()
@@ -598,8 +611,8 @@ def main():
     parser.add_argument("--tree_min_samples", type=int, default=16)
     parser.add_argument("--tree_max_samples", type=int, default=65536,
                         help="Subsample calibration data for tree building")
-    parser.add_argument("--target_mode", type=str, default="direct", choices=["direct", "residual_mean"],
-                        help="direct: LUT stores full FFN output; residual_mean: LUT stores output - group_mean")
+    parser.add_argument("--target_mode", type=str, default="direct", choices=["direct", "residual_mean", "residual_input"],
+                        help="direct: LUT stores full FFN output; residual_mean: LUT stores output - group_mean; residual_input: LUT stores output - input_residual")
     parser.add_argument("--calib_size", type=int, default=65536)
     parser.add_argument("--eval_size", type=int, default=8192)
     parser.add_argument("--batch_size", type=int, default=256)
@@ -682,7 +695,7 @@ def main():
     for gid in group_ids:
         print(f"\n[Group {gid}] building LUT ...")
         address, lut, group_mean = build_lut_for_group(calib_x, calib_y, gid, args.group_size, args, device)
-        metrics = evaluate_group(address, lut, group_mean, eval_x, eval_y, gid, args.group_size, device)
+        metrics = evaluate_group(address, lut, group_mean, args.target_mode, eval_x, eval_y, gid, args.group_size, device)
         print(f"  group {gid}: cos_sim={metrics['cosine_similarity']:.4f}, "
               f"rel_l2={metrics['relative_l2']:.2%}, rel_mse={metrics['relative_mse']:.4f}")
 
@@ -706,7 +719,7 @@ def main():
         print(f"  saved checkpoint: {ckpt_path}")
 
     print("\n[Full output] evaluating all replaced groups together ...")
-    full_metrics = evaluate_full_output(addresses, luts, group_means, group_ids, eval_x, eval_y, args.group_size, device)
+    full_metrics = evaluate_full_output(addresses, luts, group_means, args.target_mode, group_ids, eval_x, eval_y, args.group_size, device)
     print(f"  full output: cos_sim={full_metrics['cosine_similarity']:.4f}, "
           f"rel_l2={full_metrics['relative_l2']:.2%}")
 
