@@ -779,6 +779,70 @@ def evaluate_full_output(addresses_per_group, luts_per_group, group_means, targe
     }
 
 
+def finetune_luts(addresses, luts, group_means, target_mode, calib_x, calib_y,
+                  group_ids, group_size, device, args):
+    """
+    离线 finetune：地址固定，只优化 LUT 表值。
+    在 calibration 数据上最小化所有被替换 group 的 MSE。
+    """
+    epochs = args.finetune_epochs
+    if epochs <= 0:
+        return
+
+    print(f"\n[Finetune] optimizing LUT tables for {epochs} epochs (lr={args.finetune_lr}, batch={args.finetune_batch_size}) ...")
+    params = []
+    for gid in group_ids:
+        for lut in luts[gid]:
+            lut.to(device)
+            params.append(lut.table)
+
+    optimizer = torch.optim.Adam(params, lr=args.finetune_lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    calib_x = calib_x  # keep on CPU, move batch to device
+    calib_y = calib_y
+    n_samples = calib_x.shape[0]
+
+    for epoch in range(epochs):
+        perm = torch.randperm(n_samples)
+        epoch_loss = 0.0
+        n_batches = 0
+        for start in range(0, n_samples, args.finetune_batch_size):
+            idx = perm[start:start + args.finetune_batch_size]
+            xb = calib_x[idx].to(device)
+            yb = calib_y[idx].to(device)
+
+            optimizer.zero_grad()
+            loss = 0.0
+            for gid in group_ids:
+                g_start = gid * group_size
+                g_end = g_start + group_size
+
+                pred_group = None
+                for address, lut in zip(addresses[gid], luts[gid]):
+                    indices = address.compute_indices(xb.unsqueeze(0)).view(-1, address.num_tables)
+                    out = lut(indices).squeeze(1)
+                    pred_group = out if pred_group is None else pred_group + out
+
+                if target_mode == "residual_input":
+                    pred_group = pred_group + xb[:, g_start:g_end]
+                elif target_mode == "residual_mean":
+                    pred_group = pred_group + group_means[gid].to(device)
+
+                true_group = yb[:, g_start:g_end]
+                loss = loss + F.mse_loss(pred_group, true_group)
+
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+            n_batches += 1
+
+        scheduler.step()
+        avg_loss = epoch_loss / max(n_batches, 1)
+        print(f"  epoch {epoch + 1}/{epochs}: avg_loss={avg_loss:.6e}")
+    print("[Finetune] done")
+
+
 def compute_lut_storage_bytes(num_entries, group_size, num_tables=1):
     """按 FP16 表值估算。"""
     return num_tables * num_entries * group_size * 2
@@ -892,6 +956,12 @@ def main():
     parser.add_argument("--batch_size", type=int, default=256)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--finetune_epochs", type=int, default=0,
+                        help="Number of offline LUT table value finetune epochs after mean initialization. 0 = no finetune.")
+    parser.add_argument("--finetune_lr", type=float, default=1e-3,
+                        help="Learning rate for offline LUT finetune")
+    parser.add_argument("--finetune_batch_size", type=int, default=1024,
+                        help="Batch size for offline LUT finetune")
     args = parser.parse_args()
 
     if args.tree_max_samples <= 0:
@@ -912,6 +982,12 @@ def main():
         raise ValueError(f"--residual_num_bits must be positive, got {args.residual_num_bits}")
     if args.num_bits <= 0:
         raise ValueError(f"--num_bits must be positive, got {args.num_bits}")
+    if args.finetune_epochs < 0:
+        raise ValueError(f"--finetune_epochs must be non-negative, got {args.finetune_epochs}")
+    if args.finetune_lr <= 0:
+        raise ValueError(f"--finetune_lr must be positive, got {args.finetune_lr}")
+    if args.finetune_batch_size <= 0:
+        raise ValueError(f"--finetune_batch_size must be positive, got {args.finetune_batch_size}")
 
     use_coarse_residual = args.coarse_num_bits is not None
 
@@ -991,15 +1067,14 @@ def main():
             address_list, lut_list, group_mean = build_lut_for_group(
                 calib_x, calib_y, gid, args.group_size, args, device
             )
-        metrics = evaluate_group(address_list, lut_list, group_mean, args.target_mode, eval_x, eval_y, gid, args.group_size, device)
-        print(f"  group {gid}: cos_sim={metrics['cosine_similarity']:.4f}, "
-              f"rel_l2={metrics['relative_l2']:.2%}, rel_mse={metrics['relative_mse']:.4f}")
-
         addresses[gid] = address_list
         luts[gid] = lut_list
         group_means[gid] = group_mean
-        group_metrics.append({"group_id": gid, "num_luts": len(address_list), **metrics})
 
+    if args.finetune_epochs > 0:
+        finetune_luts(addresses, luts, group_means, args.target_mode, calib_x, calib_y, group_ids, args.group_size, device, args)
+
+    for gid in group_ids:
         ckpt = {
             "group_id": gid,
             "group_size": args.group_size,
@@ -1011,18 +1086,27 @@ def main():
             "address_mode": args.address_mode,
             "num_tables": args.num_tables,
             "target_mode": args.target_mode,
-            "addresses": address_list,
-            "lut_tables": [lut.table.detach().cpu().half() for lut in lut_list],  # FP16 for storage
-            "group_mean": group_mean.detach().cpu().half() if group_mean is not None else None,
+            "finetune_epochs": args.finetune_epochs,
+            "finetune_lr": args.finetune_lr,
+            "addresses": addresses[gid],
+            "lut_tables": [lut.table.detach().cpu().half() for lut in luts[gid]],  # FP16 for storage
+            "group_mean": group_means[gid].detach().cpu().half() if group_means[gid] is not None else None,
         }
         # 保持单 LUT 模式下旧字段名兼容
-        if len(address_list) == 1:
-            ckpt["address"] = address_list[0]
+        if len(addresses[gid]) == 1:
+            ckpt["address"] = addresses[gid][0]
             ckpt["lut_table"] = ckpt["lut_tables"][0]
 
         ckpt_path = ckpt_dir / f"replacement_g{gid}.pt"
         torch.save(ckpt, ckpt_path)
         print(f"  saved checkpoint: {ckpt_path}")
+
+    print("\n[Group evaluation] ...")
+    for gid in group_ids:
+        metrics = evaluate_group(addresses[gid], luts[gid], group_means[gid], args.target_mode, eval_x, eval_y, gid, args.group_size, device)
+        print(f"  group {gid}: cos_sim={metrics['cosine_similarity']:.4f}, "
+              f"rel_l2={metrics['relative_l2']:.2%}, rel_mse={metrics['relative_mse']:.4f}")
+        group_metrics.append({"group_id": gid, "num_luts": len(addresses[gid]), **metrics})
 
     print("\n[Full output] evaluating all replaced groups together ...")
     full_metrics = evaluate_full_output(addresses, luts, group_means, args.target_mode, group_ids, eval_x, eval_y, args.group_size, device)
@@ -1059,6 +1143,9 @@ def main():
         "tree_min_samples": args.tree_min_samples,
         "tree_max_samples": args.tree_max_samples,
         "target_mode": args.target_mode,
+        "finetune_epochs": args.finetune_epochs,
+        "finetune_lr": args.finetune_lr,
+        "finetune_batch_size": args.finetune_batch_size,
         "num_entries_per_group": num_entries_per_group,
         "actual_leaves_per_group": {str(gid): count_leaves_for_group(addresses[gid]) for gid in group_ids},
         "table_bytes_per_group": table_bytes_per_group,

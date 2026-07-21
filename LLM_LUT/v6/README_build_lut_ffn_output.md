@@ -108,6 +108,9 @@ python build_lut_ffn_output.py \
 | `--calib_size` | 用于构建 LUT 的样本数 | 65536 |
 | `--eval_size` | 用于评估的样本数 | 8192 |
 | `--batch_size` | 读取数据时每次处理的 batch size | 256 |
+| `--finetune_epochs` | 均值初始化后，是否离线 finetune LUT 表值。`0` = 不微调 | 0 |
+| `--finetune_lr` | LUT 表值 finetune 的学习率 | 1e-3 |
+| `--finetune_batch_size` | LUT 表值 finetune 的 batch size | 1024 |
 | `--device` | 使用的单卡 | `cuda:0` |
 
 ---
@@ -221,6 +224,32 @@ python build_lut_ffn_output.py \
 - 两张表在线相加得到最终预测，summary 里的总存储量会自动按两张表之和估算。
 - 在 `tree` 或 `2d` 模式下，`coarse_num_bits` / `residual_num_bits` 同样有效；`2d` 模式下两张表仍共用 `--num_bins`。
 
+**4 groups，Coarse + Residual + 离线 finetune（10 epochs）**：
+
+```bash
+python build_lut_ffn_output.py \
+  --teacher_weight_path /root/data1/rce/OLMo-core/tmp/qwen_35b_last_moe.pt \
+  --dataset_dir /data/ai2/datasets/lut_distill_dataset/input_qwen3_layer1_ffn_1000w_0711 \
+  --output_dataset_dir /data/ai2/datasets/lut_distill_dataset/output_qwen3_layer1_ffn_1000w_0711 \
+  --output_root ./outputs_ffn_lut_layer1_4groups_1000w_coarse12_residual16_finetune10 \
+  --group_size 64 \
+  --group_ids "0-3" \
+  --address_mode high_order \
+  --coarse_num_bits 12 \
+  --residual_num_bits 16 \
+  --finetune_epochs 10 \
+  --finetune_lr 1e-3 \
+  --finetune_batch_size 1024 \
+  --calib_size 200000 \
+  --eval_size 20000 \
+  --device cuda:0
+```
+
+说明：
+- 先按 calibration 均值初始化 coarse 和 residual 两张表。
+- 然后固定 address，只优化 LUT 表值，最小化被替换 group 的 MSE。
+- finetune 不增加存储，只改变表值，仍然属于 O(1) LUT 查表。
+
 ---
 
 **建议推进顺序**：
@@ -245,6 +274,7 @@ python build_lut_ffn_output.py \
   - `lut_tables`: 对应 LUT 表的列表
 - 公共字段：
   - `group_id`, `group_size`, `num_bits`, `coarse_num_bits`, `residual_num_bits`, `channels_per_bit`, `target_mode`, `address_mode`
+  - `finetune_epochs`, `finetune_lr`：如果做了离线 LUT 表值微调，会记录这些参数
   - `group_mean`: 用于 `residual_mean` 目标
 
 ### 2. 汇总结果
