@@ -587,6 +587,58 @@ def collect_calibration_and_eval(
 # 4. 构建与评估
 # =============================================================================
 @torch.no_grad()
+def _build_single_address_lut(calib_x, group_target_for_lut, group_id, group_size, args, num_bits, seed_offset, desc):
+    """Helper: build one address + LUT."""
+    seed = args.seed * 10000 + group_id * 100 + seed_offset
+
+    if args.address_mode == "2d":
+        addr_idx, _ = select_2d_address(calib_x, group_target_for_lut, group_size, args.num_bins)
+        address = Address2D(
+            addr_idx,
+            calib_x[:, addr_idx].mean(dim=0),
+            calib_x[:, addr_idx].std(dim=0),
+            num_bins=args.num_bins,
+        )
+    elif args.address_mode == "high_order":
+        address = AddressHighOrderRandom(
+            input_dim=calib_x.shape[-1],
+            num_tables=args.num_tables,
+            num_bits=num_bits,
+            channels_per_bit=args.channels_per_bit,
+            seed=seed,
+        )
+        address.fit_calibration(calib_x.unsqueeze(0))
+    else:  # tree
+        address = AddressGreedyTree(
+            input_dim=calib_x.shape[-1],
+            num_bits=num_bits,
+            channels_per_bit=args.channels_per_bit,
+            seed=seed,
+        )
+        if desc:
+            print(f"  building {desc} tree for group {group_id} ...")
+        t0 = time.time()
+        address.build(
+            calib_x, group_target_for_lut,
+            num_candidates=args.tree_candidates,
+            min_samples=args.tree_min_samples,
+            max_samples=args.tree_max_samples,
+        )
+        if desc:
+            print(f"  {desc} tree built in {time.time() - t0:.2f}s, leaves={address._leaf_counter}")
+
+    indices = address.compute_indices(calib_x.unsqueeze(0)).view(-1, address.num_tables)
+    lut = LUTGroup(
+        num_tables=address.num_tables,
+        num_entries=address.num_entries,
+        group_size=group_size,
+        device=calib_x.device,
+    )
+    lut.initialize_from_calibration(indices, group_target_for_lut)
+    return address, lut
+
+
+@torch.no_grad()
 def build_lut_for_group(calib_x, calib_y, group_id, group_size, args, device):
     g_start = group_id * group_size
     g_end = g_start + group_size
@@ -602,60 +654,63 @@ def build_lut_for_group(calib_x, calib_y, group_id, group_size, args, device):
     else:
         group_target_for_lut = group_target
 
-    seed = args.seed * 10000 + group_id
-
-    if args.address_mode == "2d":
-        addr_idx, _ = select_2d_address(calib_x, group_target_for_lut, group_size, args.num_bins)
-        address = Address2D(
-            addr_idx,
-            calib_x[:, addr_idx].mean(dim=0),
-            calib_x[:, addr_idx].std(dim=0),
-            num_bins=args.num_bins,
-        )
-    elif args.address_mode == "high_order":
-        address = AddressHighOrderRandom(
-            input_dim=calib_x.shape[-1],
-            num_tables=args.num_tables,
-            num_bits=args.num_bits,
-            channels_per_bit=args.channels_per_bit,
-            seed=seed,
-        )
-        address.fit_calibration(calib_x.unsqueeze(0))
-    else:  # tree
-        address = AddressGreedyTree(
-            input_dim=calib_x.shape[-1],
-            num_bits=args.num_bits,
-            channels_per_bit=args.channels_per_bit,
-            seed=seed,
-        )
-        print(f"  building tree for group {group_id} ...")
-        t0 = time.time()
-        address.build(
-            calib_x, group_target_for_lut,
-            num_candidates=args.tree_candidates,
-            min_samples=args.tree_min_samples,
-            max_samples=args.tree_max_samples,
-        )
-        print(f"  tree built in {time.time() - t0:.2f}s, leaves={address._leaf_counter}")
-
-    indices = address.compute_indices(calib_x.unsqueeze(0)).view(-1, address.num_tables)
-    lut = LUTGroup(
-        num_tables=address.num_tables,
-        num_entries=address.num_entries,
-        group_size=group_size,
-        device=calib_x.device,
+    address, lut = _build_single_address_lut(
+        calib_x, group_target_for_lut, group_id, group_size, args,
+        num_bits=args.num_bits, seed_offset=0, desc="single",
     )
-    lut.initialize_from_calibration(indices, group_target_for_lut)
-    return address, lut, group_mean
+    return [address], [lut], group_mean
 
 
 @torch.no_grad()
-def evaluate_group(address, lut, group_mean, target_mode, eval_x, eval_y, group_id, group_size, device):
+def build_coarse_residual_luts_for_group(calib_x, calib_y, group_id, group_size, args, device):
+    """Build two LUTs: coarse predicts the main target, residual predicts the error of coarse."""
+    g_start = group_id * group_size
+    g_end = g_start + group_size
+    group_target = calib_y[:, g_start:g_end]
+
+    group_mean = None
+    if args.target_mode == "residual_input":
+        baseline = calib_x[:, g_start:g_end]
+        group_target_for_lut = group_target - baseline
+    elif args.target_mode == "residual_mean":
+        group_mean = group_target.mean(dim=0)
+        group_target_for_lut = group_target - group_mean
+    else:
+        group_target_for_lut = group_target
+
+    # Coarse LUT
+    coarse_address, coarse_lut = _build_single_address_lut(
+        calib_x, group_target_for_lut, group_id, group_size, args,
+        num_bits=args.coarse_num_bits, seed_offset=0, desc="coarse",
+    )
+
+    # Compute coarse prediction on calibration data
+    coarse_indices = coarse_address.compute_indices(calib_x.unsqueeze(0)).view(-1, coarse_address.num_tables)
+    coarse_pred = coarse_lut(coarse_indices).squeeze(1)  # [N, group_size]
+
+    # Residual target = remaining error after coarse
+    residual_target = group_target_for_lut - coarse_pred
+
+    # Residual LUT
+    residual_address, residual_lut = _build_single_address_lut(
+        calib_x, residual_target, group_id, group_size, args,
+        num_bits=args.residual_num_bits, seed_offset=1, desc="residual",
+    )
+
+    return [coarse_address, residual_address], [coarse_lut, residual_lut], group_mean
+
+
+@torch.no_grad()
+def evaluate_group(addresses, luts, group_mean, target_mode, eval_x, eval_y, group_id, group_size, device):
     eval_x = eval_x.to(device)
     eval_y = eval_y.to(device)
-    lut = lut.to(device)
-    indices = address.compute_indices(eval_x.unsqueeze(0)).view(-1, address.num_tables)
-    pred_group = lut(indices).squeeze(1)
+
+    pred_group = None
+    for address, lut in zip(addresses, luts):
+        lut = lut.to(device)
+        indices = address.compute_indices(eval_x.unsqueeze(0)).view(-1, address.num_tables)
+        out = lut(indices).squeeze(1)
+        pred_group = out if pred_group is None else pred_group + out
 
     g_start = group_id * group_size
     g_end = g_start + group_size
@@ -683,17 +738,21 @@ def evaluate_group(address, lut, group_mean, target_mode, eval_x, eval_y, group_
 
 
 @torch.no_grad()
-def evaluate_full_output(addresses, luts, group_means, target_mode, group_ids, eval_x, eval_y, group_size, device):
+def evaluate_full_output(addresses_per_group, luts_per_group, group_means, target_mode, group_ids, eval_x, eval_y, group_size, device):
     """把所有被替换 group 拼回完整 FFN 输出，再和真实输出比。"""
     eval_x = eval_x.to(device)
     eval_y = eval_y.to(device)
     pred_y = eval_y.clone()
 
     for gid in group_ids:
-        address = addresses[gid]
-        lut = luts[gid].to(device)
-        indices = address.compute_indices(eval_x.unsqueeze(0)).view(-1, address.num_tables)
-        pred_group = lut(indices).squeeze(1)
+        addresses = addresses_per_group[gid]
+        luts = luts_per_group[gid]
+        pred_group = None
+        for address, lut in zip(addresses, luts):
+            lut = lut.to(device)
+            indices = address.compute_indices(eval_x.unsqueeze(0)).view(-1, address.num_tables)
+            out = lut(indices).squeeze(1)
+            pred_group = out if pred_group is None else pred_group + out
 
         g_start = gid * group_size
         g_end = g_start + group_size
@@ -725,6 +784,25 @@ def compute_lut_storage_bytes(num_entries, group_size, num_tables=1):
     return num_tables * num_entries * group_size * 2
 
 
+def table_storage_bytes_for_group(addresses, group_size):
+    """支持 coarse+residual 等多张 LUT 的存储估算。"""
+    total = 0
+    for addr in addresses:
+        total += compute_lut_storage_bytes(addr.num_entries, group_size, addr.num_tables)
+    return total
+
+
+def count_leaves_for_group(addresses):
+    """对每组所有 address 统计叶子 / 表项数。"""
+    total = 0
+    for addr in addresses:
+        if isinstance(addr, AddressGreedyTree):
+            total += addr._leaf_counter
+        else:
+            total += addr.num_entries
+    return total
+
+
 def parse_group_ids(s: str, max_group: int):
     """解析 group_ids，支持逗号分隔和连字符范围，例如 '0,1,2' 或 '0-7' 或 '0-3,8,10-15'。"""
     ids = set()
@@ -751,7 +829,8 @@ def parse_group_ids(s: str, max_group: int):
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Build single-expert FFN output group LUT (v6 corrected direction)."
+        description="Build single-expert FFN output group LUT (v6 corrected direction). "
+                    "Supports single LUT or coarse+residual LUT."
     )
     parser.add_argument("--teacher_weight_path", required=True, help="Path to expert .pt weights")
     parser.add_argument("--dataset_dir", required=True, help="Dir containing .pt input tensors")
@@ -762,13 +841,17 @@ def main():
                         help="Output group ids to replace, e.g. '0,1,2,3' or '0-7' or '0-3,8,10-15'")
     parser.add_argument("--num_bits", type=int, default=12,
                         help="Tree depth or bits per table => 2^num_bits entries per table")
+    parser.add_argument("--coarse_num_bits", type=int, default=None,
+                        help="Coarse LUT bits. If set together with --residual_num_bits, use coarse+residual mode.")
+    parser.add_argument("--residual_num_bits", type=int, default=None,
+                        help="Residual LUT bits. If set together with --coarse_num_bits, use coarse+residual mode.")
     parser.add_argument("--channels_per_bit", type=int, default=4)
     parser.add_argument("--address_mode", type=str, default="tree", choices=["tree", "high_order", "2d"],
                         help="Address generator mode")
     parser.add_argument("--num_tables", type=int, default=1,
                         help="Number of tables for high_order address (total entries = num_tables * 2^num_bits)")
     parser.add_argument("--num_bins", type=int, default=64,
-                        help="Bins per axis for 2d address (entries = num_bins^2)")
+                        help="Bins per axis for 2d address (entries = num_bins^2). Used for both coarse and residual in 2d mode.")
     parser.add_argument("--tree_candidates", type=int, default=64)
     parser.add_argument("--tree_min_samples", type=int, default=16)
     parser.add_argument("--tree_max_samples", type=int, default=65536,
@@ -790,6 +873,18 @@ def main():
         raise ValueError(f"--calib_size must be positive, got {args.calib_size}")
     if args.batch_size <= 0:
         raise ValueError(f"--batch_size must be positive, got {args.batch_size}")
+
+    coarse_residual_provided = (args.coarse_num_bits is not None) or (args.residual_num_bits is not None)
+    if coarse_residual_provided and not ((args.coarse_num_bits is not None) and (args.residual_num_bits is not None)):
+        raise ValueError("--coarse_num_bits and --residual_num_bits must be provided together or not at all")
+    if args.coarse_num_bits is not None and args.coarse_num_bits <= 0:
+        raise ValueError(f"--coarse_num_bits must be positive, got {args.coarse_num_bits}")
+    if args.residual_num_bits is not None and args.residual_num_bits <= 0:
+        raise ValueError(f"--residual_num_bits must be positive, got {args.residual_num_bits}")
+    if args.num_bits <= 0:
+        raise ValueError(f"--num_bits must be positive, got {args.num_bits}")
+
+    use_coarse_residual = args.coarse_num_bits is not None
 
     torch.manual_seed(args.seed)
     device = torch.device(args.device)
@@ -856,27 +951,45 @@ def main():
 
     for gid in group_ids:
         print(f"\n[Group {gid}] building LUT ...")
-        address, lut, group_mean = build_lut_for_group(calib_x, calib_y, gid, args.group_size, args, device)
-        metrics = evaluate_group(address, lut, group_mean, args.target_mode, eval_x, eval_y, gid, args.group_size, device)
+        if use_coarse_residual:
+            address_list, lut_list, group_mean = build_coarse_residual_luts_for_group(
+                calib_x, calib_y, gid, args.group_size, args, device
+            )
+        else:
+            address_list, lut_list, group_mean = build_lut_for_group(
+                calib_x, calib_y, gid, args.group_size, args, device
+            )
+        metrics = evaluate_group(address_list, lut_list, group_mean, args.target_mode, eval_x, eval_y, gid, args.group_size, device)
         print(f"  group {gid}: cos_sim={metrics['cosine_similarity']:.4f}, "
               f"rel_l2={metrics['relative_l2']:.2%}, rel_mse={metrics['relative_mse']:.4f}")
 
-        addresses[gid] = address
-        luts[gid] = lut
+        addresses[gid] = address_list
+        luts[gid] = lut_list
         group_means[gid] = group_mean
-        group_metrics.append({"group_id": gid, **metrics})
+        group_metrics.append({"group_id": gid, "num_luts": len(address_list), **metrics})
 
-        ckpt_path = ckpt_dir / f"replacement_g{gid}.pt"
-        torch.save({
+        ckpt = {
             "group_id": gid,
             "group_size": args.group_size,
             "num_bits": args.num_bits,
+            "coarse_num_bits": args.coarse_num_bits,
+            "residual_num_bits": args.residual_num_bits,
+            "num_bins": args.num_bins,
             "channels_per_bit": args.channels_per_bit,
+            "address_mode": args.address_mode,
+            "num_tables": args.num_tables,
             "target_mode": args.target_mode,
-            "address": address,
-            "lut_table": lut.table.detach().cpu().half(),  # FP16 for storage
+            "addresses": address_list,
+            "lut_tables": [lut.table.detach().cpu().half() for lut in lut_list],  # FP16 for storage
             "group_mean": group_mean.detach().cpu().half() if group_mean is not None else None,
-        }, ckpt_path)
+        }
+        # 保持单 LUT 模式下旧字段名兼容
+        if len(address_list) == 1:
+            ckpt["address"] = address_list[0]
+            ckpt["lut_table"] = ckpt["lut_tables"][0]
+
+        ckpt_path = ckpt_dir / f"replacement_g{gid}.pt"
+        torch.save(ckpt, ckpt_path)
         print(f"  saved checkpoint: {ckpt_path}")
 
     print("\n[Full output] evaluating all replaced groups together ...")
@@ -884,20 +997,15 @@ def main():
     print(f"  full output: cos_sim={full_metrics['cosine_similarity']:.4f}, "
           f"rel_l2={full_metrics['relative_l2']:.2%}")
 
-    num_entries = 2 ** args.num_bits
-    num_tables = addresses[group_ids[0]].num_tables
-    table_bytes_per_group = compute_lut_storage_bytes(num_entries, args.group_size, num_tables=num_tables)
-    total_table_bytes = table_bytes_per_group * len(group_ids)
     replaced_channels = len(group_ids) * args.group_size
 
     total_ffn_mac = 3 * hidden_size * intermediate_size
     saved_mac = replaced_channels * intermediate_size  # skip down_proj slice for replaced groups
     mac_reduction_ratio = saved_mac / total_ffn_mac
 
-    def count_leaves(addr):
-        if isinstance(addr, AddressGreedyTree):
-            return addr._leaf_counter
-        return addr.num_entries
+    table_bytes_per_group = {str(gid): table_storage_bytes_for_group(addresses[gid], args.group_size) for gid in group_ids}
+    total_table_bytes = sum(table_bytes_per_group.values())
+    num_entries_per_group = {str(gid): sum(addr.num_entries * addr.num_tables for addr in addresses[gid]) for gid in group_ids}
 
     summary = {
         "teacher_weight_path": args.teacher_weight_path,
@@ -909,16 +1017,18 @@ def main():
         "group_size": args.group_size,
         "group_ids": group_ids,
         "address_mode": args.address_mode,
-        "num_tables": num_tables,
+        "num_tables": args.num_tables,
         "num_bins": args.num_bins,
         "num_bits": args.num_bits,
+        "coarse_num_bits": args.coarse_num_bits,
+        "residual_num_bits": args.residual_num_bits,
         "channels_per_bit": args.channels_per_bit,
         "tree_candidates": args.tree_candidates,
         "tree_min_samples": args.tree_min_samples,
         "tree_max_samples": args.tree_max_samples,
         "target_mode": args.target_mode,
-        "num_entries_per_group": num_entries * num_tables,
-        "actual_leaves_per_group": {str(gid): count_leaves(addresses[gid]) for gid in group_ids},
+        "num_entries_per_group": num_entries_per_group,
+        "actual_leaves_per_group": {str(gid): count_leaves_for_group(addresses[gid]) for gid in group_ids},
         "table_bytes_per_group": table_bytes_per_group,
         "total_table_bytes": total_table_bytes,
         "total_table_mib": total_table_bytes / (1024 * 1024),

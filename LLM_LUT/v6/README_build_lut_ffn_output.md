@@ -95,6 +95,8 @@ python build_lut_ffn_output.py \
 | `--group_size` | 每个输出 group 的通道数 | 64 |
 | `--group_ids` | 要替换的输出 group 编号，支持逗号或连字符范围，如 `0,1,2,3`、`0-7`、`0-3,8,10-15` | `0-3` |
 | `--num_bits` | tree 深度 / 每表 bit 数，表项数为 `2^num_bits` | 12 |
+| `--coarse_num_bits` | **Coarse LUT** 的 bit 数。需要和 `--residual_num_bits` 同时指定才会启用 coarse+residual 模式 | `None` |
+| `--residual_num_bits` | **Residual LUT** 的 bit 数。需要和 `--coarse_num_bits` 同时指定才会启用 coarse+residual 模式 | `None` |
 | `--channels_per_bit` | 每个地址位随机选用的输入通道数 | 4 |
 | `--address_mode` | 地址生成器：`tree`（决策树）、`high_order`（随机高阶投影）、`2d`（两通道分箱） | `tree` |
 | `--num_tables` | `high_order` 模式下的表数（总表项 = `num_tables * 2^num_bits`） | 1 |
@@ -193,11 +195,39 @@ python build_lut_ffn_output.py \
   --device cuda:0
 ```
 
+**4 groups，Coarse + Residual LUT（high_order，coarse 12-bit + residual 16-bit）**。
+这个配置每张 LUT 的容量都会显著变大，4 groups 合计约 40 MiB 左右，适合验证“大容量 LUT”是否能压住残差：
+
+```bash
+python build_lut_ffn_output.py \
+  --teacher_weight_path /root/data1/rce/OLMo-core/tmp/qwen_35b_last_moe.pt \
+  --dataset_dir /data/ai2/datasets/lut_distill_dataset/input_qwen3_layer1_ffn_1000w_0711 \
+  --output_dataset_dir /data/ai2/datasets/lut_distill_dataset/output_qwen3_layer1_ffn_1000w_0711 \
+  --output_root ./outputs_ffn_lut_layer1_4groups_1000w_coarse12_residual16 \
+  --group_size 64 \
+  --group_ids "0-3" \
+  --address_mode high_order \
+  --num_tables 1 \
+  --coarse_num_bits 12 \
+  --residual_num_bits 16 \
+  --calib_size 200000 \
+  --eval_size 20000 \
+  --device cuda:0
+```
+
+说明：
+- coarse LUT 用 `coarse_num_bits=12` 捕捉 FFN 输出的主要分量。
+- residual LUT 用 `residual_num_bits=16` 对 coarse 预测后的残差做第二次查表。
+- 两张表在线相加得到最终预测，summary 里的总存储量会自动按两张表之和估算。
+- 在 `tree` 或 `2d` 模式下，`coarse_num_bits` / `residual_num_bits` 同样有效；`2d` 模式下两张表仍共用 `--num_bins`。
+
+---
+
 **建议推进顺序**：
 1. 先跑 `high_order` + `num_bits=12` + `num_tables=4` + `direct` 目标，看单 group cos_sim 是否比 `tree` 好。
 2. 如果好，再试 `high_order` + `residual_input`。
 3. 如果单 group 到 0.9 以上，再扩到 10 groups。
-4. 如果 `high_order` 也不行，再试 `Coarse + Residual` 或多表组合。
+4. 如果直接 LUT 精度不够，优先试 `Coarse + Residual`（`--coarse_num_bits` + `--residual_num_bits`），用更大容量压残差。
 
 ---
 
@@ -207,10 +237,15 @@ python build_lut_ffn_output.py \
 
 `outputs/checkpoints/replacement_g{gid}.pt` 包含：
 
-- `address`: 地址生成器对象（tree / high_order / 2d 之一）
-- `lut_table`: FP16 的 LUT 表，形状 `[num_tables, num_entries, group_size]`
-- `group_id`, `group_size`, `num_bits`, `channels_per_bit`, `target_mode`
-- `group_mean`: 用于 `residual_mean` 目标
+- 单 LUT 模式下：
+  - `address`: 地址生成器对象（tree / high_order / 2d 之一）
+  - `lut_table`: FP16 的 LUT 表，形状 `[num_tables, num_entries, group_size]`
+- Coarse + Residual 模式下：
+  - `addresses`: 地址生成器对象的列表，长度 2（coarse 在前，residual 在后）
+  - `lut_tables`: 对应 LUT 表的列表
+- 公共字段：
+  - `group_id`, `group_size`, `num_bits`, `coarse_num_bits`, `residual_num_bits`, `channels_per_bit`, `target_mode`, `address_mode`
+  - `group_mean`: 用于 `residual_mean` 目标
 
 ### 2. 汇总结果
 
