@@ -803,6 +803,35 @@ def count_leaves_for_group(addresses):
     return total
 
 
+def estimate_eval_files_needed(input_files, eval_size):
+    """
+    从末尾预留足够多的 .pt 文件，确保 eval 集至少能收集到 eval_size 条样本。
+    先 probe 最后 100 个文件估算每个文件平均样本数。
+    """
+    n = len(input_files)
+    if n <= 1:
+        return n
+
+    probe = min(100, n)
+    counts = []
+    for path in input_files[-probe:]:
+        try:
+            t = torch.load(path, map_location="cpu")
+        except Exception:
+            counts.append(1)
+            continue
+        if t.dim() == 1:
+            counts.append(1)
+        elif t.dim() == 2:
+            counts.append(t.shape[0])
+        else:
+            counts.append(1)
+
+    avg = sum(counts) / len(counts) if counts else 1.0
+    n_eval = max(100, int(math.ceil(eval_size / avg)))
+    return min(n_eval, n - 1)
+
+
 def parse_group_ids(s: str, max_group: int):
     """解析 group_ids，支持逗号分隔和连字符范围，例如 '0,1,2' 或 '0-7' 或 '0-3,8,10-15'。"""
     ids = set()
@@ -912,15 +941,18 @@ def main():
         input_files = [p[0] for p in paired]
         output_files = [p[1] for p in paired]
         print(f"Found {len(paired)} paired input/output .pt files")
-        train_input_files = input_files[:-100]
-        test_input_files = input_files[-100:]
-        train_output_files = output_files[:-100]
-        test_output_files = output_files[-100:]
+        n_eval = estimate_eval_files_needed(input_files, args.eval_size)
+        train_input_files = input_files[:-n_eval]
+        test_input_files = input_files[-n_eval:]
+        train_output_files = output_files[:-n_eval]
+        test_output_files = output_files[-n_eval:]
+        print(f"  using {len(train_input_files)} files for calibration, {len(test_input_files)} files for eval")
     else:
+        n_eval = estimate_eval_files_needed(input_files, args.eval_size)
         print(f"Found {len(input_files)} .pt input files, "
-              f"using first {len(input_files)-100} for calibration, last 100 for eval")
-        train_input_files = input_files[:-100]
-        test_input_files = input_files[-100:]
+              f"using {len(input_files) - n_eval} files for calibration, {n_eval} files for eval")
+        train_input_files = input_files[:-n_eval]
+        test_input_files = input_files[-n_eval:]
         train_output_files = None
         test_output_files = None
 
