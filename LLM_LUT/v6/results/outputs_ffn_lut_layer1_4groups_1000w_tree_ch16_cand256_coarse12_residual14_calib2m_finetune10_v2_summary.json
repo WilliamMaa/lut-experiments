@@ -1,0 +1,99 @@
+{
+  "teacher_weight_path": "/root/data1/rce/OLMo-core/tmp/qwen_35b_last_moe.pt",
+  "dataset_dir": "/data/ai2/datasets/lut_distill_dataset/input_qwen3_layer1_ffn_1000w_0711",
+  "output_dataset_dir": "/data/ai2/datasets/lut_distill_dataset/output_qwen3_layer1_ffn_1000w_0711",
+  "output_root": "./outputs_ffn_lut_layer1_4groups_1000w_tree_ch16_cand256_coarse12_residual14_calib2m_finetune10_v2",
+  "hidden_size": 2048,
+  "intermediate_size": 512,
+  "group_size": 64,
+  "group_ids": [
+    0,
+    1,
+    2,
+    3
+  ],
+  "address_mode": "tree",
+  "num_tables": 1,
+  "num_bins": 64,
+  "num_bits": 12,
+  "coarse_num_bits": 12,
+  "residual_num_bits": 14,
+  "channels_per_bit": 16,
+  "tree_candidates": 256,
+  "tree_min_samples": 16,
+  "tree_max_samples": 200000,
+  "target_mode": "direct",
+  "finetune_epochs": 10,
+  "finetune_lr": 0.001,
+  "finetune_batch_size": 1024,
+  "num_entries_per_group": {
+    "0": 20480,
+    "1": 20480,
+    "2": 20480,
+    "3": 20480
+  },
+  "actual_leaves_per_group": {
+    "0": 12288,
+    "1": 12289,
+    "2": 12288,
+    "3": 12288
+  },
+  "table_bytes_per_group": {
+    "0": 2621440,
+    "1": 2621440,
+    "2": 2621440,
+    "3": 2621440
+  },
+  "total_table_bytes": 10485760,
+  "total_table_mib": 10.0,
+  "replaced_channels": 256,
+  "replaced_ratio": 0.125,
+  "saved_mac_per_token": 131072,
+  "total_ffn_mac_per_token": 3145728,
+  "mac_reduction_ratio": 0.041666666666666664,
+  "group_metrics": [
+    {
+      "group_id": 0,
+      "num_luts": 2,
+      "mse": 2.451085310894996e-05,
+      "rmse": 0.004950843676480804,
+      "relative_mse": 0.7036318994077047,
+      "relative_l2": 0.8383856228784335,
+      "cosine_similarity": 0.5798789858818054
+    },
+    {
+      "group_id": 1,
+      "num_luts": 2,
+      "mse": 2.2928958060219884e-05,
+      "rmse": 0.004788419160873438,
+      "relative_mse": 0.6577954158021992,
+      "relative_l2": 0.81116215089412,
+      "cosine_similarity": 0.6146663427352905
+    },
+    {
+      "group_id": 2,
+      "num_luts": 2,
+      "mse": 2.51536512223538e-05,
+      "rmse": 0.005015341585809864,
+      "relative_mse": 0.6444489419981922,
+      "relative_l2": 0.8028659962284995,
+      "cosine_similarity": 0.6323790550231934
+    },
+    {
+      "group_id": 3,
+      "num_luts": 2,
+      "mse": 2.3644268367206678e-05,
+      "rmse": 0.004862537235559917,
+      "relative_mse": 0.6965136369695492,
+      "relative_l2": 0.8342856473188952,
+      "cosine_similarity": 0.5889431238174438
+    }
+  ],
+  "full_output_metrics": {
+    "mse": 3.0074290862103226e-06,
+    "rmse": 0.0017341940739750907,
+    "relative_mse": 0.0813748539800074,
+    "relative_l2": 0.28530136382555543,
+    "cosine_similarity": 0.962493360042572
+  }
+}

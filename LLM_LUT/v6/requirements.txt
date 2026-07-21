@@ -9,3 +9,9 @@
 torch==2.5.1+cu124
 numpy<2
 tqdm
+transformers>=4.40.0
+datasets>=2.0.0
+accelerate>=0.20.0  # needed by transformers, but never use device_map="auto" in our scripts
+protobuf>=3.20
+sentencepiece
+

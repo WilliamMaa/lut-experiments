@@ -100,30 +100,39 @@ class AddressGreedyTree:
 
     def build(self, x: torch.Tensor, target: torch.Tensor,
               num_candidates: int = 64, min_samples: int = 32,
-              max_samples: int = 65536):
+              max_samples: int = 65536, device: torch.device = None,
+              candidate_chunk_size: int = 32):
         N = x.shape[0]
         if N > max_samples:
             perm = torch.randperm(N, device=x.device)[:max_samples]
             x = x[perm]
             target = target[perm]
+        if device is not None:
+            x = x.to(device)
+            target = target.to(device)
         self._leaf_counter = 0
         self.root = self._build_node(x, target, depth=0,
                                      num_candidates=num_candidates,
-                                     min_samples=min_samples)
+                                     min_samples=min_samples,
+                                     candidate_chunk_size=candidate_chunk_size)
         self._build_lookup_arrays()
 
-    def _build_node(self, x, target, depth, num_candidates, min_samples):
+    def _build_node(self, x, target, depth, num_candidates, min_samples, candidate_chunk_size):
         N = x.shape[0]
         if depth >= self.num_bits or N < 2 * min_samples:
             leaf = _TreeNode(is_leaf=True, leaf_index=self._leaf_counter)
             self._leaf_counter += 1
             return leaf
 
-        parent_var = target.var(dim=0).sum().item()
+        parent_var = target.var(dim=0, unbiased=False).sum().item()
         if parent_var < 1e-12:
             leaf = _TreeNode(is_leaf=True, leaf_index=self._leaf_counter)
             self._leaf_counter += 1
             return leaf
+
+        gs = target.shape[1]
+        total_sum = target.sum(dim=0)          # [gs]
+        total_sum_sq = (target ** 2).sum(dim=0) # [gs]
 
         best_reduction = -1.0
         best_ch = None
@@ -131,26 +140,57 @@ class AddressGreedyTree:
         best_threshold = None
         best_left_mask = None
 
-        for _ in range(num_candidates):
-            ch = torch.randint(0, self.input_dim, (self.channels_per_bit,), generator=self.gen).to(x.device)
-            signs = (torch.randint(0, 2, (self.channels_per_bit,), generator=self.gen).float() * 2 - 1).to(x.device)
-            proj = (x[:, ch] * signs.to(x.dtype)).sum(dim=-1)
-            threshold = proj.median().item()
-            left_mask = proj <= threshold
-            right_mask = ~left_mask
-            n_l = int(left_mask.sum().item())
+        # vectorized candidate evaluation in chunks to control memory
+        for start in range(0, num_candidates, candidate_chunk_size):
+            end = min(start + candidate_chunk_size, num_candidates)
+            csize = end - start
+
+            ch = torch.randint(
+                0, self.input_dim, (csize, self.channels_per_bit), generator=self.gen
+            ).to(x.device)
+            signs = (
+                torch.randint(0, 2, (csize, self.channels_per_bit), generator=self.gen).float() * 2 - 1
+            ).to(x.device)
+
+            # projections: [N, csize]
+            selected = x[:, ch]  # [N, csize, channels_per_bit]
+            proj = (selected * signs.to(x.dtype)).sum(dim=-1)
+
+            # threshold: median per candidate
+            thresholds = proj.median(dim=0).values  # [csize]
+
+            # left masks: [csize, N]
+            left_mask = (proj <= thresholds.unsqueeze(0)).t().contiguous()
+            n_l = left_mask.sum(dim=1).float()
             n_r = N - n_l
-            if n_l < min_samples or n_r < min_samples:
+            valid = (n_l >= min_samples) & (n_r >= min_samples)
+            if not valid.any():
                 continue
-            var_l = target[left_mask].var(dim=0).sum().item()
-            var_r = target[right_mask].var(dim=0).sum().item()
-            reduction = parent_var - (n_l * var_l + n_r * var_r) / N
-            if reduction > best_reduction:
-                best_reduction = reduction
-                best_ch = ch
-                best_signs = signs
-                best_threshold = threshold
-                best_left_mask = left_mask
+
+            # batched variance via scatter-add-like matmul
+            left_mask_f = left_mask.float()
+            left_sum = torch.matmul(left_mask_f, target.float())              # [csize, gs]
+            left_sum_sq = torch.matmul(left_mask_f, (target ** 2).float())    # [csize, gs]
+            right_sum = total_sum.float().unsqueeze(0) - left_sum
+            right_sum_sq = total_sum_sq.float().unsqueeze(0) - left_sum_sq
+
+            n_l_safe = n_l.clamp(min=1.0).unsqueeze(1)
+            n_r_safe = n_r.clamp(min=1.0).unsqueeze(1)
+            left_var = (left_sum_sq / n_l_safe) - (left_sum / n_l_safe) ** 2
+            right_var = (right_sum_sq / n_r_safe) - (right_sum / n_r_safe) ** 2
+            left_var.clamp_(min=0.0)
+            right_var.clamp_(min=0.0)
+
+            reductions = parent_var - (n_l * left_var.sum(dim=1) + n_r * right_var.sum(dim=1)) / N
+            reductions = torch.where(valid, reductions, torch.full_like(reductions, -float('inf')))
+
+            best_idx = int(torch.argmax(reductions).item())
+            if reductions[best_idx].item() > best_reduction:
+                best_reduction = reductions[best_idx].item()
+                best_ch = ch[best_idx]
+                best_signs = signs[best_idx]
+                best_threshold = thresholds[best_idx].item()
+                best_left_mask = left_mask[best_idx]
 
         if best_reduction <= 0 or best_left_mask is None:
             leaf = _TreeNode(is_leaf=True, leaf_index=self._leaf_counter)
@@ -158,9 +198,11 @@ class AddressGreedyTree:
             return leaf
 
         left = self._build_node(x[best_left_mask], target[best_left_mask],
-                                depth + 1, num_candidates, min_samples)
+                                depth + 1, num_candidates, min_samples,
+                                candidate_chunk_size)
         right = self._build_node(x[~best_left_mask], target[~best_left_mask],
-                                 depth + 1, num_candidates, min_samples)
+                                 depth + 1, num_candidates, min_samples,
+                                 candidate_chunk_size)
         return _TreeNode(
             channel_idx=best_ch,
             signs=best_signs,
@@ -587,7 +629,7 @@ def collect_calibration_and_eval(
 # 4. 构建与评估
 # =============================================================================
 @torch.no_grad()
-def _build_single_address_lut(calib_x, group_target_for_lut, group_id, group_size, args, num_bits, seed_offset, desc):
+def _build_single_address_lut(calib_x, group_target_for_lut, group_id, group_size, args, num_bits, seed_offset, desc, device=None):
     """Helper: build one address + LUT."""
     seed = args.seed * 10000 + group_id * 100 + seed_offset
 
@@ -623,6 +665,8 @@ def _build_single_address_lut(calib_x, group_target_for_lut, group_id, group_siz
             num_candidates=args.tree_candidates,
             min_samples=args.tree_min_samples,
             max_samples=args.tree_max_samples,
+            device=device,
+            candidate_chunk_size=args.tree_candidate_chunk_size,
         )
         if desc:
             print(f"  {desc} tree built in {time.time() - t0:.2f}s, leaves={address._leaf_counter}")
@@ -656,7 +700,7 @@ def build_lut_for_group(calib_x, calib_y, group_id, group_size, args, device):
 
     address, lut = _build_single_address_lut(
         calib_x, group_target_for_lut, group_id, group_size, args,
-        num_bits=args.num_bits, seed_offset=0, desc="single",
+        num_bits=args.num_bits, seed_offset=0, desc="single", device=device,
     )
     return [address], [lut], group_mean
 
@@ -681,7 +725,7 @@ def build_coarse_residual_luts_for_group(calib_x, calib_y, group_id, group_size,
     # Coarse LUT
     coarse_address, coarse_lut = _build_single_address_lut(
         calib_x, group_target_for_lut, group_id, group_size, args,
-        num_bits=args.coarse_num_bits, seed_offset=0, desc="coarse",
+        num_bits=args.coarse_num_bits, seed_offset=0, desc="coarse", device=device,
     )
 
     # Compute coarse prediction on calibration data
@@ -694,7 +738,7 @@ def build_coarse_residual_luts_for_group(calib_x, calib_y, group_id, group_size,
     # Residual LUT
     residual_address, residual_lut = _build_single_address_lut(
         calib_x, residual_target, group_id, group_size, args,
-        num_bits=args.residual_num_bits, seed_offset=1, desc="residual",
+        num_bits=args.residual_num_bits, seed_offset=1, desc="residual", device=device,
     )
 
     return [coarse_address, residual_address], [coarse_lut, residual_lut], group_mean
@@ -739,10 +783,16 @@ def evaluate_group(addresses, luts, group_mean, target_mode, eval_x, eval_y, gro
 
 @torch.no_grad()
 def evaluate_full_output(addresses_per_group, luts_per_group, group_means, target_mode, group_ids, eval_x, eval_y, group_size, device):
-    """把所有被替换 group 拼回完整 FFN 输出，再和真实输出比。"""
+    """
+    把所有被替换 group 拼回完整 FFN 输出，再和真实输出比。
+    当 group_ids 覆盖所有输出通道时，等价于完整 FFN 替换。
+    """
     eval_x = eval_x.to(device)
     eval_y = eval_y.to(device)
-    pred_y = eval_y.clone()
+    hidden_size = eval_y.shape[-1]
+
+    pred_y = torch.empty_like(eval_y)
+    covered = torch.zeros(hidden_size, dtype=torch.bool, device=device)
 
     for gid in group_ids:
         addresses = addresses_per_group[gid]
@@ -763,19 +813,45 @@ def evaluate_full_output(addresses_per_group, luts_per_group, group_means, targe
             pred_group = pred_group + group_means[gid].to(device)
 
         pred_y[:, g_start:g_end] = pred_group
+        covered[g_start:g_end] = True
+
+    if not covered.all():
+        pred_y[:, ~covered] = eval_y[:, ~covered]
+    else:
+        assert covered.all(), "Full FFN replacement must cover every output channel"
 
     mse = F.mse_loss(pred_y, eval_y).item()
     rmse = math.sqrt(mse)
     var = eval_y.var().item()
     rel_mse = mse / (var + 1e-8)
     rel_l2 = torch.norm(pred_y - eval_y).item() / (torch.norm(eval_y).item() + 1e-8)
-    cos_sim = F.cosine_similarity(pred_y, eval_y, dim=-1).mean().item()
+    cos_sim = F.cosine_similarity(pred_y, eval_y, dim=-1)
+    cos_mean = cos_sim.mean().item()
+    cos_p10 = torch.quantile(cos_sim, 0.10).item()
+    cos_p50 = torch.quantile(cos_sim, 0.50).item()
+    cos_p90 = torch.quantile(cos_sim, 0.90).item()
+
+    pred_norm = torch.norm(pred_y, dim=-1)
+    true_norm = torch.norm(eval_y, dim=-1)
+    norm_ratio = pred_norm / (true_norm + 1e-8)
+    norm_ratio_mean = norm_ratio.mean().item()
+    norm_ratio_p10 = torch.quantile(norm_ratio, 0.10).item()
+    norm_ratio_p50 = torch.quantile(norm_ratio, 0.50).item()
+    norm_ratio_p90 = torch.quantile(norm_ratio, 0.90).item()
+
     return {
         "mse": mse,
         "rmse": rmse,
         "relative_mse": rel_mse,
         "relative_l2": rel_l2,
-        "cosine_similarity": cos_sim,
+        "cosine_similarity": cos_mean,
+        "cosine_similarity_p10": cos_p10,
+        "cosine_similarity_p50": cos_p50,
+        "cosine_similarity_p90": cos_p90,
+        "norm_ratio": norm_ratio_mean,
+        "norm_ratio_p10": norm_ratio_p10,
+        "norm_ratio_p50": norm_ratio_p50,
+        "norm_ratio_p90": norm_ratio_p90,
     }
 
 
@@ -949,6 +1025,8 @@ def main():
     parser.add_argument("--tree_min_samples", type=int, default=16)
     parser.add_argument("--tree_max_samples", type=int, default=65536,
                         help="Subsample calibration data for tree building")
+    parser.add_argument("--tree_candidate_chunk_size", type=int, default=32,
+                        help="Number of tree candidates evaluated in one GPU batch (lower = less memory)")
     parser.add_argument("--target_mode", type=str, default="direct", choices=["direct", "residual_mean", "residual_input"],
                         help="direct: LUT stores full FFN output; residual_mean: LUT stores output - group_mean; residual_input: LUT stores output - input_residual")
     parser.add_argument("--calib_size", type=int, default=65536)
@@ -966,6 +1044,8 @@ def main():
 
     if args.tree_max_samples <= 0:
         raise ValueError(f"--tree_max_samples must be positive, got {args.tree_max_samples}")
+    if args.tree_candidate_chunk_size <= 0:
+        raise ValueError(f"--tree_candidate_chunk_size must be positive, got {args.tree_candidate_chunk_size}")
     if args.tree_min_samples <= 0:
         raise ValueError(f"--tree_min_samples must be positive, got {args.tree_min_samples}")
     if args.calib_size <= 0:
@@ -1111,13 +1191,22 @@ def main():
     print("\n[Full output] evaluating all replaced groups together ...")
     full_metrics = evaluate_full_output(addresses, luts, group_means, args.target_mode, group_ids, eval_x, eval_y, args.group_size, device)
     print(f"  full output: cos_sim={full_metrics['cosine_similarity']:.4f}, "
-          f"rel_l2={full_metrics['relative_l2']:.2%}")
+          f"rel_l2={full_metrics['relative_l2']:.2%}, "
+          f"norm_ratio={full_metrics['norm_ratio']:.4f}, "
+          f"cos_p50={full_metrics['cosine_similarity_p50']:.4f}")
 
     replaced_channels = len(group_ids) * args.group_size
 
     total_ffn_mac = 3 * hidden_size * intermediate_size
-    saved_mac = replaced_channels * intermediate_size  # skip down_proj slice for replaced groups
-    mac_reduction_ratio = saved_mac / total_ffn_mac
+    if replaced_channels >= hidden_size:
+        # 完整 FFN 替换：跳过 gate_proj / up_proj / down_proj / SiLU
+        saved_mac = total_ffn_mac
+        mac_reduction_ratio = 1.0
+        full_ffn_replacement = True
+    else:
+        saved_mac = replaced_channels * intermediate_size  # skip down_proj slice for replaced groups
+        mac_reduction_ratio = saved_mac / total_ffn_mac
+        full_ffn_replacement = False
 
     table_bytes_per_group = {str(gid): table_storage_bytes_for_group(addresses[gid], args.group_size) for gid in group_ids}
     total_table_bytes = sum(table_bytes_per_group.values())
@@ -1153,6 +1242,7 @@ def main():
         "total_table_mib": total_table_bytes / (1024 * 1024),
         "replaced_channels": replaced_channels,
         "replaced_ratio": replaced_channels / hidden_size,
+        "full_ffn_replacement": full_ffn_replacement,
         "saved_mac_per_token": saved_mac,
         "total_ffn_mac_per_token": total_ffn_mac,
         "mac_reduction_ratio": mac_reduction_ratio,
@@ -1165,7 +1255,10 @@ def main():
         json.dump(summary, f, indent=2)
     print(f"\nSaved summary: {summary_path}")
     print(f"Total LUT storage: {summary['total_table_mib']:.2f} MiB")
-    print(f"Theoretical MAC reduction: {mac_reduction_ratio:.2%}")
+    if full_ffn_replacement:
+        print(f"Full FFN replacement: bypassing {saved_mac:,} MAC/token (100.00%)")
+    else:
+        print(f"Theoretical MAC reduction: {mac_reduction_ratio:.2%}")
 
 
 if __name__ == "__main__":
