@@ -865,7 +865,7 @@ def finetune_luts(addresses, luts, group_means, target_mode, calib_x, calib_y,
     if epochs <= 0:
         return
 
-    print(f"\n[Finetune] optimizing LUT tables for {epochs} epochs (lr={args.finetune_lr}, batch={args.finetune_batch_size}) ...")
+    print(f"\n[Finetune] optimizing LUT tables for {epochs} epochs (lr={args.finetune_lr}, batch={args.finetune_batch_size}, loss={args.finetune_loss_mode}) ...")
     params = []
     for gid in group_ids:
         for lut in luts[gid]:
@@ -881,7 +881,7 @@ def finetune_luts(addresses, luts, group_means, target_mode, calib_x, calib_y,
 
     for epoch in range(epochs):
         perm = torch.randperm(n_samples)
-        epoch_loss = 0.0
+        epoch_metrics = {"loss": 0.0, "mse": 0.0, "cos": 0.0}
         n_batches = 0
         for start in range(0, n_samples, args.finetune_batch_size):
             idx = perm[start:start + args.finetune_batch_size]
@@ -889,7 +889,9 @@ def finetune_luts(addresses, luts, group_means, target_mode, calib_x, calib_y,
             yb = calib_y[idx].to(device)
 
             optimizer.zero_grad()
-            loss = 0.0
+
+            # Reconstruct full replaced output for all groups
+            pred_y = torch.zeros_like(yb)
             for gid in group_ids:
                 g_start = gid * group_size
                 g_end = g_start + group_size
@@ -905,17 +907,29 @@ def finetune_luts(addresses, luts, group_means, target_mode, calib_x, calib_y,
                 elif target_mode == "residual_mean":
                     pred_group = pred_group + group_means[gid].to(device)
 
-                true_group = yb[:, g_start:g_end]
-                loss = loss + F.mse_loss(pred_group, true_group)
+                pred_y[:, g_start:g_end] = pred_group
+
+            mse = F.mse_loss(pred_y, yb)
+            cos = F.cosine_similarity(pred_y, yb, dim=-1).mean()
+
+            if args.finetune_loss_mode == "mse":
+                loss = mse
+            elif args.finetune_loss_mode == "cosine":
+                loss = 1 - cos
+            else:  # mse+cosine
+                loss = mse + args.finetune_cosine_alpha * (1 - cos)
 
             loss.backward()
             optimizer.step()
-            epoch_loss += loss.item()
+            epoch_metrics["loss"] += loss.item()
+            epoch_metrics["mse"] += mse.item()
+            epoch_metrics["cos"] += cos.item()
             n_batches += 1
 
         scheduler.step()
-        avg_loss = epoch_loss / max(n_batches, 1)
-        print(f"  epoch {epoch + 1}/{epochs}: avg_loss={avg_loss:.6e}")
+        for k in epoch_metrics:
+            epoch_metrics[k] /= max(n_batches, 1)
+        print(f"  epoch {epoch + 1}/{epochs}: loss={epoch_metrics['loss']:.6e}, mse={epoch_metrics['mse']:.6e}, cos={epoch_metrics['cos']:.6f}")
     print("[Finetune] done")
 
 
@@ -1040,6 +1054,11 @@ def main():
                         help="Learning rate for offline LUT finetune")
     parser.add_argument("--finetune_batch_size", type=int, default=1024,
                         help="Batch size for offline LUT finetune")
+    parser.add_argument("--finetune_loss_mode", type=str, default="mse",
+                        choices=["mse", "mse+cosine", "cosine"],
+                        help="Loss for LUT finetune. mse+cosine optimizes both magnitude and direction.")
+    parser.add_argument("--finetune_cosine_alpha", type=float, default=1.0,
+                        help="Weight for cosine term when finetune_loss_mode=mse+cosine")
     args = parser.parse_args()
 
     if args.tree_max_samples <= 0:
@@ -1068,6 +1087,10 @@ def main():
         raise ValueError(f"--finetune_lr must be positive, got {args.finetune_lr}")
     if args.finetune_batch_size <= 0:
         raise ValueError(f"--finetune_batch_size must be positive, got {args.finetune_batch_size}")
+    if args.finetune_loss_mode not in ("mse", "mse+cosine", "cosine"):
+        raise ValueError(f"--finetune_loss_mode must be mse/mse+cosine/cosine, got {args.finetune_loss_mode}")
+    if args.finetune_cosine_alpha <= 0:
+        raise ValueError(f"--finetune_cosine_alpha must be positive, got {args.finetune_cosine_alpha}")
 
     use_coarse_residual = args.coarse_num_bits is not None
 
@@ -1168,6 +1191,9 @@ def main():
             "target_mode": args.target_mode,
             "finetune_epochs": args.finetune_epochs,
             "finetune_lr": args.finetune_lr,
+            "finetune_batch_size": args.finetune_batch_size,
+            "finetune_loss_mode": args.finetune_loss_mode,
+            "finetune_cosine_alpha": args.finetune_cosine_alpha,
             "addresses": addresses[gid],
             "lut_tables": [lut.table.detach().cpu().half() for lut in luts[gid]],  # FP16 for storage
             "group_mean": group_means[gid].detach().cpu().half() if group_means[gid] is not None else None,
@@ -1235,6 +1261,8 @@ def main():
         "finetune_epochs": args.finetune_epochs,
         "finetune_lr": args.finetune_lr,
         "finetune_batch_size": args.finetune_batch_size,
+        "finetune_loss_mode": args.finetune_loss_mode,
+        "finetune_cosine_alpha": args.finetune_cosine_alpha,
         "num_entries_per_group": num_entries_per_group,
         "actual_leaves_per_group": {str(gid): count_leaves_for_group(addresses[gid]) for gid in group_ids},
         "table_bytes_per_group": table_bytes_per_group,

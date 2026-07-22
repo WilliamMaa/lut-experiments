@@ -48,9 +48,17 @@
 
 ## 环境依赖
 
-- Python >= 3.9
-- PyTorch
-- tqdm
+- Python >= 3.9（推荐 3.10）
+- PyTorch 2.5.1 + cu124
+- transformers / accelerate / numpy / tqdm
+
+安装命令：
+
+```bash
+pip install -r requirements.txt \
+  --index-url https://download.pytorch.org/whl/cu124 \
+  --extra-index-url https://mirrors.aliyun.com/pypi/simple/
+```
 
 ---
 
@@ -111,7 +119,42 @@ python build_lut_ffn_output.py \
 | `--finetune_epochs` | 均值初始化后，是否离线 finetune LUT 表值。`0` = 不微调 | 0 |
 | `--finetune_lr` | LUT 表值 finetune 的学习率 | 1e-3 |
 | `--finetune_batch_size` | LUT 表值 finetune 的 batch size | 1024 |
-| `--device` | 使用的单卡 | `cuda:0` |
+| `--finetune_loss_mode` | 离线 finetune 损失函数：`mse`、`mse+cosine`、`cosine`。`mse+cosine` 同时优化数值和方向 | `mse` |
+| `--finetune_cosine_alpha` | `mse+cosine` 中 cosine 项的权重 | 1.0 |
+
+---
+
+## 强化 finetune 用于最后一层
+
+最后一层 FFN 替换难度远高于第一层，建议从以下角度强化 finetune：
+
+1. **使用 `mse+cosine` 损失**：最后一层对输出方向敏感，cosine 项能让 LUT 更好地保持 FFN 输出的方向。
+2. **增加 finetune epoch**：从默认 10 提升到 50，让表值充分收敛。
+3. **使用 `residual_input` target**：LUT 只学习 `FFN(x) - x`，减少需要拟合的量。
+4. **增加 LUT 容量**：例如 `coarse 14 + residual 16`，用存储换精度。
+
+示例：
+
+```bash
+python build_lut_ffn_output.py \
+  --teacher_weight_path /root/data1/rce/OLMo-core/tmp/qwen_35b_last_moe.pt \
+  --dataset_dir /data/ai2/datasets/lut_distill_dataset/input_qwen3_layer_39_ffn_3000w_0721 \
+  --output_dataset_dir /data/ai2/datasets/lut_distill_dataset/output_qwen3_layer_39_ffn_3000w_0721 \
+  --output_root ./outputs_ffn_lut_layer39_32groups_mse_cosine \
+  --group_size 64 \
+  --group_ids "0-31" \
+  --coarse_num_bits 14 \
+  --residual_num_bits 16 \
+  --target_mode residual_input \
+  --finetune_epochs 50 \
+  --finetune_lr 1e-3 \
+  --finetune_batch_size 1024 \
+  --finetune_loss_mode mse+cosine \
+  --finetune_cosine_alpha 1.0 \
+  --calib_size 200000 \
+  --eval_size 20000 \
+  --device cuda:0
+```
 
 ---
 

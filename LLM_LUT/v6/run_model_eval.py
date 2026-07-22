@@ -15,6 +15,17 @@ Usage:
     --eval_file eval.jsonl \
     --max_eval_samples 128 \
     --device cuda:0
+
+python run_model_eval.py \
+  --model_path /data/downloads/Qwen3.6/models/Qwen3.6-35B-A3B \
+  --checkpoint_dir ./worstcase_32g_full_ffn/checkpoints \
+  --layer_idx 1 \
+  --hook_path "model.model.layers[1].mlp" \
+  --device_map balanced_low_0 \
+  --torch_dtype bfloat16 \
+  --prompt "诸葛亮第一次北伐为什么会失败？请分别分析街亭失守、用人问题、蜀魏国力差距和整体战略选择的影响，并说明把失败简单归因于马谡是否合理。" \
+  --max_new_tokens 1024 \
+  --output_json ./worstcase_32g_full_ffn_model_eval_2.json
 """
 
 import os
@@ -121,19 +132,42 @@ def main():
     parser.add_argument("--max_new_tokens", type=int, default=128)
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--device_map", default=None, help="HuggingFace device_map for multi-GPU inference, e.g. balanced_low_0. Do NOT use 'auto'.")
     parser.add_argument("--torch_dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
+    parser.add_argument("--output_json", default=None, help="Path to write the PPL/generation summary JSON")
+    parser.add_argument("--prompt", action="append", default=None, help="Custom prompt for generation. Repeat for multiple prompts. If omitted, use built-in prompts.")
+    parser.add_argument("--verify_replacement", action="store_true", default=True, help="Verify that the hook actually changes the MLP output (default: True)")
+    parser.add_argument("--no_verify_replacement", action="store_true", default=False, help="Skip replacement verification")
     args = parser.parse_args()
 
-    device = torch.device(args.device)
+    if args.device_map == "auto":
+        raise ValueError("device_map='auto' is forbidden by project red line. Use an explicit map like 'balanced_low_0'.")
+
+    prompts = args.prompt if args.prompt else DEFAULT_PROMPTS
+
     dtype = getattr(torch, args.torch_dtype)
 
     print(f"Loading model: {args.model_path}")
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=dtype,
-        trust_remote_code=True,
-    )
-    model.to(device)
+    if args.device_map is not None:
+        print(f"  device_map={args.device_map}")
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+            device_map=args.device_map,
+        )
+        device = next(model.parameters()).device
+        print(f"  first-layer device is {device}")
+        engine_device = None
+    else:
+        device = torch.device(args.device)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+        )
+        model.to(device)
+        engine_device = device
     model.eval()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
@@ -146,15 +180,15 @@ def main():
     if args.eval_file:
         texts = load_eval_texts(args.eval_file, args.max_eval_samples)
     else:
-        print("No --eval_file provided, using default prompts for PPL (not ideal)")
-        texts = DEFAULT_PROMPTS[: args.max_eval_samples]
+        print("No --eval_file provided, using prompts for PPL (not ideal)")
+        texts = prompts[: args.max_eval_samples]
     print(f"Evaluating on {len(texts)} samples")
 
     # Baseline
     print("\n===== Baseline (no LUT) =====")
     baseline_ppl = compute_ppl(model, tokenizer, texts, device, max_length=args.max_length)
     print(f"Baseline PPL: {baseline_ppl:.4f}")
-    baseline_gen = run_generation(model, tokenizer, DEFAULT_PROMPTS, device, max_new_tokens=args.max_new_tokens)
+    baseline_gen = run_generation(model, tokenizer, prompts, device, max_new_tokens=args.max_new_tokens)
     for item in baseline_gen:
         print(f"  Prompt: {item['prompt']}")
         print(f"  Output: {item['output']}")
@@ -166,14 +200,20 @@ def main():
         model=model,
         layer_idx=args.layer_idx,
         checkpoint_dir=args.checkpoint_dir,
-        device=device,
+        device=engine_device,
         hook_path=args.hook_path,
     )
     engine.install()
 
+    # Verify that the hook actually changes the MLP output
+    if args.verify_replacement and not args.no_verify_replacement:
+        ok = engine.verify_replacement(model.config.hidden_size)
+        if not ok:
+            print("\n[Warning] Replacement verification failed; results below may not reflect LUT behavior.")
+
     lut_ppl = compute_ppl(model, tokenizer, texts, device, max_length=args.max_length)
     print(f"LUT PPL: {lut_ppl:.4f}")
-    lut_gen = run_generation(model, tokenizer, DEFAULT_PROMPTS, device, max_new_tokens=args.max_new_tokens)
+    lut_gen = run_generation(model, tokenizer, prompts, device, max_new_tokens=args.max_new_tokens)
     for item in lut_gen:
         print(f"  Prompt: {item['prompt']}")
         print(f"  Output: {item['output']}")
@@ -185,6 +225,27 @@ def main():
     print(f"Baseline PPL: {baseline_ppl:.4f}")
     print(f"LUT PPL:      {lut_ppl:.4f}")
     print(f"PPL delta:    {lut_ppl - baseline_ppl:+.4f}")
+
+    if args.output_json:
+        summary = {
+            "model_path": args.model_path,
+            "checkpoint_dir": str(args.checkpoint_dir),
+            "layer_idx": args.layer_idx,
+            "hook_path": args.hook_path,
+            "device": str(device),
+            "device_map": args.device_map,
+            "torch_dtype": args.torch_dtype,
+            "max_new_tokens": args.max_new_tokens,
+            "prompts": prompts,
+            "baseline_ppl": baseline_ppl,
+            "lut_ppl": lut_ppl,
+            "ppl_delta": lut_ppl - baseline_ppl,
+            "baseline_generations": baseline_gen,
+            "lut_generations": lut_gen,
+        }
+        with open(args.output_json, "w", encoding="utf-8") as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+        print(f"Summary written to {args.output_json}")
 
 
 if __name__ == "__main__":

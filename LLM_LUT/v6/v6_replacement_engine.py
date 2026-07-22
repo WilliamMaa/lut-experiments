@@ -16,6 +16,31 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from build_lut_ffn_output import AddressGreedyTree, Address2D, AddressHighOrderRandom, _TreeNode
 
+# Allow loading V6 checkpoints built by build_lut_ffn_output.py across different
+# __main__ contexts. These classes are trusted because we built the checkpoints.
+# NOTE: device_map here is a fixed, explicit map (e.g. balanced_low_0), never "auto".
+torch.serialization.add_safe_globals([
+    AddressGreedyTree, Address2D, AddressHighOrderRandom, _TreeNode,
+])
+
+
+def _load_v6_checkpoint(path: str):
+    """Load a V6 checkpoint, allowing classes defined in build_lut_ffn_output.py.
+
+    PyTorch 2.6+ defaults to weights_only=True; our classes are registered above.
+    If that still fails (e.g. older PyTorch, or the checkpoint was pickled as
+    __main__ classes from another script), inject the classes into the current
+    __main__ module and fall back to full pickle.
+    """
+    try:
+        return torch.load(path, map_location="cpu", weights_only=True)
+    except Exception:
+        import __main__ as _main_mod
+        for cls in (AddressGreedyTree, Address2D, AddressHighOrderRandom, _TreeNode):
+            if not hasattr(_main_mod, cls.__name__):
+                setattr(_main_mod, cls.__name__, cls)
+        return torch.load(path, map_location="cpu", weights_only=False)
+
 
 class V6ReplacementEngine:
     """
@@ -32,7 +57,7 @@ class V6ReplacementEngine:
         model: nn.Module,
         layer_idx: int,
         checkpoint_dir: str,
-        device: torch.device,
+        device: Optional[torch.device] = None,
         hook_path: Optional[str] = None,
     ):
         self.model = model
@@ -46,14 +71,19 @@ class V6ReplacementEngine:
             raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
 
         for ckpt_path in sorted(ckpt_dir.glob("replacement_g*.pt")):
-            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+            ckpt = _load_v6_checkpoint(ckpt_path)
             gid = int(ckpt["group_id"])
             group_size = int(ckpt["group_size"])
             target_mode = ckpt.get("target_mode", "direct")
             addresses = ckpt["addresses"]
-            tables = [t.to(device) for t in ckpt["lut_tables"]]
-            gm = ckpt.get("group_mean")
-            group_mean = gm.to(device) if gm is not None else None
+            if self.device is not None:
+                tables = [t.to(self.device) for t in ckpt["lut_tables"]]
+                gm = ckpt.get("group_mean")
+                group_mean = gm.to(self.device) if gm is not None else None
+            else:
+                tables = [t for t in ckpt["lut_tables"]]
+                gm = ckpt.get("group_mean")
+                group_mean = gm if gm is not None else None
 
             self.group_specs[gid] = {
                 "group_size": group_size,
@@ -100,10 +130,11 @@ class V6ReplacementEngine:
 
             pred = None
             for addr, table in zip(spec["addresses"], spec["tables"]):
-                indices = addr.compute_indices(x).view(-1, addr.num_tables)  # [B*S, M]
+                indices = addr.compute_indices(x).view(-1, addr.num_tables)  # on x.device
+                indices = indices.to(table.device)
                 N = indices.shape[0]
                 gathered = torch.zeros(
-                    N, gs, device=self.device, dtype=table.dtype
+                    N, gs, device=table.device, dtype=table.dtype
                 )
                 for m in range(addr.num_tables):
                     idx_m = indices[:, m].clamp(0, table.shape[1] - 1)
@@ -114,20 +145,96 @@ class V6ReplacementEngine:
             if spec["target_mode"] == "residual_input":
                 pred = pred + x[:, :, g_start:g_end]
             elif spec["target_mode"] == "residual_mean":
-                gm = spec["group_mean"].view(1, 1, gs)
-                pred = pred + gm.to(out.dtype)
+                gm = spec["group_mean"].view(1, 1, gs).to(out.dtype)
+                pred = pred + gm
 
-            out[:, :, g_start:g_end] = pred.to(out.dtype)
+            out[:, :, g_start:g_end] = pred.to(device=out.device, dtype=out.dtype)
 
         if isinstance(output, tuple):
             return (out,) + output[1:]
         return out
 
+    def _relocate_tables_to_device(self, device: torch.device):
+        """Move all LUT tables and group means to the target device."""
+        for spec in self.group_specs.values():
+            spec["tables"] = [t.to(device) for t in spec["tables"]]
+            if spec["group_mean"] is not None:
+                spec["group_mean"] = spec["group_mean"].to(device)
+        self.device = device
+        print(f"[V6Engine] Moved tables to {device}")
+
     def install(self):
         if self._hook_handle is not None:
             return
+
+        if self.device is None:
+            try:
+                target_device = next(self.hook_mod.parameters()).device
+            except StopIteration:
+                target_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        else:
+            target_device = self.device
+
+        self._relocate_tables_to_device(target_device)
         self._hook_handle = self.hook_mod.register_forward_hook(self._hook)
-        print(f"[V6Engine] Hook installed on {self.hook_mod}")
+        print(f"[V6Engine] Hook installed on {self.hook_mod} (device={target_device})")
+
+    def verify_replacement(self, hidden_size: int) -> bool:
+        """
+        Verify that the installed hook actually changes the MLP output.
+
+        Runs a dummy input through the hook module with and without the hook,
+        and checks whether the outputs differ. This proves the model sees the
+        LUT output instead of the original MLP output for the replaced channels.
+        """
+        if self._hook_handle is None:
+            raise RuntimeError("Hook is not installed. Call install() first.")
+
+        try:
+            param = next(self.hook_mod.parameters())
+            device = param.device
+            dtype = param.dtype
+        except StopIteration:
+            device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+            dtype = torch.float32
+
+        dummy_x = torch.randn(1, 1, hidden_size, device=device, dtype=dtype)
+
+        # 1. Forward with hook active (LUT output)
+        with torch.no_grad():
+            out_with_hook = self.hook_mod(dummy_x)
+        out_with_hook = out_with_hook[0] if isinstance(out_with_hook, tuple) else out_with_hook
+
+        # 2. Temporarily remove hook and forward original MLP output
+        self._hook_handle.remove()
+        with torch.no_grad():
+            out_without_hook = self.hook_mod(dummy_x)
+        out_without_hook = out_without_hook[0] if isinstance(out_without_hook, tuple) else out_without_hook
+
+        # 3. Reinstall hook
+        self._hook_handle = self.hook_mod.register_forward_hook(self._hook)
+
+        # 4. Compare on the same device
+        out_with_hook = out_with_hook.to(device)
+        out_without_hook = out_without_hook.to(device)
+        diff = (out_with_hook - out_without_hook).abs().max().item()
+        denom = out_without_hook.abs().max().item() + 1e-12
+        rel_diff = diff / denom
+
+        replaced_channels = max(gid * spec["group_size"] + spec["group_size"] for gid, spec in self.group_specs.items())
+        print(f"[V6Engine] Replacement verification:")
+        print(f"  output shape: {tuple(out_without_hook.shape)}")
+        print(f"  replaced channels: {replaced_channels} / {hidden_size}")
+        print(f"  max absolute diff: {diff:.6f}")
+        print(f"  relative diff: {rel_diff:.2%}")
+
+        if diff < 1e-4:
+            print("[V6Engine] WARNING: Hook output is almost identical to original MLP output.")
+            print("[V6Engine]          Replacement may not be active; check hook_path and group coverage.")
+            return False
+        else:
+            print("[V6Engine] Replacement verified: LUT output differs from original MLP output.")
+            return True
 
     def uninstall(self):
         if self._hook_handle is not None:
