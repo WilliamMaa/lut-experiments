@@ -14,9 +14,13 @@
 
 ### 2. LUT checkpoint 目录（`--checkpoint_dir`）
 
-- `build_lut_ffn_output.py` 生成的 `checkpoints/` 目录。
+- `build_lut_ffn_output.py` / `build_tail_aware_hard_correction.py` 生成的 `checkpoints/` 目录。
 - 里面必须包含 `replacement_g{gid}.pt` 文件。
-- 例：`./worstcase_32g_full_ffn/checkpoints`
+- 例：`./worstcase_32g_full_ffn/checkpoints`、`./outputs_ffn_lut_layer39_full_moe_v4_tail/checkpoints`
+- 兼容三种 checkpoint 来源：
+  - 原始 v6 单 LUT（`build_lut_ffn_output.py`）
+  - v3 shared coarse + per-group residual（由 `build_tail_aware_hard_correction.py` 导出）
+  - v4 tail-aware hard correction（`build_tail_aware_hard_correction.py`）
 
 ### 3. （可选）PPL 评估文本（`--eval_file`）
 

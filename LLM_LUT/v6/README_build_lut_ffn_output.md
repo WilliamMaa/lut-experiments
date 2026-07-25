@@ -341,6 +341,118 @@ python build_lut_ffn_output.py \
 
 ---
 
+## v3 / v4 实验：共享 coarse + 分组 residual + tail-aware hard correction
+
+从 `docs/04-reflection.md` 出发，我们新增了两种脚本，形成 **base → hard correction → 模型评估** 的流水线：
+
+| 脚本 | 角色 | 输入 | 输出 |
+|---|---|---|---|
+| `build_lut_ffn_output_v3_shared_coarse_fixed.py` | 建 base | 完整 FFN 输入/输出 | `shared_coarse.pt` + `residual_g*.pt` |
+| `build_tail_aware_hard_correction.py` | 加困难样本修正 | v3 base checkpoint | `replacement_g*.pt`（兼容 v6 engine） |
+| `run_model_eval.py` | 模型级验证 | v4 checkpoint + 完整模型 | PPL / 生成文本对比 |
+
+### 为什么分 v3 base 和 v4 hard correction？
+
+- v3 用一棵 **共享 global coarse tree** 捕捉完整 2048 维 FFN 输出的主要分量，再用 32 棵 **per-group residual tree** 补充分组残差。
+- 直接训练 2048 维完整 hard correction tree 会需要极大容量；所以 v4 只在 v3 base 预测不好的 **tail 样本**上加权，学一个共享 2048 维修正表。
+- v4 导出时会拆回 per-group checkpoint，保持和 `v6_replacement_engine.py` 的接口兼容。
+
+### Step 1：建 v3 base（layer 39 完整 FFN 替换）
+
+```bash
+python -u build_lut_ffn_output_v3_shared_coarse_fixed.py \
+  --teacher_weight_path /root/data1/rce/OLMo-core/tmp/qwen_35b_last_moe.pt \
+  --dataset_dir /data/ai2/datasets/lut_distill_dataset/layer39_full_moe_v2/input \
+  --output_dataset_dir /data/ai2/datasets/lut_distill_dataset/layer39_full_moe_v2/output \
+  --output_root ./outputs_ffn_lut_layer39_full_moe_v3_shared \
+  --group_size 64 \
+  --group_ids "0-31" \
+  --coarse_num_bits 14 \
+  --residual_num_bits 16 \
+  --coarse_finetune_epochs 10 \
+  --residual_finetune_epochs 10 \
+  --finetune_epochs 50 \
+  --finetune_loss_mode multi \
+  --finetune_cosine_alpha 1.0 \
+  --finetune_residual_cosine_alpha 0.5 \
+  --finetune_norm_alpha 0.01 \
+  --tree_max_samples 400000 \
+  --tree_min_samples 4 \
+  --tree_candidates 256 \
+  --calib_size 400000 \
+  --eval_size 100000 \
+  --device cuda:5 \
+  > v3_shared.log 2>&1 &
+```
+
+**数据集路径注意**：
+- v3 默认示例使用 `layer39_full_moe_v2/input` 和 `output`。
+- 如果你手头的数据是 `input_qwen3_layer_39_ffn_3000w_0721` / `output_qwen3_layer_39_ffn_3000w_0721`，直接把上面两个路径替换即可。
+- 两个目录必须**文件名一一对应**，脚本会按文件名配对。
+
+**资源估算**：
+- 单卡即可，推荐 40GB 显存卡。
+- `calib_size=400000`、`eval_size=100000`、32 groups、coarse 14-bit + residual 16-bit，预计运行 **6–15 小时**。
+
+### Step 2：建 v4 tail-aware hard correction
+
+```bash
+python -u build_tail_aware_hard_correction.py \
+  --base_checkpoint_dir ./outputs_ffn_lut_layer39_full_moe_v3_shared/checkpoints \
+  --teacher_weight_path /root/data1/rce/OLMo-core/tmp/qwen_35b_last_moe.pt \
+  --dataset_dir /data/ai2/datasets/lut_distill_dataset/layer39_full_moe_v2/input \
+  --output_dataset_dir /data/ai2/datasets/lut_distill_dataset/layer39_full_moe_v2/output \
+  --output_root ./outputs_ffn_lut_layer39_full_moe_v4_tail \
+  --group_size 64 \
+  --group_ids "0-31" \
+  --hard_num_bits 13 \
+  --hard_tau 0.80 \
+  --hard_temperature 0.05 \
+  --hard_finetune_epochs 30 \
+  --hard_finetune_lr 1e-3 \
+  --hard_finetune_batch_size 1024 \
+  --hard_finetune_loss_mode mse+cosine \
+  --tree_max_samples 200000 \
+  --tree_min_samples 4 \
+  --tree_candidates 256 \
+  --calib_size 400000 \
+  --eval_size 100000 \
+  --device cuda:0 \
+  > v4_tail.log 2>&1 &
+```
+
+**关键参数**：
+
+| 参数 | 含义 | 默认值 |
+|---|---|---|
+| `--hard_num_bits` | hard correction tree 的 bit 数 | 13 |
+| `--hard_tau` | 困难样本阈值，base cosine 低于该值权重高 | 0.80 |
+| `--hard_temperature` | sigmoid 温度，越小越聚焦 tail | 0.05 |
+| `--hard_finetune_epochs` | hard correction LUT 微调轮数 | 30 |
+| `--hard_finetune_loss_mode` | `mse` / `cosine` / `mse+cosine` | `mse+cosine` |
+
+**存储增量**：
+- 13-bit shared hard correction = `2^13 * 2048 * 2B ≈ 32 MiB`。
+- 拆到 32 groups 后每组多 1 MiB，总增量仍是 32 MiB。
+
+### Step 3：接入完整模型验证（见 `README_run_model_eval.md`）
+
+```bash
+python run_model_eval.py \
+  --model_path /data/downloads/Qwen3.6/models/Qwen3.6-35B-A3B \
+  --checkpoint_dir ./outputs_ffn_lut_layer39_full_moe_v4_tail/checkpoints \
+  --layer_idx 39 \
+  --hook_path "model.model.layers[39].mlp" \
+  --device_map balanced_low_0 \
+  --torch_dtype bfloat16 \
+  --max_new_tokens 128 \
+  --output_json ./layer39_v4_tail_model_eval.json
+```
+
+`v6_replacement_engine.py` 已经兼容 v3/v4 checkpoint：加载时会自动导入 `build_lut_ffn_output_v3_shared_coarse_fixed` 中的 `AddressGreedyTree`、`_TreeNode`、`LUTGroup`。
+
+---
+
 ## 后续方向
 
 如果 4/8 个 group 的结果显示容量-精度曲线成立，可以继续按 `00-ideas.md` 扩展：

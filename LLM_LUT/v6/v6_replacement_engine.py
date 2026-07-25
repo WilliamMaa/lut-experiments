@@ -16,16 +16,37 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from build_lut_ffn_output import AddressGreedyTree, Address2D, AddressHighOrderRandom, _TreeNode
 
+# v3 shared-coarse checkpoints pickle classes from a different module; import them
+# explicitly so torch.load can resolve the globals.
+try:
+    import build_lut_ffn_output_v3_shared_coarse_fixed as _v3_module
+except Exception as _v3_import_err:  # pragma: no cover
+    _v3_module = None
+    print(f"[V6Engine] WARNING: failed to import v3 module: {_v3_import_err}")
+
+_V3_CLASSES = []
+if _v3_module is not None:
+    for _v3_cls_name in ("AddressGreedyTree", "_TreeNode", "LUTGroup"):
+        _v3_cls = getattr(_v3_module, _v3_cls_name, None)
+        if _v3_cls is not None:
+            _V3_CLASSES.append(_v3_cls)
+
 # Allow loading V6 checkpoints built by build_lut_ffn_output.py across different
 # __main__ contexts. These classes are trusted because we built the checkpoints.
+# Also allow v3 shared-coarse / v4 tail-aware classes if the module is importable.
 # NOTE: device_map here is a fixed, explicit map (e.g. balanced_low_0), never "auto".
 torch.serialization.add_safe_globals([
     AddressGreedyTree, Address2D, AddressHighOrderRandom, _TreeNode,
-])
+] + _V3_CLASSES)
 
 
 def _load_v6_checkpoint(path: str):
     """Load a V6 checkpoint, allowing classes defined in build_lut_ffn_output.py.
+
+    Supports checkpoints built by:
+      - build_lut_ffn_output.py (original v6)
+      - build_lut_ffn_output_v3_shared_coarse_fixed.py (shared coarse + residual)
+      - build_tail_aware_hard_correction.py (v4, exported from v3 base)
 
     PyTorch 2.6+ defaults to weights_only=True; our classes are registered above.
     If that still fails (e.g. older PyTorch, or the checkpoint was pickled as
@@ -37,6 +58,9 @@ def _load_v6_checkpoint(path: str):
     except Exception:
         import __main__ as _main_mod
         for cls in (AddressGreedyTree, Address2D, AddressHighOrderRandom, _TreeNode):
+            if not hasattr(_main_mod, cls.__name__):
+                setattr(_main_mod, cls.__name__, cls)
+        for cls in _V3_CLASSES:
             if not hasattr(_main_mod, cls.__name__):
                 setattr(_main_mod, cls.__name__, cls)
         return torch.load(path, map_location="cpu", weights_only=False)

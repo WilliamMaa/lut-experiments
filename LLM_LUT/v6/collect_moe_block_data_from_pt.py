@@ -6,13 +6,14 @@ This script loads existing FFN input tensors (e.g., from layer_39_ffn_3000w_0721
 and captures the COMPLETE MLP output (router + routed experts + shared expert).
 
 Usage:
-  python collect_moe_block_data_from_pt.py \
+python collect_moe_block_data_from_pt.py \
     --model_path /data/downloads/Qwen3.6/models/Qwen3.6-35B-A3B \
     --layer_idx 39 \
     --input_pt_dir /data/ai2/datasets/lut_distill_dataset/input_qwen3_layer_39_ffn_3000w_0721/39 \
-    --output_dir /data/ai2/datasets/lut_distill_dataset/layer39_full_moe \
+    --output_dir /data/ai2/datasets/lut_distill_dataset/layer39_full_moe_v2 \
     --max_samples 200000 \
-    --device_map balanced_low_0
+    --device_map balanced_low_0 \
+    --torch_dtype bfloat16
 """
 
 import os
@@ -49,15 +50,21 @@ def load_pt_files(pt_dir: str, max_samples: int) -> List[torch.Tensor]:
             if tensor.dim() == 1:
                 # [hidden_size] -> [1, hidden_size]
                 tensor = tensor.unsqueeze(0)
+                n_tokens = tensor.shape[0]
             elif tensor.dim() == 2:
                 # [seq_len, hidden_size] or [batch, hidden_size]
-                pass
+                n_tokens = tensor.shape[0]
+            elif tensor.dim() == 3:
+                # [batch, seq_len, hidden] -> [batch*seq_len, hidden]
+                batch, seq_len, hidden = tensor.shape
+                tensor = tensor.view(-1, hidden)
+                n_tokens = batch * seq_len
             else:
                 print(f"Warning: {pt_file} has unexpected shape {tensor.shape}, skipping")
                 continue
 
             tensors.append(tensor)
-            total_tokens += tensor.shape[0]
+            total_tokens += n_tokens
 
         except Exception as e:
             print(f"Warning: Failed to load {pt_file}: {e}")
@@ -152,31 +159,10 @@ def collect_moe_data_from_pt(
             # For efficiency, we'll do a forward pass and let the hook capture
 
             try:
-                # Create a dummy input that will flow through the model
-                # Since we have the hidden states, we need to inject them at the right layer
-                # This is tricky - instead, we'll do a forward pass from the beginning
-                # but use a small dummy input and replace intermediate activations
-
-                # Actually, simpler approach: do full forward with dummy input
-                # and accept that we're re-computing from embedding layer
-                # The hook will still capture the MLP input/output correctly
-
-                # Get batch size and seq len
-                batch_size_actual, seq_len = tensor.shape[0], 1
+                # tensor is now [N, hidden_size] from load_pt_files
+                # Reshape to [1, N, hidden] for layernorm (expects 3D)
                 if tensor.dim() == 2:
-                    seq_len = tensor.shape[0]
-                    batch_size_actual = 1
-                    tensor = tensor.unsqueeze(0)  # [1, seq_len, hidden]
-
-                # We need to create input_ids that will produce similar hidden states
-                # This is approximate - for exact match, we'd need to inject at layer boundary
-
-                # Alternative: directly call the layer's forward with our tensor
-                # But we need to go through layernorm first
-
-                # Let's use a different approach: directly call the mlp with our tensor
-                # This skips the layernorm, but the hook will still capture
-                # Actually, we want the FULL MLP input (after layernorm)
+                    tensor = tensor.unsqueeze(0)  # [1, N, hidden]
 
                 # Best approach: manually call the layer components
                 layer = model.model.layers[layer_idx]

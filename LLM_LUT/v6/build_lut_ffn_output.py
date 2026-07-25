@@ -1,18 +1,10 @@
 #!/usr/bin/env python3
 """
 build_lut_ffn_output.py
-
-v6 纠偏后的第一个最小实验：单层单专家 FFN output group LUT。
-
-- 不最近邻搜索
-- 不 JVP / Jacobian
-- 固定 O(1) tree address 查表
-- 先验证 LUT 对真实 FFN 输出的近似能力
-
-对应设计文档：LLM_LUT/v6/docs/00-ideas.md
 """
 
 import os
+import gc
 import glob
 import json
 import math
@@ -101,7 +93,7 @@ class AddressGreedyTree:
     def build(self, x: torch.Tensor, target: torch.Tensor,
               num_candidates: int = 64, min_samples: int = 32,
               max_samples: int = 65536, device: torch.device = None,
-              candidate_chunk_size: int = 32):
+              candidate_chunk_size: int = 32, min_relative_gain: float = 0.0):
         N = x.shape[0]
         if N > max_samples:
             perm = torch.randperm(N, device=x.device)[:max_samples]
@@ -111,6 +103,7 @@ class AddressGreedyTree:
             x = x.to(device)
             target = target.to(device)
         self._leaf_counter = 0
+        self.min_relative_gain = min_relative_gain
         self.root = self._build_node(x, target, depth=0,
                                      num_candidates=num_candidates,
                                      min_samples=min_samples,
@@ -192,10 +185,17 @@ class AddressGreedyTree:
                 best_threshold = thresholds[best_idx].item()
                 best_left_mask = left_mask[best_idx]
 
+        # Check absolute and relative gain
+        relative_gain = best_reduction / (parent_var + 1e-12) if parent_var > 0 else 0
         if best_reduction <= 0 or best_left_mask is None:
             leaf = _TreeNode(is_leaf=True, leaf_index=self._leaf_counter)
             self._leaf_counter += 1
             return leaf
+        if hasattr(self, 'min_relative_gain') and self.min_relative_gain > 0:
+            if relative_gain < self.min_relative_gain:
+                leaf = _TreeNode(is_leaf=True, leaf_index=self._leaf_counter)
+                self._leaf_counter += 1
+                return leaf
 
         left = self._build_node(x[best_left_mask], target[best_left_mask],
                                 depth + 1, num_candidates, min_samples,
@@ -516,8 +516,7 @@ class LUTGroup(nn.Module):
 
 
 # =============================================================================
-# 3. 数据流：复用 exp11.py 的 .pt 输入格式
-#    可选：如果目录里已有预计算的 FFN 输出，直接读 output，不再 forward Teacher
+# 3. 数据流
 # =============================================================================
 def collect_calibration_and_eval(
     train_input_files, test_input_files, teacher,
@@ -667,6 +666,7 @@ def _build_single_address_lut(calib_x, group_target_for_lut, group_id, group_siz
             max_samples=args.tree_max_samples,
             device=device,
             candidate_chunk_size=args.tree_candidate_chunk_size,
+            min_relative_gain=getattr(args, 'tree_min_relative_gain', 0.0),
         )
         if desc:
             print(f"  {desc} tree built in {time.time() - t0:.2f}s, leaves={address._leaf_counter}")
@@ -740,6 +740,23 @@ def build_coarse_residual_luts_for_group(calib_x, calib_y, group_id, group_size,
         calib_x, residual_target, group_id, group_size, args,
         num_bits=args.residual_num_bits, seed_offset=1, desc="residual", device=device,
     )
+
+    # Triple residual: third LUT for remaining error after coarse + residual
+    if args.triple_residual and args.third_num_bits is not None:
+        # Compute coarse + residual prediction
+        residual_indices = residual_address.compute_indices(calib_x.unsqueeze(0)).view(-1, residual_address.num_tables)
+        residual_pred = residual_lut(residual_indices).squeeze(1)
+        combined_pred = coarse_pred + residual_pred
+
+        # Third target = remaining error
+        third_target = group_target_for_lut - combined_pred
+
+        # Third LUT
+        third_address, third_lut = _build_single_address_lut(
+            calib_x, third_target, group_id, group_size, args,
+            num_bits=args.third_num_bits, seed_offset=2, desc="third", device=device,
+        )
+        return [coarse_address, residual_address, third_address], [coarse_lut, residual_lut, third_lut], group_mean
 
     return [coarse_address, residual_address], [coarse_lut, residual_lut], group_mean
 
@@ -982,7 +999,7 @@ def estimate_eval_files_needed(input_files, eval_size):
             counts.append(1)
 
     avg = sum(counts) / len(counts) if counts else 1.0
-    n_eval = max(100, int(math.ceil(eval_size / avg)))
+    n_eval = int(math.ceil(eval_size / avg))
     return min(n_eval, n - 1)
 
 
@@ -1028,6 +1045,10 @@ def main():
                         help="Coarse LUT bits. If set together with --residual_num_bits, use coarse+residual mode.")
     parser.add_argument("--residual_num_bits", type=int, default=None,
                         help="Residual LUT bits. If set together with --coarse_num_bits, use coarse+residual mode.")
+    parser.add_argument("--triple_residual", action="store_true",
+                        help="Enable triple residual mode: coarse + residual + third LUT.")
+    parser.add_argument("--third_num_bits", type=int, default=None,
+                        help="Third LUT bits for triple residual mode. Requires --triple_residual.")
     parser.add_argument("--channels_per_bit", type=int, default=4)
     parser.add_argument("--address_mode", type=str, default="tree", choices=["tree", "high_order", "2d"],
                         help="Address generator mode")
@@ -1041,6 +1062,10 @@ def main():
                         help="Subsample calibration data for tree building")
     parser.add_argument("--tree_candidate_chunk_size", type=int, default=32,
                         help="Number of tree candidates evaluated in one GPU batch (lower = less memory)")
+    parser.add_argument("--tree_min_relative_gain", type=float, default=0.0,
+                        help="Minimum relative variance gain to continue splitting (0 = disabled, try 1e-3 or 5e-4 for noisy residuals)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from existing checkpoints in output_root/checkpoints/")
     parser.add_argument("--target_mode", type=str, default="direct", choices=["direct", "residual_mean", "residual_input"],
                         help="direct: LUT stores full FFN output; residual_mean: LUT stores output - group_mean; residual_input: LUT stores output - input_residual")
     parser.add_argument("--calib_size", type=int, default=65536)
@@ -1079,6 +1104,13 @@ def main():
         raise ValueError(f"--coarse_num_bits must be positive, got {args.coarse_num_bits}")
     if args.residual_num_bits is not None and args.residual_num_bits <= 0:
         raise ValueError(f"--residual_num_bits must be positive, got {args.residual_num_bits}")
+    if args.triple_residual:
+        if args.coarse_num_bits is None or args.residual_num_bits is None:
+            raise ValueError("--triple_residual requires --coarse_num_bits and --residual_num_bits")
+        if args.third_num_bits is None:
+            raise ValueError("--triple_residual requires --third_num_bits")
+        if args.third_num_bits <= 0:
+            raise ValueError(f"--third_num_bits must be positive, got {args.third_num_bits}")
     if args.num_bits <= 0:
         raise ValueError(f"--num_bits must be positive, got {args.num_bits}")
     if args.finetune_epochs < 0:
@@ -1155,12 +1187,36 @@ def main():
     ckpt_dir = out_dir / "checkpoints"
     ckpt_dir.mkdir(exist_ok=True)
 
+    # Check for resume
     addresses = {}
     luts = {}
     group_means = {}
+    completed_groups = set()
+
+    if args.resume:
+        print("\n[Resume] checking for existing checkpoints...")
+        for gid in group_ids:
+            ckpt_path = ckpt_dir / f"replacement_g{gid}.pt"
+            if ckpt_path.exists():
+                print(f"  Found checkpoint for group {gid}, loading...")
+                ckpt = torch.load(ckpt_path, map_location="cpu")
+                addresses[gid] = ckpt["addresses"]
+                luts[gid] = [LUTGroup(num_tables=a.num_tables, num_entries=a.num_entries,
+                                      group_size=args.group_size, init_table=t, device=device)
+                            for a, t in zip(ckpt["addresses"], ckpt["lut_tables"])]
+                group_means[gid] = ckpt.get("group_mean", None)
+                if group_means[gid] is not None:
+                    group_means[gid] = group_means[gid].to(device)
+                completed_groups.add(gid)
+        print(f"[Resume] {len(completed_groups)}/{len(group_ids)} groups already completed")
+
     group_metrics = []
 
     for gid in group_ids:
+        if gid in completed_groups:
+            print(f"\n[Group {gid}] skipping (already completed)")
+            continue
+
         print(f"\n[Group {gid}] building LUT ...")
         if use_coarse_residual:
             address_list, lut_list, group_mean = build_coarse_residual_luts_for_group(
@@ -1173,6 +1229,41 @@ def main():
         addresses[gid] = address_list
         luts[gid] = lut_list
         group_means[gid] = group_mean
+
+        # Save immediately after building this group
+        ckpt = {
+            "group_id": gid,
+            "group_size": args.group_size,
+            "num_bits": args.num_bits,
+            "coarse_num_bits": args.coarse_num_bits,
+            "residual_num_bits": args.residual_num_bits,
+            "third_num_bits": args.third_num_bits if args.triple_residual else None,
+            "num_bins": args.num_bins,
+            "channels_per_bit": args.channels_per_bit,
+            "address_mode": args.address_mode,
+            "num_tables": args.num_tables,
+            "target_mode": args.target_mode,
+            "finetune_epochs": args.finetune_epochs,
+            "finetune_lr": args.finetune_lr,
+            "finetune_batch_size": args.finetune_batch_size,
+            "finetune_loss_mode": args.finetune_loss_mode,
+            "finetune_cosine_alpha": args.finetune_cosine_alpha,
+            "addresses": address_list,
+            "lut_tables": [lut.table.detach().cpu().half() for lut in lut_list],
+            "group_mean": group_mean.detach().cpu().half() if group_mean is not None else None,
+        }
+        if len(address_list) == 1:
+            ckpt["address"] = address_list[0]
+            ckpt["lut_table"] = ckpt["lut_tables"][0]
+
+        ckpt_path = ckpt_dir / f"replacement_g{gid}.pt"
+        torch.save(ckpt, ckpt_path)
+        print(f"  [Group {gid}] checkpoint saved: {ckpt_path}")
+
+        # Release memory after saving
+        gc.collect()
+        torch.cuda.empty_cache()
+        print(f"  [Group {gid}] memory released")
 
     if args.finetune_epochs > 0:
         finetune_luts(addresses, luts, group_means, args.target_mode, calib_x, calib_y, group_ids, args.group_size, device, args)
