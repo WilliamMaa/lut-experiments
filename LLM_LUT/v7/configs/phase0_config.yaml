@@ -1,0 +1,34 @@
+# Phase 0 Configuration
+# 数据固化与 30k 基线复现
+
+# 模型路径
+teacher_weight_path: "/path/to/expert_0_L17.pt"
+
+# 数据路径
+dataset_dir: "/path/to/activation_inputs"
+output_dataset_dir: null  # 可选：预计算的 FFN 输出
+
+# 输出路径
+output_root: "./outputs/phase0_baseline"
+
+# 设备设置（重要：明确单卡，禁止 auto mapping）
+# 可选: "cuda:0", "cpu"
+device: "cpu"
+
+# 数据收集参数
+calib_size: 65536    # 校准样本数
+eval_size: 8192      # 评估样本数
+batch_size: 256      # 批大小
+
+# Anchor 参数
+n_anchors: 30000              # anchor 数量 (30k/100k/300k)
+anchor_method: "kmeans++"     # 采样方法: random, reservoir, kmeans++
+remove_duplicates: true       # 移除近似重复点
+
+# Jacobian 参数
+jacobian_method: "finite_diff"  # finite_diff 或 autograd
+jacobian_epsilon: 1.0e-4        # 有限差分步长
+skip_jacobian: false            # 是否跳过 Jacobian 计算（加速测试）
+
+# 随机种子
+seed: 42
