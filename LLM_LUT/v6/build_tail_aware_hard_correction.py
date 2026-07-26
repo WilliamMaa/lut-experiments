@@ -48,7 +48,22 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-import build_lut_ffn_output_v3_shared_coarse_fixed as v3
+import build_lut_ffn_output_v3_shared_coarse as v3
+
+
+def _inject_v3_classes_into_main():
+    """Inject v3 classes into __main__ so torch.load can resolve __main__-pickled checkpoints."""
+    import __main__ as _main_mod
+    for _name in ("AddressGreedyTree", "_TreeNode", "LUTGroup", "QwenMoEExpert"):
+        _cls = getattr(v3, _name, None)
+        if _cls is not None and not hasattr(_main_mod, _name):
+            setattr(_main_mod, _name, _cls)
+
+
+def _v3_load(path, **kwargs):
+    """Load a v3 checkpoint that may have been pickled as __main__ classes."""
+    _inject_v3_classes_into_main()
+    return torch.load(path, weights_only=False, **kwargs)
 
 
 @torch.no_grad()
@@ -57,7 +72,7 @@ def load_v3_base(ckpt_dir: Path, hidden_size: int, group_size: int, device: torc
     ckpt_dir = Path(ckpt_dir)
     print(f"\nLoading v3 base from {ckpt_dir}")
 
-    coarse_ckpt = torch.load(ckpt_dir / "shared_coarse.pt", map_location="cpu", weights_only=False)
+    coarse_ckpt = _v3_load(ckpt_dir / "shared_coarse.pt", map_location="cpu")
     coarse_address = coarse_ckpt["address"]
     coarse_lut = v3.LUTGroup(
         num_tables=coarse_address.num_tables,
@@ -74,7 +89,7 @@ def load_v3_base(ckpt_dir: Path, hidden_size: int, group_size: int, device: torc
         residual_path = ckpt_dir / f"residual_g{gid}.pt"
         if not residual_path.exists():
             continue
-        res_ckpt = torch.load(residual_path, map_location="cpu", weights_only=False)
+        res_ckpt = _v3_load(residual_path, map_location="cpu")
         residual_addresses[gid] = res_ckpt["address"]
         residual_luts[gid] = v3.LUTGroup(
             num_tables=residual_addresses[gid].num_tables,

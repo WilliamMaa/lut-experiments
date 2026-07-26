@@ -1,0 +1,5 @@
+{"prompt": "从政治、经济、军事、人口和精英结构五个维度分析罗马帝国西部衰落的原因，说明这些因素之间如何形成反馈循环。要求分章节展开，最后给出最关键的两个因素。", "language": "zh", "task": "history_analysis", "format": "sectioned_essay", "target_length": 2048}
+{"prompt": "撰写一份分布式键值存储系统的完整设计文档，包括背景、需求、核心方案、实现步骤、复杂度分析、潜在风险、测试方式和替代方案。", "language": "zh", "task": "design", "format": "tech_report", "target_length": 2048}
+{"prompt": "Explain the concept of overfitting in machine learning, then compare L1/L2 regularization, dropout, and early stopping. Discuss when each is most appropriate and provide a concrete example.", "language": "en", "task": "explanation", "format": "essay", "target_length": 2048}
+{"prompt": "实现一个支持并发写入和快照读的内存 KV 引擎。要求：先分析需求，再给出算法思路与复杂度，写出完整可运行代码，解释关键函数，给出测试用例，并讨论边界情况。", "language": "zh", "task": "coding", "format": "code_report", "target_length": 2048}
+{"prompt": "以下の中国語の技術課題を読んで、日本語で完全な回答を作成してください。専門用語には初出時に中国語または英語の原語を付記し、構造化された長文で回答してください。\n\n課題：大規模言語モデルの推論遅延を削減するためのKVキャッシュ圧縮手法を比較検討する。", "language": "ja", "task": "tech_analysis", "format": "essay", "target_length": 2048}

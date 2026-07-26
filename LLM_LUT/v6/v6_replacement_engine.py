@@ -141,6 +141,13 @@ class V6ReplacementEngine:
         x = inputs[0] if isinstance(inputs, tuple) else inputs
         out = output[0] if isinstance(output, tuple) else output
 
+        # MoE 实现中 expert/shared_expert 经常被输入 2D [N, hidden]（seq 被 flatten）。
+        # 这里统一 reshape 成 3D [B, S, hidden] 处理，最后再恢复形状。
+        is_2d = (out.dim() == 2)
+        if is_2d:
+            x = x.unsqueeze(0)
+            out = out.unsqueeze(0)
+
         B, S, hidden = out.shape
         for gid in self.group_ids:
             spec = self.group_specs[gid]
@@ -173,6 +180,9 @@ class V6ReplacementEngine:
                 pred = pred + gm
 
             out[:, :, g_start:g_end] = pred.to(device=out.device, dtype=out.dtype)
+
+        if is_2d:
+            out = out.squeeze(0)
 
         if isinstance(output, tuple):
             return (out,) + output[1:]
