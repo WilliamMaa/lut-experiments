@@ -338,8 +338,14 @@ def rollout_prompts(
         B = len(batch)
 
         for b in range(B):
-            gen_ids = output_ids[b, prompt_lens[b]:].cpu()
+            # 所有 batch 序列在 output_ids 中总长度相同：input_len + max_new_tokens
+            gen_start = input_ids.shape[1]
+            gen_ids = output_ids[b, gen_start:].cpu()
             T = gen_ids.shape[0]
+            if T > max_new_tokens:
+                raise RuntimeError(
+                    f"Sequence {b}: generated {T} tokens but max_new_tokens={max_new_tokens}."
+                )
             # 严格对齐：records 最后 T 条必须对应生成的 T 个 token
             if ffn_input.shape[1] < T:
                 raise RuntimeError(
@@ -469,30 +475,45 @@ def fit_global_pca(items: List[Dict], n_components: int = 64, max_samples: int =
     }
 
 
-def compute_leaf_histograms(engine: RecordableV6Engine, ffn_input: torch.Tensor) -> Dict[str, torch.Tensor]:
+def compute_leaf_ids_and_histograms(engine: RecordableV6Engine, ffn_input: torch.Tensor):
     """
-    计算给定 FFN input 上所有 address 的 leaf 访问直方图。
-    返回：{"coarse": [...], "hard": [...], "residual_g0": ..., ...}
+    计算给定 FFN input 上所有 address 的 per-token leaf ID 和聚合直方图。
+
+    返回：
+      leaf_ids: Dict[str, Tensor[T]]，每个 address type 每个 token 访问的 leaf index
+      hists:    Dict[str, Tensor[num_bins]]，去重后的聚合访问直方图
+                （coarse 所有 group 共享同一 address，只算一次）
     """
     device = next(engine.hook_mod.parameters()).device
     x = ffn_input.unsqueeze(0).to(device)
-    hists = {}
+    leaf_ids: Dict[str, torch.Tensor] = {}
+    hists: Dict[str, torch.Tensor] = {}
+    seen_coarse_addr = None
 
     with torch.no_grad():
         for gid, spec in engine.group_specs.items():
             for addr_idx, addr in enumerate(spec["addresses"]):
-                indices = addr.compute_indices(x).view(-1, addr.num_tables).cpu()[:, 0]
+                indices = addr.compute_indices(x).view(-1, addr.num_tables).cpu()[:, 0]  # [T]
                 if addr_idx == 0:
                     key = "coarse"
+                    # shared coarse address 只去重统计一次
+                    if seen_coarse_addr is not None and id(addr) != seen_coarse_addr:
+                        continue
+                    seen_coarse_addr = id(addr)
                 elif addr_idx == 1:
                     key = f"residual_g{gid}"
                 else:
                     key = "hard"
+                leaf_ids[key] = indices
                 hist = torch.bincount(indices.long(), minlength=addr.num_entries).float()
-                if key in hists:
-                    hists[key] += hist
-                else:
-                    hists[key] = hist
+                hists[key] = hists.get(key, torch.zeros_like(hist)) + hist
+    return leaf_ids, hists
+
+
+# 保留旧名字兼容 build_prompt_features
+def compute_leaf_histograms(engine: RecordableV6Engine, ffn_input: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """兼容接口：返回去重后的聚合直方图。"""
+    _, hists = compute_leaf_ids_and_histograms(engine, ffn_input)
     return hists
 
 
@@ -785,7 +806,7 @@ def select_prompts_constrained(
 def sample_long_rollout_positions(
     T: int,
     cos: torch.Tensor,
-    leaf_hists: Dict[str, torch.Tensor],
+    leaf_ids: Dict[str, torch.Tensor],
     global_seen_leaves: Optional[Dict[str, Set[int]]] = None,
     base_rates: Optional[Dict[Tuple[int, int], float]] = None,
     difficulty_boost: float = 0.3,
@@ -794,6 +815,7 @@ def sample_long_rollout_positions(
     """
     对长 rollout 的每个位置决定是否保留。
 
+    leaf_ids: Dict[str, Tensor[T]]，每个 address type 每个 token 访问的 leaf index。
     base_rates: 默认按位置分桶：
       0–256: 0.1, 256–512: 0.2, 512–1024: 0.4, 1024+: 0.6
     """
@@ -805,11 +827,17 @@ def sample_long_rollout_positions(
             (1024, float("inf")): 0.60,
         }
 
-    T = min(T, cos.shape[0])
     if cos.shape[0] != T:
         raise RuntimeError(
             f"sample_long_rollout_positions: T={T} but cos has {cos.shape[0]} elements"
         )
+
+    # 验证 leaf_ids 长度
+    for key, ids in leaf_ids.items():
+        if ids.shape[0] != T:
+            raise RuntimeError(
+                f"leaf_ids['{key}'] length {ids.shape[0]} != T={T}"
+            )
 
     probs = np.zeros(T, dtype=np.float32)
     for i in range(T):
@@ -826,12 +854,12 @@ def sample_long_rollout_positions(
         # 新颖性提升：如果访问了之前没见过的 leaf
         if global_seen_leaves is not None:
             novelty = 0.0
-            for key, hist in leaf_hists.items():
-                if hist[i].item() > 0:
-                    if i not in global_seen_leaves[key]:
-                        novelty += 1.0
+            for key, ids in leaf_ids.items():
+                leaf_id = ids[i].item()
+                if leaf_id not in global_seen_leaves[key]:
+                    novelty += 1.0
             # 平均到每个地址类型
-            rate += novelty_boost * (novelty / max(len(leaf_hists), 1))
+            rate += novelty_boost * (novelty / max(len(leaf_ids), 1))
 
         probs[i] = min(rate, 1.0)
 
@@ -921,8 +949,13 @@ def collect_long_rollout(
             if resume and subdir.exists() and (subdir / "ffn_input.pt").exists():
                 continue
 
-            gen_ids = output_ids[b, prompt_lens[b]:].cpu()
+            gen_start = input_ids.shape[1]
+            gen_ids = output_ids[b, gen_start:].cpu()
             T = gen_ids.shape[0]
+            if T > max_new_tokens:
+                raise RuntimeError(
+                    f"Prompt {prompt_idx}: generated {T} tokens but max_new_tokens={max_new_tokens}."
+                )
             if ffn_input.shape[1] < T:
                 raise RuntimeError(
                     f"Prompt {prompt_idx}: need {T} records but only have {ffn_input.shape[1]}. "
@@ -939,18 +972,16 @@ def collect_long_rollout(
 
             cos = F.cosine_similarity(teacher_y, lut_y.cpu(), dim=-1)
 
-            # compute per-token leaf histograms for novelty
-            # 这里简化：只对所有 token 一起算 leaf 访问，不逐 token 拆分
-            leaf_hists = compute_leaf_histograms(engine, x.cpu())
+            # compute per-token leaf IDs and histograms for novelty
+            leaf_ids, leaf_hists = compute_leaf_ids_and_histograms(engine, x.cpu())
 
             keep_indices = sample_long_rollout_positions(
-                T, cos, leaf_hists, global_seen_leaves=global_seen
+                T, cos, leaf_ids, global_seen_leaves=global_seen
             )
 
             # update global seen leaves
-            for key, hist in leaf_hists.items():
-                visited = torch.where(hist > 0)[0].tolist()
-                global_seen[key].update(visited)
+            for key, ids in leaf_ids.items():
+                global_seen[key].update(ids.tolist())
 
             subdir.mkdir(parents=True, exist_ok=True)
 
@@ -958,6 +989,7 @@ def collect_long_rollout(
             torch.save(lut_y[keep_indices].cpu(), subdir / "lut_ffn_out.pt")
             torch.save(teacher_y[keep_indices], subdir / "teacher_ffn_out.pt")
             torch.save(gen_ids[keep_indices], subdir / "tokens.pt")
+            torch.save({k: v for k, v in leaf_ids.items()}, subdir / "leaf_ids.pt")
 
             with open(subdir / "metrics.json", "w", encoding="utf-8") as f:
                 json.dump({

@@ -50,12 +50,8 @@ from collections import defaultdict
 import numpy as np
 
 # datasets 是可选依赖；如果某个数据集加载失败，该来源会被跳过
-DATASETS_AVAILABLE = False
-try:
-    from datasets import load_dataset
-    DATASETS_AVAILABLE = True
-except ImportError:
-    pass
+from datasets import load_dataset
+DATASETS_AVAILABLE = True
 
 _HF_TOKEN: Optional[str] = None  # set in main() from --hf_token or HF_TOKEN env
 
