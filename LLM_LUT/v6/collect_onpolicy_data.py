@@ -999,6 +999,41 @@ def load_json(path: Path):
         return json.load(f)
 
 
+def load_candidate_features(path: Path) -> List[Dict]:
+    """从 candidate_features.jsonl 加载所有 feature dict。"""
+    features = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            features.append(json.loads(line))
+    return features
+
+
+def save_candidate_features(path: Path, features: List[Dict]):
+    """保存 candidate_features.jsonl。"""
+    with open(path, "w", encoding="utf-8") as f:
+        for it in features:
+            f.write(json.dumps({
+                "prompt": it["prompt"],
+                "metadata": it["metadata"],
+                "metrics": it["metrics"],
+                "instability": it["instability"],
+                "difficulty": it["difficulty"],
+            }, ensure_ascii=False) + "\n")
+
+
+def merge_features(old_features: List[Dict], new_features: List[Dict]) -> List[Dict]:
+    """按 prompt 文本去重合并，新特征覆盖旧特征。"""
+    seen = {}
+    for it in old_features:
+        seen[it["prompt"]] = it
+    for it in new_features:
+        seen[it["prompt"]] = it
+    return list(seen.values())
+
+
 def load_held_out_prompts(output_root: Path, all_prompts: List[Dict], n_held_out: int, seed: int):
     """加载已有 held-out；不存在则重新拆分并保存。"""
     held_path = output_root / "held_out_prompts.json"
@@ -1088,6 +1123,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--resume", action="store_true",
                         help="断点续跑：检测到已完成的阶段输出时跳过对应阶段。")
+    parser.add_argument("--resume_stage1_from", type=str, default=None,
+                        help="增量扩展 Stage 1：从已有输出目录加载 candidate_features.jsonl 和 global_pca.pt，"
+                             "复用老特征的 PCA，只对新 prompt 跑 short rollout，然后合并。")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -1136,7 +1174,66 @@ def main():
     stage1_path = output_root / "selected_stage1.json"
     pca_path = output_root / "global_pca.pt"
 
-    if args.resume and stage1_full_path.exists():
+    # 增量扩展模式：复用已有 candidate_features.jsonl + global_pca.pt，只处理新 prompt
+    if args.resume_stage1_from is not None:
+        old_root = Path(args.resume_stage1_from)
+        old_features_path = old_root / "candidate_features.jsonl"
+        old_pca_path = old_root / "global_pca.pt"
+        if not old_features_path.exists():
+            raise FileNotFoundError(f"--resume_stage1_from: {old_features_path} not found")
+        if not old_pca_path.exists():
+            raise FileNotFoundError(f"--resume_stage1_from: {old_pca_path} not found")
+
+        old_features = load_candidate_features(old_features_path)
+        pca_state = torch.load(old_pca_path, map_location="cpu", weights_only=False)
+        print(f"\n[Stage 1 Incremental] loaded {len(old_features)} old features from {old_root}")
+
+        old_prompts = {it["prompt"] for it in old_features}
+        new_prompts = [p for p in select_prompts_list if p["prompt"] not in old_prompts]
+        print(f"[Stage 1 Incremental] {len(new_prompts)} new prompts to process")
+
+        if new_prompts:
+            print("[Stage 1 Incremental] Short rollout on new prompts ...")
+            short_items = rollout_prompts(
+                model, tokenizer, engine, new_prompts,
+                max_new_tokens=args.short_max_new_tokens,
+                batch_size=args.short_batch_size,
+                device=device,
+                desc="short rollout (incremental)",
+            )
+            add_teacher_labels(short_items, teacher, device)
+
+            print("[Stage 1 Incremental] Building features with old global PCA ...")
+            new_features = [build_prompt_features(it, engine, pca_state) for it in tqdm(short_items, desc="features")]
+            all_features = merge_features(old_features, new_features)
+        else:
+            all_features = old_features
+
+        save_candidate_features(output_root / "candidate_features.jsonl", all_features)
+        torch.save(pca_state, pca_path)
+        print(f"[Stage 1 Incremental] saved {len(all_features)} combined features")
+
+        # 默认配额
+        languages = set(it["metadata"]["language"] for it in all_features)
+        tasks = set(it["metadata"]["task"] for it in all_features)
+        formats = set(it["metadata"]["format"] for it in all_features)
+        min_by_language = {lang: 2 for lang in languages}
+        min_by_task = {task: 3 for task in tasks}
+        min_by_format = {fmt: 2 for fmt in formats}
+
+        print("[Stage 1 Incremental] Selecting top prompts ...")
+        selected_stage1_idx = select_prompts_constrained(
+            all_features,
+            n_select=min(args.n_select_stage1, len(all_features)),
+            min_by_language=min_by_language,
+            min_by_task=min_by_task,
+            min_by_format=min_by_format,
+            seed=args.seed,
+        )
+        selected_stage1 = [all_features[i] for i in selected_stage1_idx]
+        save_selected_stage1(output_root, selected_stage1)
+
+    elif args.resume and stage1_full_path.exists():
         selected_stage1 = load_selected_full(stage1_full_path)
         print(f"\n[Resume] Stage 1: loaded {len(selected_stage1)} full items from {stage1_full_path.name}")
     elif args.resume and stage1_path.exists():
@@ -1159,22 +1256,12 @@ def main():
 
         print("[Stage 1] Building prompt features ...")
         short_features = [build_prompt_features(it, engine, pca_state) for it in tqdm(short_items, desc="features")]
+        save_candidate_features(output_root / "candidate_features.jsonl", short_features)
 
-        with open(output_root / "candidate_features.jsonl", "w", encoding="utf-8") as f:
-            for it in short_features:
-                f.write(json.dumps({
-                    "prompt": it["prompt"],
-                    "metadata": it["metadata"],
-                    "metrics": it["metrics"],
-                    "instability": it["instability"],
-                    "difficulty": it["difficulty"],
-                }, ensure_ascii=False) + "\n")
-
-        # 默认配额：至少覆盖语言/任务/格式多样性
+        # 默认配额
         languages = set(it["metadata"]["language"] for it in short_features)
         tasks = set(it["metadata"]["task"] for it in short_features)
         formats = set(it["metadata"]["format"] for it in short_features)
-
         min_by_language = {lang: 2 for lang in languages}
         min_by_task = {task: 3 for task in tasks}
         min_by_format = {fmt: 2 for fmt in formats}
@@ -1197,7 +1284,8 @@ def main():
             f"global_pca.pt not found at {pca_path}. "
             "Cannot resume Stage 2/3 without Stage 1 PCA state."
         )
-    pca_state = torch.load(pca_path, map_location="cpu", weights_only=False)
+    if args.resume_stage1_from is None:
+        pca_state = torch.load(pca_path, map_location="cpu", weights_only=False)
 
     # 默认配额复用（Stage 2 selection 仍需要）
     languages = set(it["metadata"]["language"] for it in selected_stage1)
