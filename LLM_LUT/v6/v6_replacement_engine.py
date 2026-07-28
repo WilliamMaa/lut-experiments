@@ -15,29 +15,20 @@ import torch.nn as nn
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from build_lut_ffn_output import AddressGreedyTree, Address2D, AddressHighOrderRandom, _TreeNode
-
-# v3 shared-coarse checkpoints pickle classes from a different module; import them
-# explicitly so torch.load can resolve the globals.
-try:
-    import build_lut_ffn_output_v3_shared_coarse_fixed as _v3_module
-except Exception as _v3_import_err:  # pragma: no cover
-    _v3_module = None
-    print(f"[V6Engine] WARNING: failed to import v3 module: {_v3_import_err}")
-
-_V3_CLASSES = []
-if _v3_module is not None:
-    for _v3_cls_name in ("AddressGreedyTree", "_TreeNode", "LUTGroup"):
-        _v3_cls = getattr(_v3_module, _v3_cls_name, None)
-        if _v3_cls is not None:
-            _V3_CLASSES.append(_v3_cls)
+from build_lut_ffn_output_v3_shared_coarse import (
+    AddressGreedyTree as _V3AddressGreedyTree,
+    _TreeNode as _V3TreeNode,
+    LUTGroup,
+)
 
 # Allow loading V6 checkpoints built by build_lut_ffn_output.py across different
 # __main__ contexts. These classes are trusted because we built the checkpoints.
-# Also allow v3 shared-coarse / v4 tail-aware classes if the module is importable.
+# Also allow v3 shared-coarse classes if the module is importable.
 # NOTE: device_map here is a fixed, explicit map (e.g. balanced_low_0), never "auto".
 torch.serialization.add_safe_globals([
     AddressGreedyTree, Address2D, AddressHighOrderRandom, _TreeNode,
-] + _V3_CLASSES)
+    _V3AddressGreedyTree, _V3TreeNode, LUTGroup,
+])
 
 
 def _load_v6_checkpoint(path: str):
@@ -45,7 +36,7 @@ def _load_v6_checkpoint(path: str):
 
     Supports checkpoints built by:
       - build_lut_ffn_output.py (original v6)
-      - build_lut_ffn_output_v3_shared_coarse_fixed.py (shared coarse + residual)
+      - build_lut_ffn_output_v3_shared_coarse.py (shared coarse + residual)
       - build_tail_aware_hard_correction.py (v4, exported from v3 base)
 
     PyTorch 2.6+ defaults to weights_only=True; our classes are registered above.
@@ -57,10 +48,8 @@ def _load_v6_checkpoint(path: str):
         return torch.load(path, map_location="cpu", weights_only=True)
     except Exception:
         import __main__ as _main_mod
-        for cls in (AddressGreedyTree, Address2D, AddressHighOrderRandom, _TreeNode):
-            if not hasattr(_main_mod, cls.__name__):
-                setattr(_main_mod, cls.__name__, cls)
-        for cls in _V3_CLASSES:
+        for cls in (AddressGreedyTree, Address2D, AddressHighOrderRandom, _TreeNode,
+                    _V3AddressGreedyTree, _V3TreeNode, LUTGroup):
             if not hasattr(_main_mod, cls.__name__):
                 setattr(_main_mod, cls.__name__, cls)
         return torch.load(path, map_location="cpu", weights_only=False)
@@ -137,18 +126,15 @@ class V6ReplacementEngine:
             except Exception as e:
                 raise ValueError(f"Failed to evaluate hook_path={hook_path}: {e}") from e
 
-    def _hook(self, module, inputs, output):
-        x = inputs[0] if isinstance(inputs, tuple) else inputs
-        out = output[0] if isinstance(output, tuple) else output
+    def compute_lut_output(self, x_3d: torch.Tensor, output_dtype=None) -> torch.Tensor:
+        """
+        给定 3D 输入 [B, S, hidden]，直接通过 LUT 计算完整输出（所有 group）。
+        不参与 hook，可用于离线评估或数据分析。
+        """
+        B, S, hidden = x_3d.shape
+        device = x_3d.device
+        out = torch.zeros(B, S, hidden, device=device, dtype=output_dtype or x_3d.dtype)
 
-        # MoE 实现中 expert/shared_expert 经常被输入 2D [N, hidden]（seq 被 flatten）。
-        # 这里统一 reshape 成 3D [B, S, hidden] 处理，最后再恢复形状。
-        is_2d = (out.dim() == 2)
-        if is_2d:
-            x = x.unsqueeze(0)
-            out = out.unsqueeze(0)
-
-        B, S, hidden = out.shape
         for gid in self.group_ids:
             spec = self.group_specs[gid]
             gs = spec["group_size"]
@@ -161,12 +147,10 @@ class V6ReplacementEngine:
 
             pred = None
             for addr, table in zip(spec["addresses"], spec["tables"]):
-                indices = addr.compute_indices(x).view(-1, addr.num_tables)  # on x.device
+                indices = addr.compute_indices(x_3d).view(-1, addr.num_tables)
                 indices = indices.to(table.device)
                 N = indices.shape[0]
-                gathered = torch.zeros(
-                    N, gs, device=table.device, dtype=table.dtype
-                )
+                gathered = torch.zeros(N, gs, device=table.device, dtype=table.dtype)
                 for m in range(addr.num_tables):
                     idx_m = indices[:, m].clamp(0, table.shape[1] - 1)
                     gathered += table[m, idx_m]
@@ -174,12 +158,37 @@ class V6ReplacementEngine:
                 pred = gathered if pred is None else pred + gathered
 
             if spec["target_mode"] == "residual_input":
-                pred = pred + x[:, :, g_start:g_end]
+                pred = pred + x_3d[:, :, g_start:g_end]
             elif spec["target_mode"] == "residual_mean":
                 gm = spec["group_mean"].view(1, 1, gs).to(out.dtype)
                 pred = pred + gm
 
-            out[:, :, g_start:g_end] = pred.to(device=out.device, dtype=out.dtype)
+            out[:, :, g_start:g_end] = pred.to(device=device, dtype=out.dtype)
+
+        return out
+
+    def lut_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        离线 LUT forward，支持 2D [N, hidden] 或 3D [B, S, hidden] 输入。
+        """
+        is_2d = (x.dim() == 2)
+        x_in = x.unsqueeze(0) if is_2d else x
+        out = self.compute_lut_output(x_in, output_dtype=x.dtype)
+        return out.squeeze(0) if is_2d else out
+
+    def _hook(self, module, inputs, output):
+        x = inputs[0] if isinstance(inputs, tuple) else inputs
+        out = output[0] if isinstance(output, tuple) else output
+
+        # MoE 实现中 expert/shared_expert 经常被输入 2D [N, hidden]（seq 被 flatten）。
+        # 这里统一 reshape 成 3D [B, S, hidden] 处理，最后再恢复形状。
+        is_2d = (out.dim() == 2)
+        if is_2d:
+            x = x.unsqueeze(0)
+            out = out.unsqueeze(0)
+
+        lut_out = self.compute_lut_output(x, output_dtype=out.dtype)
+        out[:, :, :] = lut_out
 
         if is_2d:
             out = out.squeeze(0)

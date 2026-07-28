@@ -104,6 +104,7 @@ class RecordableV6Engine(V6ReplacementEngine):
         super().__init__(*args, **kwargs)
         self.records: List[Dict[str, torch.Tensor]] = []
         self._record_enabled = False
+        self._batch_size: Optional[int] = None
 
     def reset_records(self):
         self.records = []
@@ -113,6 +114,10 @@ class RecordableV6Engine(V6ReplacementEngine):
         if enabled:
             self.reset_records()
 
+    def set_batch_size(self, batch_size: int):
+        """设置当前 rollout 的 batch size，用于在 2D flatten 输入下重建 [B, S, hidden]。"""
+        self._batch_size = batch_size
+
     def _hook(self, module, inputs, output):
         out = super()._hook(module, inputs, output)
         if not self._record_enabled:
@@ -121,10 +126,27 @@ class RecordableV6Engine(V6ReplacementEngine):
         x = inputs[0] if isinstance(inputs, tuple) else inputs
         pred = out[0] if isinstance(out, tuple) else out
 
-        # MoE expert/shared_expert 经常被输入 2D [N, hidden]
-        is_2d = (x.dim() == 2)
-        x_view = x.unsqueeze(0) if is_2d else x
-        pred_view = pred.unsqueeze(0) if is_2d else pred
+        # MoE expert/shared_expert 经常被输入 2D [N, hidden]。
+        # 如果调用方通过 set_batch_size 提供了 B，就可以恢复 [B, S, hidden]，
+        # 从而支持 batch generation；否则退化成 [1, N, hidden]。
+        if x.dim() == 2:
+            N, hidden = x.shape
+            if self._batch_size is not None and self._batch_size > 0:
+                B = self._batch_size
+                if N % B != 0:
+                    raise ValueError(
+                        f"2D flattened input has N={N} tokens, not divisible by batch_size={B}. "
+                        f"Cannot reconstruct [B, S, hidden]."
+                    )
+                S = N // B
+                x_view = x.view(B, S, hidden)
+                pred_view = pred.view(B, S, hidden)
+            else:
+                x_view = x.unsqueeze(0)
+                pred_view = pred.unsqueeze(0)
+        else:
+            x_view = x
+            pred_view = pred
 
         B, S, hidden = x_view.shape
         # 只保留最后一个位置（新生成的 token）
@@ -268,6 +290,10 @@ def rollout_prompts(
     """
     对一批 prompt 做 autoregressive rollout，记录每个生成 token 的 FFN input 和 LUT 输出。
     返回每个 prompt 的 dict，包含 prompt 元数据、ffn_input [T, hidden]、lut_output [T, hidden]。
+
+    支持 batch generation：调用方需通过 engine.set_batch_size(len(batch)) 提供 batch size，
+    当 hook 模块接收 2D flatten 输入（如 MoE shared_expert）时，engine 可据此重建 [B, S, hidden]。
+    取最后 T 条记录（跳过 prefill 阶段）对齐到实际生成的 T 个 token。
     """
     results = []
 
@@ -276,6 +302,7 @@ def rollout_prompts(
         batch_texts = [p["prompt"] for p in batch]
         engine.reset_records()
         engine.set_record(True)
+        engine.set_batch_size(len(batch))
 
         inputs = tokenizer(
             batch_texts,
@@ -300,23 +327,32 @@ def rollout_prompts(
 
         records = engine.concat_records()
         engine.set_record(False)
+        engine.set_batch_size(None)
 
         if records is None or "ffn_input" not in records:
             warnings.warn(f"Batch {start_idx}: no records captured")
             continue
 
-        ffn_input = records["ffn_input"]    # [B, T, hidden]
-        lut_output = records["lut_output"]  # [B, T, hidden]
+        ffn_input = records["ffn_input"]    # [B, num_records, hidden]
+        lut_output = records["lut_output"]  # [B, num_records, hidden]
         B = len(batch)
 
         for b in range(B):
             gen_ids = output_ids[b, prompt_lens[b]:].cpu()
             T = gen_ids.shape[0]
+            # 严格对齐：records 最后 T 条必须对应生成的 T 个 token
+            if ffn_input.shape[1] < T:
+                raise RuntimeError(
+                    f"Sequence {b}: need {T} records but only have {ffn_input.shape[1]}. "
+                    f"This usually means the hook did not fire for every generation step. "
+                    f"Try reducing rollout batch_size to 1."
+                )
             item = dict(batch[b])
             item["generated_token_ids"] = gen_ids
             item["generated_text"] = tokenizer.decode(gen_ids, skip_special_tokens=True)
-            item["ffn_input"] = ffn_input[b, :T].cpu().float()
-            item["lut_output"] = lut_output[b, :T].cpu().float()
+            # 最后 T 条记录对应实际生成的 T 个 token（前面可能有一条 prefill 记录）
+            item["ffn_input"] = ffn_input[b, -T:].cpu().float()
+            item["lut_output"] = lut_output[b, -T:].cpu().float()
             item["T"] = T
             results.append(item)
 
@@ -329,7 +365,7 @@ def add_teacher_labels(items: List[Dict], teacher, device: torch.device, batch_s
     注意：这里只在 LUT 访问到的状态上打标签，不重新运行完整 LLM。
     """
     for item in tqdm(items, desc="teacher label"):
-        x = item["ffn_input"].to(device)
+        x = item["ffn_input"].to(device).float()
         ys = []
         with torch.no_grad():
             for start in range(0, x.shape[0], batch_size):
@@ -769,6 +805,12 @@ def sample_long_rollout_positions(
             (1024, float("inf")): 0.60,
         }
 
+    T = min(T, cos.shape[0])
+    if cos.shape[0] != T:
+        raise RuntimeError(
+            f"sample_long_rollout_positions: T={T} but cos has {cos.shape[0]} elements"
+        )
+
     probs = np.zeros(T, dtype=np.float32)
     for i in range(T):
         rate = 0.0
@@ -826,6 +868,7 @@ def collect_long_rollout(
     batch_size: int,
     device: torch.device,
     output_dir: Path,
+    resume: bool = False,
 ):
     """
     对最终选中的 prompt 做长 rollout，按位置/困难度/新颖性采样，保存 teacher 标注。
@@ -840,6 +883,7 @@ def collect_long_rollout(
         batch_texts = [p["prompt"] for p in batch]
         engine.reset_records()
         engine.set_record(True)
+        engine.set_batch_size(len(batch))
 
         inputs = tokenizer(
             batch_texts,
@@ -864,16 +908,30 @@ def collect_long_rollout(
 
         records = engine.concat_records()
         engine.set_record(False)
+        engine.set_batch_size(None)
 
         ffn_input = records["ffn_input"]
         lut_output = records["lut_output"]
         B = len(batch)
 
         for b in range(B):
+            prompt_idx = start_idx + b
+            subdir = output_dir / f"prompt_{prompt_idx:06d}"
+
+            if resume and subdir.exists() and (subdir / "ffn_input.pt").exists():
+                continue
+
             gen_ids = output_ids[b, prompt_lens[b]:].cpu()
             T = gen_ids.shape[0]
-            x = ffn_input[b, :T].to(device)
-            lut_y = lut_output[b, :T].to(device)
+            if ffn_input.shape[1] < T:
+                raise RuntimeError(
+                    f"Prompt {prompt_idx}: need {T} records but only have {ffn_input.shape[1]}. "
+                    f"This usually means the hook did not fire for every generation step. "
+                    f"Try reducing rollout batch_size to 1."
+                )
+            # 最后 T 条记录对应实际生成的 T 个 token（跳过 prefill）
+            x = ffn_input[b, -T:].to(device).float()
+            lut_y = lut_output[b, -T:].to(device).float()
 
             # teacher forward on LUT-visited states
             with torch.no_grad():
@@ -894,7 +952,6 @@ def collect_long_rollout(
                 visited = torch.where(hist > 0)[0].tolist()
                 global_seen[key].update(visited)
 
-            subdir = output_dir / f"prompt_{start_idx + b:06d}"
             subdir.mkdir(parents=True, exist_ok=True)
 
             torch.save(x[keep_indices].cpu(), subdir / "ffn_input.pt")
@@ -934,7 +991,71 @@ def merge_to_train_samples(long_rollout_dir: Path, output_path: Path):
 
 
 # =============================================================================
-# 10. Main
+# 10. Resume helpers
+# =============================================================================
+
+def load_json(path: Path):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_held_out_prompts(output_root: Path, all_prompts: List[Dict], n_held_out: int, seed: int):
+    """加载已有 held-out；不存在则重新拆分并保存。"""
+    held_path = output_root / "held_out_prompts.json"
+    if held_path.exists():
+        held = load_json(held_path)
+        select = [p for p in all_prompts if p not in held]
+        print(f"[Resume] loaded held-out: {len(held)}, selection pool: {len(select)}")
+        return select, held
+    select, held = split_held_out(all_prompts, n_held_out, seed)
+    with open(held_path, "w", encoding="utf-8") as f:
+        json.dump(held, f, ensure_ascii=False, indent=2)
+    print(f"Held-out: {len(held)}, selection pool: {len(select)}")
+    return select, held
+
+
+def load_selected_basic(path: Path) -> List[Dict]:
+    """从 selected_stage*.json 读取 prompt 列表（resume 用，不包含完整特征）。"""
+    obj = load_json(path)
+    items = []
+    for it in obj.get("selected", []):
+        items.append({
+            "prompt": it["prompt"],
+            "metadata": it.get("metadata", {}),
+            "difficulty": it.get("difficulty", 0.0),
+        })
+    return items
+
+
+def load_selected_full(path: Path) -> List[Dict]:
+    """从 *_full.pt 读取完整 feature dict（保留 tensor）。"""
+    return torch.load(path, map_location="cpu", weights_only=False)
+
+
+def save_selected_stage1(output_root: Path, selected: List[Dict]):
+    """保存 Stage 1 初选结果：基本版 JSON + 完整版 PT。"""
+    with open(output_root / "selected_stage1.json", "w", encoding="utf-8") as f:
+        json.dump({
+            "n_select": len(selected),
+            "selected_indices": list(range(len(selected))),
+            "selected": [{"prompt": it["prompt"], "metadata": it["metadata"], "difficulty": it["difficulty"]} for it in selected],
+        }, f, ensure_ascii=False, indent=2)
+    torch.save(selected, output_root / "selected_stage1_full.pt")
+
+
+def save_selected_stage2(output_root: Path, selected: List[Dict]):
+    """保存 Stage 2 复筛结果：基本版 JSON + 完整版 PT。"""
+    with open(output_root / "selected_stage2.json", "w", encoding="utf-8") as f:
+        json.dump({
+            "n_select": len(selected),
+            "selected_indices": list(range(len(selected))),
+            "selected": [{"prompt": it["prompt"], "metadata": it["metadata"], "difficulty": it["difficulty"]} for it in selected],
+        }, f, ensure_ascii=False, indent=2)
+    torch.save(selected, output_root / "selected_stage2_full.pt")
+
+
+# =============================================================================
+# 11. Main
 # =============================================================================
 
 def main():
@@ -957,14 +1078,16 @@ def main():
     parser.add_argument("--enable_medium_stage", action="store_true")
     parser.add_argument("--medium_max_new_tokens", type=int, default=1024)
     parser.add_argument("--long_max_new_tokens", type=int, default=2048)
-    parser.add_argument("--short_batch_size", type=int, default=8)
-    parser.add_argument("--medium_batch_size", type=int, default=4)
-    parser.add_argument("--long_batch_size", type=int, default=2)
+    parser.add_argument("--short_batch_size", type=int, default=1)
+    parser.add_argument("--medium_batch_size", type=int, default=1)
+    parser.add_argument("--long_batch_size", type=int, default=1)
     parser.add_argument("--n_select_stage1", type=int, default=160)
     parser.add_argument("--n_select_final", type=int, default=64)
     parser.add_argument("--n_held_out", type=int, default=64)
     parser.add_argument("--pca_components", type=int, default=64)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--resume", action="store_true",
+                        help="断点续跑：检测到已完成的阶段输出时跳过对应阶段。")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -1002,99 +1125,123 @@ def main():
 
     # 加载并拆分候选 prompt
     all_prompts = load_prompts(args.prompt_file, max_prompts=args.max_candidate_prompts)
-    select_prompts_list, held_out = split_held_out(all_prompts, args.n_held_out, args.seed)
-
-    with open(output_root / "held_out_prompts.json", "w", encoding="utf-8") as f:
-        json.dump(held_out, f, ensure_ascii=False, indent=2)
-    print(f"Held-out: {len(held_out)}, selection pool: {len(select_prompts_list)}")
+    select_prompts_list, held_out = load_held_out_prompts(
+        output_root, all_prompts, args.n_held_out, args.seed
+    )
 
     # =====================================================================
     # Stage 1: 短 rollout + teacher 标注 + 初选
     # =====================================================================
-    print("\n[Stage 1] Short rollout (256 tokens) ...")
-    short_items = rollout_prompts(
-        model, tokenizer, engine, select_prompts_list,
-        max_new_tokens=args.short_max_new_tokens,
-        batch_size=args.short_batch_size,
-        device=device,
-        desc="short rollout",
-    )
-    add_teacher_labels(short_items, teacher, device)
+    stage1_full_path = output_root / "selected_stage1_full.pt"
+    stage1_path = output_root / "selected_stage1.json"
+    pca_path = output_root / "global_pca.pt"
 
-    print("[Stage 1] Fitting global PCA ...")
-    pca_state = fit_global_pca(short_items, n_components=args.pca_components)
-    torch.save(pca_state, output_root / "global_pca.pt")
-
-    print("[Stage 1] Building prompt features ...")
-    short_features = [build_prompt_features(it, engine, pca_state) for it in tqdm(short_items, desc="features")]
-
-    with open(output_root / "candidate_features.jsonl", "w", encoding="utf-8") as f:
-        for it in short_features:
-            f.write(json.dumps({
-                "prompt": it["prompt"],
-                "metadata": it["metadata"],
-                "metrics": it["metrics"],
-                "instability": it["instability"],
-                "difficulty": it["difficulty"],
-            }, ensure_ascii=False) + "\n")
-
-    # 默认配额：至少覆盖语言/任务/格式多样性
-    languages = set(it["metadata"]["language"] for it in short_features)
-    tasks = set(it["metadata"]["task"] for it in short_features)
-    formats = set(it["metadata"]["format"] for it in short_features)
-
-    min_by_language = {lang: 2 for lang in languages}
-    min_by_task = {task: 3 for task in tasks}
-    min_by_format = {fmt: 2 for fmt in formats}
-
-    print("[Stage 1] Selecting top prompts ...")
-    selected_stage1_idx = select_prompts_constrained(
-        short_features,
-        n_select=min(args.n_select_stage1, len(short_features)),
-        min_by_language=min_by_language,
-        min_by_task=min_by_task,
-        min_by_format=min_by_format,
-        seed=args.seed,
-    )
-    selected_stage1 = [short_features[i] for i in selected_stage1_idx]
-
-    with open(output_root / "selected_stage1.json", "w", encoding="utf-8") as f:
-        json.dump({
-            "n_select": len(selected_stage1),
-            "selected_indices": selected_stage1_idx,
-            "selected": [{"prompt": it["prompt"], "metadata": it["metadata"], "difficulty": it["difficulty"]} for it in selected_stage1],
-        }, f, ensure_ascii=False, indent=2)
-
-    # =====================================================================
-    # Stage 2 (可选): 中等 rollout 复筛
-    # =====================================================================
-    if args.enable_medium_stage:
-        print("\n[Stage 2] Medium rollout (1024 tokens) on selected candidates ...")
-        medium_items = rollout_prompts(
-            model, tokenizer, engine, selected_stage1,
-            max_new_tokens=args.medium_max_new_tokens,
-            batch_size=args.medium_batch_size,
+    if args.resume and stage1_full_path.exists():
+        selected_stage1 = load_selected_full(stage1_full_path)
+        print(f"\n[Resume] Stage 1: loaded {len(selected_stage1)} full items from {stage1_full_path.name}")
+    elif args.resume and stage1_path.exists():
+        selected_stage1 = load_selected_basic(stage1_path)
+        print(f"\n[Resume] Stage 1: loaded {len(selected_stage1)} basic items from {stage1_path.name}")
+    else:
+        print("\n[Stage 1] Short rollout (256 tokens) ...")
+        short_items = rollout_prompts(
+            model, tokenizer, engine, select_prompts_list,
+            max_new_tokens=args.short_max_new_tokens,
+            batch_size=args.short_batch_size,
             device=device,
-            desc="medium rollout",
+            desc="short rollout",
         )
-        add_teacher_labels(medium_items, teacher, device)
-        medium_features = [build_prompt_features(it, engine, pca_state) for it in tqdm(medium_items, desc="medium features")]
+        add_teacher_labels(short_items, teacher, device)
 
-        selected_stage2_idx = select_prompts_constrained(
-            medium_features,
-            n_select=min(args.n_select_final * 2, len(medium_features)),
+        print("[Stage 1] Fitting global PCA ...")
+        pca_state = fit_global_pca(short_items, n_components=args.pca_components)
+        torch.save(pca_state, pca_path)
+
+        print("[Stage 1] Building prompt features ...")
+        short_features = [build_prompt_features(it, engine, pca_state) for it in tqdm(short_items, desc="features")]
+
+        with open(output_root / "candidate_features.jsonl", "w", encoding="utf-8") as f:
+            for it in short_features:
+                f.write(json.dumps({
+                    "prompt": it["prompt"],
+                    "metadata": it["metadata"],
+                    "metrics": it["metrics"],
+                    "instability": it["instability"],
+                    "difficulty": it["difficulty"],
+                }, ensure_ascii=False) + "\n")
+
+        # 默认配额：至少覆盖语言/任务/格式多样性
+        languages = set(it["metadata"]["language"] for it in short_features)
+        tasks = set(it["metadata"]["task"] for it in short_features)
+        formats = set(it["metadata"]["format"] for it in short_features)
+
+        min_by_language = {lang: 2 for lang in languages}
+        min_by_task = {task: 3 for task in tasks}
+        min_by_format = {fmt: 2 for fmt in formats}
+
+        print("[Stage 1] Selecting top prompts ...")
+        selected_stage1_idx = select_prompts_constrained(
+            short_features,
+            n_select=min(args.n_select_stage1, len(short_features)),
             min_by_language=min_by_language,
             min_by_task=min_by_task,
             min_by_format=min_by_format,
             seed=args.seed,
         )
-        selected_final = [medium_features[i] for i in selected_stage2_idx]
-        with open(output_root / "selected_stage2.json", "w", encoding="utf-8") as f:
-            json.dump({
-                "n_select": len(selected_final),
-                "selected_indices": selected_stage2_idx,
-                "selected": [{"prompt": it["prompt"], "metadata": it["metadata"], "difficulty": it["difficulty"]} for it in selected_final],
-            }, f, ensure_ascii=False, indent=2)
+        selected_stage1 = [short_features[i] for i in selected_stage1_idx]
+        save_selected_stage1(output_root, selected_stage1)
+
+    # 加载 PCA（Stage 2 复筛 feature 需要）
+    if not pca_path.exists():
+        raise FileNotFoundError(
+            f"global_pca.pt not found at {pca_path}. "
+            "Cannot resume Stage 2/3 without Stage 1 PCA state."
+        )
+    pca_state = torch.load(pca_path, map_location="cpu", weights_only=False)
+
+    # 默认配额复用（Stage 2 selection 仍需要）
+    languages = set(it["metadata"]["language"] for it in selected_stage1)
+    tasks = set(it["metadata"]["task"] for it in selected_stage1)
+    formats = set(it["metadata"]["format"] for it in selected_stage1)
+    min_by_language = {lang: 2 for lang in languages}
+    min_by_task = {task: 3 for task in tasks}
+    min_by_format = {fmt: 2 for fmt in formats}
+
+    # =====================================================================
+    # Stage 2 (可选): 中等 rollout 复筛
+    # =====================================================================
+    stage2_full_path = output_root / "selected_stage2_full.pt"
+    stage2_path = output_root / "selected_stage2.json"
+
+    if args.enable_medium_stage:
+        if args.resume and stage2_full_path.exists():
+            selected_final = load_selected_full(stage2_full_path)
+            print(f"\n[Resume] Stage 2: loaded {len(selected_final)} full items from {stage2_full_path.name}")
+        elif args.resume and stage2_path.exists():
+            selected_final = load_selected_basic(stage2_path)
+            print(f"\n[Resume] Stage 2: loaded {len(selected_final)} basic items from {stage2_path.name}")
+        else:
+            print("\n[Stage 2] Medium rollout (1024 tokens) on selected candidates ...")
+            medium_items = rollout_prompts(
+                model, tokenizer, engine, selected_stage1,
+                max_new_tokens=args.medium_max_new_tokens,
+                batch_size=args.medium_batch_size,
+                device=device,
+                desc="medium rollout",
+            )
+            add_teacher_labels(medium_items, teacher, device)
+            medium_features = [build_prompt_features(it, engine, pca_state) for it in tqdm(medium_items, desc="medium features")]
+
+            selected_stage2_idx = select_prompts_constrained(
+                medium_features,
+                n_select=min(args.n_select_final * 2, len(medium_features)),
+                min_by_language=min_by_language,
+                min_by_task=min_by_task,
+                min_by_format=min_by_format,
+                seed=args.seed,
+            )
+            selected_final = [medium_features[i] for i in selected_stage2_idx]
+            save_selected_stage2(output_root, selected_final)
     else:
         selected_final = selected_stage1[:args.n_select_final]
 
@@ -1109,6 +1256,7 @@ def main():
         batch_size=args.long_batch_size,
         device=device,
         output_dir=output_root / "long_rollout",
+        resume=args.resume,
     )
 
     # =====================================================================

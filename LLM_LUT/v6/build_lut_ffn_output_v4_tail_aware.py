@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-build_lut_ffn_output_v3_shared_coarse_fixed.py
-结构版（修复版）：共享 global coarse (2048维) + 分组 residual (64维)
+build_lut_ffn_output_v3_shared_coarse.py
+结构版：共享 global coarse (2048维) + 分组 residual (64维)
 
 修复列表：
 1. 正确的 group_ids 解析
@@ -18,7 +18,7 @@ build_lut_ffn_output_v3_shared_coarse_fixed.py
 - 最后联合 finetune
 
 默认运行指令：
-python -u build_lut_ffn_output_v3_shared_coarse_fixed.py \
+python -u build_lut_ffn_output_v3_shared_coarse.py \
     --teacher_weight_path /root/data1/rce/OLMo-core/tmp/qwen_35b_last_moe.pt \
     --dataset_dir /data/ai2/datasets/lut_distill_dataset/layer39_full_moe_v2/input \
     --output_dataset_dir /data/ai2/datasets/lut_distill_dataset/layer39_full_moe_v2/output \
@@ -791,7 +791,7 @@ def evaluate_full_output(coarse_lut, coarse_address, residual_luts, residual_add
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Build LUT FFN (v3_shared_coarse_fixed): shared global coarse + group residuals"
+        description="Build LUT FFN (v3_shared_coarse): shared global coarse + group residuals"
     )
     parser.add_argument("--teacher_weight_path", required=True)
     parser.add_argument("--dataset_dir", required=True)

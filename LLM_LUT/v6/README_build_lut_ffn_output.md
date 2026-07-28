@@ -347,7 +347,7 @@ python build_lut_ffn_output.py \
 
 | 脚本 | 角色 | 输入 | 输出 |
 |---|---|---|---|
-| `build_lut_ffn_output_v3_shared_coarse_fixed.py` | 建 base | 完整 FFN 输入/输出 | `shared_coarse.pt` + `residual_g*.pt` |
+| `build_lut_ffn_output_v3_shared_coarse.py` | 建 base | 完整 FFN 输入/输出 | `shared_coarse.pt` + `residual_g*.pt` |
 | `build_tail_aware_hard_correction.py` | 加困难样本修正 | v3 base checkpoint | `replacement_g*.pt`（兼容 v6 engine） |
 | `run_model_eval.py` | 模型级验证 | v4 checkpoint + 完整模型 | PPL / 生成文本对比 |
 
@@ -360,7 +360,7 @@ python build_lut_ffn_output.py \
 ### Step 1：建 v3 base（layer 39 完整 FFN 替换）
 
 ```bash
-python -u build_lut_ffn_output_v3_shared_coarse_fixed.py \
+python -u build_lut_ffn_output_v3_shared_coarse.py \
   --teacher_weight_path /root/data1/rce/OLMo-core/tmp/qwen_35b_last_moe.pt \
   --dataset_dir /data/ai2/datasets/lut_distill_dataset/layer39_full_moe_v2/input \
   --output_dataset_dir /data/ai2/datasets/lut_distill_dataset/layer39_full_moe_v2/output \
@@ -449,7 +449,7 @@ python run_model_eval.py \
   --output_json ./layer39_v4_tail_model_eval.json
 ```
 
-`v6_replacement_engine.py` 已经兼容 v3/v4 checkpoint：加载时会自动导入 `build_lut_ffn_output_v3_shared_coarse_fixed` 中的 `AddressGreedyTree`、`_TreeNode`、`LUTGroup`。
+`v6_replacement_engine.py` 已经兼容 v3/v4 checkpoint：加载时会自动导入 `build_lut_ffn_output_v3_shared_coarse` 中的 `AddressGreedyTree`、`_TreeNode`、`LUTGroup`。
 
 ---
 

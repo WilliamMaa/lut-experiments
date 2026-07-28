@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-build_lut_ffn_output_v3_shared_coarse_fixed.py
-结构版（修复版）：共享 global coarse (2048维) + 分组 residual (64维)
+build_lut_ffn_output_v3_shared_coarse.py
+结构版：共享 global coarse (2048维) + 分组 residual (64维)
 
 修复列表：
 1. 正确的 group_ids 解析
@@ -427,7 +427,7 @@ def collect_calibration_and_eval(
             break
             
         try:
-            x_tensor = torch.load(in_path, map_location="cpu")
+            x_tensor = torch.load(in_path, map_location="cpu", weights_only=False)
             if x_tensor.dim() == 1:
                 x_tensor = x_tensor.unsqueeze(0)
             elif x_tensor.dim() != 2:
@@ -440,7 +440,7 @@ def collect_calibration_and_eval(
         if use_precomputed_outputs:
             out_path = output_files[idx]
             try:
-                y_tensor = torch.load(out_path, map_location="cpu")
+                y_tensor = torch.load(out_path, map_location="cpu", weights_only=False)
                 if y_tensor.dim() == 1:
                     y_tensor = y_tensor.unsqueeze(0)
                 elif y_tensor.dim() != 2:
@@ -555,7 +555,7 @@ def finetune_coarse_global(coarse_lut, coarse_address, calib_x, calib_y,
             optimizer.zero_grad()
 
             indices = coarse_address.compute_indices(xb.unsqueeze(0)).view(-1, coarse_address.num_tables)
-            pred = coarse_lut(indices).squeeze(1)
+            pred = coarse_lut(indices)
 
             mse = F.mse_loss(pred, yb)
             cos = F.cosine_similarity(pred, yb, dim=-1).mean()
@@ -614,7 +614,7 @@ def finetune_residual_groups(residual_luts, residual_addresses, calib_x, full_re
 
                 optimizer.zero_grad()
                 indices = residual_address.compute_indices(xb.unsqueeze(0)).view(-1, residual_address.num_tables)
-                pred = residual_lut(indices).squeeze(1)
+                pred = residual_lut(indices)
 
                 mse = F.mse_loss(pred, yb)
                 cos = F.cosine_similarity(pred, yb, dim=-1).mean()
@@ -674,7 +674,7 @@ def finetune_joint_all(coarse_lut, coarse_address, residual_luts, residual_addre
 
             # coarse 只查一次，得到完整 2048 维
             coarse_indices = coarse_address.compute_indices(xb.unsqueeze(0)).view(-1, coarse_address.num_tables)
-            coarse_full = coarse_lut(coarse_indices).squeeze(1)  # [batch, 2048]
+            coarse_full = coarse_lut(coarse_indices)  # [batch, 2048]
 
             # 重建完整输出：coarse_slice + residual
             pred_y = torch.zeros_like(yb)
@@ -684,7 +684,7 @@ def finetune_joint_all(coarse_lut, coarse_address, residual_luts, residual_addre
 
                 coarse_group = coarse_full[:, g_start:g_end]
                 residual_indices = residual_addresses[gid].compute_indices(xb.unsqueeze(0)).view(-1, residual_addresses[gid].num_tables)
-                residual_group = residual_luts[gid](residual_indices).squeeze(1)
+                residual_group = residual_luts[gid](residual_indices)
                 
                 pred_y[:, g_start:g_end] = coarse_group + residual_group
 
@@ -743,7 +743,7 @@ def evaluate_full_output(coarse_lut, coarse_address, residual_luts, residual_add
     # coarse 只查一次
     coarse_lut.to(device)
     coarse_indices = coarse_address.compute_indices(eval_x.unsqueeze(0)).view(-1, coarse_address.num_tables)
-    coarse_full = coarse_lut(coarse_indices).squeeze(1)  # [batch, 2048]
+    coarse_full = coarse_lut(coarse_indices)  # [batch, 2048]
     
     # 组装各 group
     pred_y = torch.zeros_like(eval_y)
@@ -754,7 +754,7 @@ def evaluate_full_output(coarse_lut, coarse_address, residual_luts, residual_add
         coarse_group = coarse_full[:, g_start:g_end]
         residual_luts[gid].to(device)
         residual_indices = residual_addresses[gid].compute_indices(eval_x.unsqueeze(0)).view(-1, residual_addresses[gid].num_tables)
-        residual_group = residual_luts[gid](residual_indices).squeeze(1)
+        residual_group = residual_luts[gid](residual_indices)
         
         pred_y[:, g_start:g_end] = coarse_group + residual_group
 
@@ -791,7 +791,7 @@ def evaluate_full_output(coarse_lut, coarse_address, residual_luts, residual_add
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Build LUT FFN (v3_shared_coarse_fixed): shared global coarse + group residuals"
+        description="Build LUT FFN (v3_shared_coarse): shared global coarse + group residuals"
     )
     parser.add_argument("--teacher_weight_path", required=True)
     parser.add_argument("--dataset_dir", required=True)
@@ -961,7 +961,7 @@ def main():
         print(f"{'='*60}")
         
         with torch.no_grad():
-            coarse_pred = coarse_lut(coarse_indices.to(device)).squeeze(1).cpu()
+            coarse_pred = coarse_lut(coarse_indices.to(device)).cpu()
             full_residual = calib_y - coarse_pred
             print(f"  Residual computed: mean_abs={full_residual.abs().mean():.6f}")
 

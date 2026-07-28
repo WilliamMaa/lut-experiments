@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-build_lut_ffn_output_v3_independent_fixed.py
+build_lut_ffn_output_v3_independent.py
 修复版：正确的两阶段构建，local loss，全局 joint finetune
 """
 
@@ -813,7 +813,7 @@ def parse_group_ids(s: str, max_group: int):
 # =============================================================================
 def main():
     parser = argparse.ArgumentParser(
-        description="Build LUT FFN (v3_independent_fixed): correct two-stage building"
+        description="Build LUT FFN (v3_independent): correct two-stage building"
     )
     parser.add_argument("--teacher_weight_path", required=True)
     parser.add_argument("--dataset_dir", required=True)
@@ -959,7 +959,7 @@ def main():
         print(f"\n[Stage 2] Computing residual and building residual LUT ({args.residual_num_bits} bits) ...")
         with torch.no_grad():
             coarse_indices = coarse_address.compute_indices(calib_x.unsqueeze(0)).view(-1, coarse_address.num_tables)
-            coarse_pred = coarse_lut(coarse_indices).squeeze(1)
+            coarse_pred = coarse_lut(coarse_indices).squeeze(1).cpu()  # 移回 CPU
             residual_target = group_target - coarse_pred
 
         residual_address, residual_lut = _build_single_address_lut(
