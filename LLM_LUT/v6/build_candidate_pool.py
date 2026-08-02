@@ -33,7 +33,7 @@ JSONL 字段：
 依赖：
   pip install datasets
 
-python build_candidate_pool.py \
+python -u build_candidate_pool.py \
   --output_file ./candidate_prompts.jsonl \
   --hf_token 
 """

@@ -38,6 +38,8 @@ from typing import List
 DEFAULT_DIR_PATTERNS = [
     "outputs_ffn_lut_*",
     "onpolicy_data_*",
+    "onpolicy_layer39_*",
+    "onpolicy_layer*_",
     "worstcase_*",
 ]
 

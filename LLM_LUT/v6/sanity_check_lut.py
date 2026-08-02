@@ -23,6 +23,21 @@ sanity_check_lut.py
     --max_length 512 \
     --output_json ./sanity_check_report.json \
     > sanity_check.log 2>&1 &
+
+python -u sanity_check_lut.py \
+  --model_path /data/downloads/Qwen3.6/models/Qwen3.6-35B-A3B \
+  --checkpoint_dir ./outputs_ffn_lut_layer39_full_moe_v4_tail/checkpoints \
+  --teacher_weight_path /root/data1/rce/OLMo-core/tmp/qwen_35b_last_moe.pt \
+  --teacher_mode original_module \
+  --hook_path "model.model.layers[39].mlp" \
+  --layer_idx 39 \
+  --device_map balanced_low_0 \
+  --torch_dtype bfloat16 \
+  --device cuda:0 \
+  --input_text "请你简述明朝灭亡的原因" \
+  --max_length 512 \
+  --output_json ./sanity_check_whole_mlp.json \
+  > sanity_check_whole_mlp.log 2>&1 &
 """
 
 import argparse
@@ -97,8 +112,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", required=True)
     parser.add_argument("--checkpoint_dir", required=True)
-    parser.add_argument("--teacher_weight_path", required=True)
+    parser.add_argument("--teacher_weight_path", type=str, default=None)
     parser.add_argument("--teacher_module_path", type=str, default=None)
+    parser.add_argument("--teacher_mode", type=str, default="loaded_expert",
+                        choices=["loaded_expert", "original_module"],
+                        help="teacher 来源。loaded_expert 从 teacher_weight_path 加载；"
+                             "original_module 用模型原始 hook_mod 输出作 teacher。"
+                             "当 LUT 目标是替换完整模块（如整个 MoE block）时用 original_module。")
     parser.add_argument("--hook_path", required=True)
     parser.add_argument("--layer_idx", type=int, default=39)
     parser.add_argument("--device_map", type=str, default="balanced_low_0")
@@ -123,8 +143,15 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
-    print(f"Loading teacher from {args.teacher_weight_path} module={args.teacher_module_path}")
-    teacher, _ = load_teacher(args.teacher_weight_path, args.teacher_module_path, device)
+    if args.teacher_mode == "loaded_expert":
+        if not args.teacher_weight_path:
+            raise ValueError("--teacher_weight_path is required when --teacher_mode=loaded_expert")
+        print(f"Loading teacher from {args.teacher_weight_path} module={args.teacher_module_path}")
+        teacher, _ = load_teacher(args.teacher_weight_path, args.teacher_module_path, device)
+        teacher = teacher.to(dtype)
+    else:
+        teacher = None
+        print("[Teacher mode] Using original hook module output as teacher")
 
     print("Loading LUT engine ...")
     engine = V6ReplacementEngine(
@@ -134,6 +161,11 @@ def main():
         hook_path=args.hook_path,
         device=device,
     )
+
+    # 模型运行 dtype，teacher / LUT 离线 forward 都必须用同一 dtype，
+    # 否则会出现 mat1/mat2 dtype mismatch（如 bfloat16 vs float32）
+    model_dtype = next(model.parameters()).dtype
+    print(f"Model dtype: {model_dtype}")
 
     inputs = tokenizer(
         args.input_text,
@@ -203,12 +235,26 @@ def main():
     print(f"Captured runtime LUT: x={tuple(x_rt.shape)}, y={tuple(y_rt.shape)}")
 
     # -------------------------------------------------------------------------
-    # Teacher 和 offline LUT 都在 original x 上计算
+    # Teacher 和 offline LUT 都在 original x 上计算，dtype 与模型保持一致
     # -------------------------------------------------------------------------
-    x_eval = x_orig.to(device)
+    if args.teacher_mode == "loaded_expert":
+        x_eval = x_orig.to(device).to(model_dtype)
+        with torch.no_grad():
+            y_teacher = teacher(x_eval).float().cpu()
+    else:
+        # original_module：把 x 送到原始 hook_mod 所在设备
+        hook_mod_device = next(hook_module.parameters()).device
+        x_eval = x_orig.to(hook_mod_device).to(model_dtype)
+        with torch.no_grad():
+            y_teacher = hook_module(x_eval)
+            if isinstance(y_teacher, tuple):
+                y_teacher = y_teacher[0]
+            y_teacher = y_teacher.float().cpu()
+
+    # offline LUT：用和模型相同的 dtype/device
+    x_eval_offline = x_orig.to(device).to(model_dtype)
     with torch.no_grad():
-        y_teacher = teacher(x_eval).cpu().float()
-        y_offline = engine.lut_forward(x_eval).cpu().float()
+        y_offline = engine.lut_forward(x_eval_offline).float().cpu()
 
     # -------------------------------------------------------------------------
     # 统计比较

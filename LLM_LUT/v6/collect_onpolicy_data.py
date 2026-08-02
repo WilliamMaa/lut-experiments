@@ -274,6 +274,69 @@ def load_real_teacher(teacher_weight_path: str, device: torch.device, module_pat
 
 
 # =============================================================================
+# 3b. Teacher label 生成器：支持从加载的 expert 或原始 hook 模块生成
+# =============================================================================
+
+class TeacherLabeler:
+    """
+    生成 teacher 标签的封装。
+
+    mode="loaded_expert": 用 load_real_teacher 加载的独立 expert 前向。
+    mode="original_module": 临时关掉 LUT hook，用模型原始的 hook_mod（如完整 mlp）前向。
+                            用于 LUT 目标是替换完整模块（如整个 MoE block）的场景。
+    """
+
+    def __init__(
+        self,
+        mode: str,
+        device: torch.device,
+        teacher: Optional[torch.nn.Module] = None,
+        hook_mod: Optional[torch.nn.Module] = None,
+        engine: Optional[RecordableV6Engine] = None,
+    ):
+        assert mode in ("loaded_expert", "original_module")
+        self.mode = mode
+        self.device = device
+        self.teacher = teacher
+        self.hook_mod = hook_mod
+        self.engine = engine
+
+        if mode == "loaded_expert" and teacher is None:
+            raise ValueError("mode='loaded_expert' requires teacher")
+        if mode == "original_module" and hook_mod is None:
+            raise ValueError("mode='original_module' requires hook_mod")
+
+    def _module_device_dtype(self):
+        param = next(self.hook_mod.parameters())
+        return param.device, param.dtype
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [N, hidden] or [B, S, hidden]；返回 float32 CPU tensor。"""
+        if self.mode == "loaded_expert":
+            teacher_dtype = next(self.teacher.parameters()).dtype
+            x = x.to(self.device).to(teacher_dtype)
+            with torch.no_grad():
+                y = self.teacher(x).float().cpu()
+            return y
+
+        # original_module: 临时卸载 LUT hook，跑原始模块
+        module_device, module_dtype = self._module_device_dtype()
+        x = x.to(module_device).to(module_dtype)
+        if self.engine is not None and self.engine._hook_handle is not None:
+            self.engine.uninstall()
+        try:
+            with torch.no_grad():
+                y = self.hook_mod(x)
+            # 有些模块返回 tuple
+            if isinstance(y, tuple):
+                y = y[0]
+            return y.float().cpu()
+        finally:
+            if self.engine is not None:
+                self.engine.install()
+
+
+# =============================================================================
 # 4. Rollout：短 / 中 / 长
 # =============================================================================
 
@@ -365,19 +428,29 @@ def rollout_prompts(
     return results
 
 
-def add_teacher_labels(items: List[Dict], teacher, device: torch.device, batch_size: int = 256):
+def add_teacher_labels(items: List[Dict], labeler: TeacherLabeler, batch_size: int = 256):
     """
-    对 rollout 结果批量 forward teacher expert，得到真实 FFN 输出。
+    对 rollout 结果批量生成 teacher 标签。
     注意：这里只在 LUT 访问到的状态上打标签，不重新运行完整 LLM。
     """
-    for item in tqdm(items, desc="teacher label"):
-        x = item["ffn_input"].to(device).float()
-        ys = []
-        with torch.no_grad():
-            for start in range(0, x.shape[0], batch_size):
-                yb = teacher(x[start:start + batch_size])
-                ys.append(yb.cpu())
-        item["teacher_output"] = torch.cat(ys, dim=0).float()
+    # original_module 模式下，批量处理前临时卸载 LUT hook，处理完再装回
+    uninstalled = False
+    if labeler.mode == "original_module" and labeler.engine is not None:
+        labeler.engine.uninstall()
+        uninstalled = True
+
+    try:
+        for item in tqdm(items, desc="teacher label"):
+            x = item["ffn_input"]
+            ys = []
+            with torch.no_grad():
+                for start in range(0, x.shape[0], batch_size):
+                    yb = labeler(x[start:start + batch_size])
+                    ys.append(yb)
+            item["teacher_output"] = torch.cat(ys, dim=0)
+    finally:
+        if uninstalled:
+            labeler.engine.install()
 
 
 def compute_token_metrics(item: Dict) -> Dict:
@@ -890,7 +963,7 @@ def collect_long_rollout(
     model,
     tokenizer,
     engine: RecordableV6Engine,
-    teacher,
+    labeler: TeacherLabeler,
     selected_prompts: List[Dict],
     max_new_tokens: int,
     batch_size: int,
@@ -963,14 +1036,13 @@ def collect_long_rollout(
                     f"Try reducing rollout batch_size to 1."
                 )
             # 最后 T 条记录对应实际生成的 T 个 token（跳过 prefill）
-            x = ffn_input[b, -T:].to(device).float()
-            lut_y = lut_output[b, -T:].to(device).float()
+            x = ffn_input[b, -T:].cpu().float()
+            lut_y = lut_output[b, -T:].cpu().float()
 
             # teacher forward on LUT-visited states
-            with torch.no_grad():
-                teacher_y = teacher(x).cpu()
+            teacher_y = labeler(x)
 
-            cos = F.cosine_similarity(teacher_y, lut_y.cpu(), dim=-1)
+            cos = F.cosine_similarity(teacher_y, lut_y, dim=-1)
 
             # compute per-token leaf IDs and histograms for novelty
             leaf_ids, leaf_hists = compute_leaf_ids_and_histograms(engine, x.cpu())
@@ -1128,10 +1200,17 @@ def save_selected_stage2(output_root: Path, selected: List[Dict]):
 def main():
     parser = argparse.ArgumentParser(description="Scheme 1: prompt selection + on-policy data collection")
     parser.add_argument("--model_path", required=True)
-    parser.add_argument("--teacher_weight_path", required=True)
+    parser.add_argument("--teacher_weight_path", type=str, default=None,
+                        help="mode='loaded_expert' 时必填；mode='original_module' 时不需要。")
     parser.add_argument("--teacher_module_path", type=str, default=None,
                         help="当 teacher_weight_path 是完整模型权重时，用此路径提取单个 expert。"
                              "例如：model.model.layers[39].mlp.shared_expert")
+    parser.add_argument("--teacher_mode", type=str, default="loaded_expert",
+                        choices=["loaded_expert", "original_module"],
+                        help="teacher 标签来源。"
+                             "loaded_expert: 从 teacher_weight_path 加载独立 expert；"
+                             "original_module: 临时关掉 LUT hook，用模型原始 hook_mod 输出作 teacher。"
+                             "当 LUT 目标是替换完整模块（如整个 MoE block）时用 original_module。")
     parser.add_argument("--checkpoint_dir", required=True)
     parser.add_argument("--prompt_file", required=True)
     parser.add_argument("--output_root", required=True)
@@ -1189,9 +1268,25 @@ def main():
     engine.install()
 
     device = torch.device(args.device)
-    teacher, hidden_size, _ = load_real_teacher(
-        args.teacher_weight_path, device, module_path=args.teacher_module_path
-    )
+
+    if args.teacher_mode == "loaded_expert":
+        if not args.teacher_weight_path:
+            raise ValueError("--teacher_weight_path is required when --teacher_mode=loaded_expert")
+        teacher, hidden_size, _ = load_real_teacher(
+            args.teacher_weight_path, device, module_path=args.teacher_module_path
+        )
+        labeler = TeacherLabeler(mode="loaded_expert", device=device, teacher=teacher)
+    else:
+        # original_module: teacher 是安装 LUT hook 之前的原始 hook_mod
+        teacher = None
+        hidden_size = None
+        labeler = TeacherLabeler(
+            mode="original_module",
+            device=device,
+            hook_mod=engine.hook_mod,
+            engine=engine,
+        )
+        print(f"[TeacherLabeler] Using original module output as teacher: {engine.hook_mod}")
 
     # 加载并拆分候选 prompt
     all_prompts = load_prompts(args.prompt_file, max_prompts=args.max_candidate_prompts)
@@ -1233,7 +1328,7 @@ def main():
                 device=device,
                 desc="short rollout (incremental)",
             )
-            add_teacher_labels(short_items, teacher, device)
+            add_teacher_labels(short_items, labeler)
 
             print("[Stage 1 Incremental] Building features with old global PCA ...")
             new_features = [build_prompt_features(it, engine, pca_state) for it in tqdm(short_items, desc="features")]
@@ -1280,7 +1375,7 @@ def main():
             device=device,
             desc="short rollout",
         )
-        add_teacher_labels(short_items, teacher, device)
+        add_teacher_labels(short_items, labeler)
 
         print("[Stage 1] Fitting global PCA ...")
         pca_state = fit_global_pca(short_items, n_components=args.pca_components)
@@ -1349,7 +1444,7 @@ def main():
                 device=device,
                 desc="medium rollout",
             )
-            add_teacher_labels(medium_items, teacher, device)
+            add_teacher_labels(medium_items, labeler)
             medium_features = [build_prompt_features(it, engine, pca_state) for it in tqdm(medium_items, desc="medium features")]
 
             selected_stage2_idx = select_prompts_constrained(
@@ -1370,7 +1465,7 @@ def main():
     # =====================================================================
     print("\n[Stage 3] Long rollout (2048 tokens) and on-policy collection ...")
     collect_long_rollout(
-        model, tokenizer, engine, teacher,
+        model, tokenizer, engine, labeler,
         selected_final[:args.n_select_final],
         max_new_tokens=args.long_max_new_tokens,
         batch_size=args.long_batch_size,
