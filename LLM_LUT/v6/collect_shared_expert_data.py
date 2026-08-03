@@ -80,7 +80,9 @@ def collect_shared_expert_data(
     layer_idx: int,
     output_dir: Path,
     max_tokens_per_prompt: int,
+    max_new_tokens: int,
     max_total_tokens: int,
+    generation_kwargs: dict,
 ):
     output_dir = Path(output_dir)
     input_dir = output_dir / "input"
@@ -119,10 +121,20 @@ def collect_shared_expert_data(
         )
         input_ids = inputs["input_ids"]
 
-        # For device_map models, just pass to model; accelerate handles placement
         try:
             with torch.no_grad():
-                _ = model(input_ids, use_cache=False)
+                if max_new_tokens > 0:
+                    # Generate continuation so LUT sees rollout states, not just prompt states.
+                    _ = model.generate(
+                        input_ids,
+                        max_new_tokens=max_new_tokens,
+                        use_cache=True,
+                        pad_token_id=tokenizer.pad_token_id,
+                        eos_token_id=tokenizer.eos_token_id,
+                        **generation_kwargs,
+                    )
+                else:
+                    _ = model(input_ids, use_cache=False)
         except Exception as e:
             print(f"Warning: Failed to process prompt: {e}")
             continue
@@ -161,6 +173,7 @@ def collect_shared_expert_data(
         "num_files": file_counter,
         "total_tokens": total_tokens,
         "hook_path": hook_path,
+        "max_new_tokens": max_new_tokens,
     }
     with open(output_dir / "metadata.json", "w") as f:
         json.dump(metadata, f, indent=2)
@@ -176,6 +189,12 @@ def main():
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--max_prompts", type=int, default=1000)
     parser.add_argument("--max_tokens_per_prompt", type=int, default=512)
+    parser.add_argument("--max_new_tokens", type=int, default=512,
+                        help="If > 0, generate this many new tokens per prompt instead of only forwarding the prompt.")
+    parser.add_argument("--do_sample", action="store_true", default=True,
+                        help="Sample during generation (default: True).")
+    parser.add_argument("--temperature", type=float, default=0.7)
+    parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--max_total_tokens", type=int, default=500000)
     parser.add_argument("--device_map", default="balanced_low_0")
     parser.add_argument("--torch_dtype", default="bfloat16")
@@ -201,6 +220,14 @@ def main():
 
     texts = load_calibration_texts(args.calib_file, args.max_prompts)
 
+    generation_kwargs = {}
+    if args.do_sample:
+        generation_kwargs["do_sample"] = True
+        generation_kwargs["temperature"] = args.temperature
+        generation_kwargs["top_p"] = args.top_p
+    else:
+        generation_kwargs["do_sample"] = False
+
     num_files, num_tokens = collect_shared_expert_data(
         model=model,
         tokenizer=tokenizer,
@@ -208,7 +235,9 @@ def main():
         layer_idx=args.layer_idx,
         output_dir=Path(args.output_dir),
         max_tokens_per_prompt=args.max_tokens_per_prompt,
+        max_new_tokens=args.max_new_tokens,
         max_total_tokens=args.max_total_tokens,
+        generation_kwargs=generation_kwargs,
     )
 
     print(f"\nDone: {num_files} files, {num_tokens} tokens")

@@ -83,6 +83,9 @@ def load_teacher(teacher_weight_path: str, module_path: str, device: torch.devic
             raise KeyError(f"Cannot find module {module_path} in {teacher_weight_path}")
         new_state = {k[len(prefix_dot):]: v for k, v in matched.items()}
 
+    # shared_expert_gate.weight 是 MoE gate 权重，不是 FFN 权重，过滤掉
+    new_state = {k: v for k, v in new_state.items() if k in ("gate_proj.weight", "up_proj.weight", "down_proj.weight")}
+
     gate_key = next(k for k in new_state.keys() if "gate_proj" in k and "weight" in k)
     intermediate_size, hidden_size = new_state[gate_key].shape
 
