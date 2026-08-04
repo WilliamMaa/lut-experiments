@@ -20,6 +20,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import build_lut_ffn_output_v3_shared_coarse as v3
+import build_lut_ffn_output_v3_lowrank as v3_lr
 
 
 def _inject_v3_classes_into_main():
@@ -45,6 +46,11 @@ def load_v3_base(ckpt_dir: Path, hidden_size: int, group_size: int, device: torc
         device=device,
     )
 
+    lowrank_V = coarse_ckpt.get("lowrank_V", None)
+    lowrank_A = coarse_ckpt.get("lowrank_A", None)
+    if lowrank_V is not None:
+        print(f"  loaded lowrank correction: rank={lowrank_V.shape[1]}, A shape={tuple(lowrank_A.shape)}")
+
     residual_addresses = {}
     residual_luts = {}
     max_group = hidden_size // group_size
@@ -64,7 +70,7 @@ def load_v3_base(ckpt_dir: Path, hidden_size: int, group_size: int, device: torc
 
     group_ids = sorted(residual_luts.keys())
     print(f"  loaded coarse entries={coarse_address.num_entries}, groups={len(group_ids)}")
-    return coarse_address, coarse_lut, residual_addresses, residual_luts, group_ids
+    return coarse_address, coarse_lut, residual_addresses, residual_luts, lowrank_V, lowrank_A, group_ids
 
 
 def main():
@@ -89,7 +95,7 @@ def main():
     hidden_size = max_group * group_size
     print(f"Inferred hidden_size={hidden_size}, group_size={group_size}, num_groups={max_group}")
 
-    coarse_address, coarse_lut, residual_addresses, residual_luts, group_ids = load_v3_base(
+    coarse_address, coarse_lut, residual_addresses, residual_luts, lowrank_V, lowrank_A, group_ids = load_v3_base(
         args.v3_checkpoint_dir, hidden_size, group_size, device
     )
 
@@ -99,6 +105,15 @@ def main():
     ckpt_out_dir.mkdir(exist_ok=True)
 
     coarse_table = coarse_lut.table.detach().cpu().half()
+
+    # Export optional low-rank correction
+    if lowrank_V is not None:
+        torch.save({
+            "lowrank_V": lowrank_V.detach().cpu().half(),
+            "lowrank_A": lowrank_A.detach().cpu().half(),
+            "lowrank_rank": lowrank_V.shape[1],
+        }, ckpt_out_dir / "lowrank.pt")
+        print(f"  exported lowrank.pt (rank={lowrank_V.shape[1]})")
 
     for gid in group_ids:
         g_start = gid * group_size

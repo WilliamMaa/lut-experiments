@@ -20,6 +20,11 @@ from build_lut_ffn_output_v3_shared_coarse import (
     _TreeNode as _V3TreeNode,
     LUTGroup,
 )
+try:
+    from build_lut_ffn_output_v3_lowrank import apply_lowrank_correction
+except Exception:
+    def apply_lowrank_correction(*args, **kwargs):
+        raise RuntimeError("apply_lowrank_correction not available; is build_lut_ffn_output_v3_lowrank.py present?")
 
 # Allow loading V6 checkpoints built by build_lut_ffn_output.py across different
 # __main__ contexts. These classes are trusted because we built the checkpoints.
@@ -110,6 +115,20 @@ class V6ReplacementEngine:
         if not self.group_ids:
             raise FileNotFoundError(f"No replacement_g*.pt found in {checkpoint_dir}")
 
+        # Shared coarse address is needed for low-rank correction; take from first group
+        self.coarse_address = self.group_specs[self.group_ids[0]]["addresses"][0]
+
+        # Load optional per-coarse-leaf low-rank correction
+        self.lowrank_V = None
+        self.lowrank_A = None
+        lowrank_path = ckpt_dir / "lowrank.pt"
+        if lowrank_path.exists():
+            lr_ckpt = _load_v6_checkpoint(lowrank_path)
+            self.lowrank_V = lr_ckpt["lowrank_V"]
+            self.lowrank_A = lr_ckpt["lowrank_A"]
+            print(f"[V6Engine] Loaded lowrank correction: rank={self.lowrank_V.shape[1]}, "
+                  f"A shape={tuple(self.lowrank_A.shape)}")
+
         print(f"[V6Engine] loaded {len(self.group_ids)} groups from {ckpt_dir}: {self.group_ids}")
 
         if hook_path is None:
@@ -165,6 +184,11 @@ class V6ReplacementEngine:
 
             out[:, :, g_start:g_end] = pred.to(device=device, dtype=out.dtype)
 
+        # Apply per-coarse-leaf low-rank correction if available
+        if self.lowrank_V is not None:
+            correction = apply_lowrank_correction(x_3d, self.coarse_address, self.lowrank_V, self.lowrank_A)
+            out = out + correction.to(device=device, dtype=out.dtype)
+
         return out
 
     def lut_forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -198,11 +222,15 @@ class V6ReplacementEngine:
         return out
 
     def _relocate_tables_to_device(self, device: torch.device):
-        """Move all LUT tables and group means to the target device."""
+        """Move all LUT tables, group means, and low-rank params to the target device."""
         for spec in self.group_specs.values():
             spec["tables"] = [t.to(device) for t in spec["tables"]]
             if spec["group_mean"] is not None:
                 spec["group_mean"] = spec["group_mean"].to(device)
+        if self.lowrank_V is not None:
+            self.lowrank_V = self.lowrank_V.to(device)
+        if self.lowrank_A is not None:
+            self.lowrank_A = self.lowrank_A.to(device)
         self.device = device
         print(f"[V6Engine] Moved tables to {device}")
 

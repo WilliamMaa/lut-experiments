@@ -251,6 +251,9 @@ def load_real_teacher(teacher_weight_path: str, device: torch.device, module_pat
                 f"Extracted keys (first 20): {list(new_state.keys())[:20]}"
             )
 
+    # 过滤掉非 FFN 权重（如 shared_expert_gate.weight）
+    new_state = {k: v for k, v in new_state.items() if k in ("gate_proj.weight", "up_proj.weight", "down_proj.weight")}
+
     # 确定 hidden/intermediate：与 build_lut_ffn_output.py 保持一致，
     # gate_proj.weight shape 为 [intermediate_size, hidden_size]
     gate_key = next(k for k in new_state.keys() if "gate_proj" in k and "weight" in k)
