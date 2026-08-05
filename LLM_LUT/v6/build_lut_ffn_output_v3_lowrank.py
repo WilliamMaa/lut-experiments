@@ -500,15 +500,18 @@ def apply_lowrank_correction(x, coarse_address, V, A_table):
     if V is None or A_table is None:
         return 0.0
     orig_shape = x.shape
+    orig_dtype = x.dtype
     if x.dim() == 2:
         x = x.unsqueeze(0)
     B, S, hidden = x.shape
-    x_flat = x.reshape(B * S, hidden)
-    z = x_flat @ V  # [B*S, rank]
+    x_flat = x.reshape(B * S, hidden).float()
+    V_f = V.float()
+    A_f = A_table.float()
+    z = x_flat @ V_f  # [B*S, rank]
     leaf_ids = coarse_address.compute_indices(x).view(-1)  # [B*S]
-    A_ell = A_table[leaf_ids]  # [B*S, hidden, rank]
+    A_ell = A_f[leaf_ids]  # [B*S, hidden, rank]
     correction = torch.bmm(A_ell, z.unsqueeze(-1)).squeeze(-1)  # [B*S, hidden]
-    return correction.view(orig_shape)
+    return correction.view(orig_shape).to(dtype=orig_dtype)
 
 
 # =============================================================================
@@ -979,6 +982,9 @@ def main():
                       help="Learning rate for low-rank parameters.")
     parser.add_argument("--lowrank_freeze_V", action="store_true",
                       help="Freeze shared projection V after PCA initialization.")
+    parser.add_argument("--lowrank_loss_mode", type=str, default="multi",
+                        choices=["mse", "multi"],
+                        help="Loss mode for lowrank-only finetune.")
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -1241,24 +1247,50 @@ def main():
             n_samples = calib_x.shape[0]
             for epoch in range(args.lowrank_finetune_epochs):
                 perm = torch.randperm(n_samples)
-                epoch_loss = 0.0
+                epoch_metrics = {"loss": 0.0, "mse": 0.0, "cos": 0.0, "res_cos": 0.0, "norm_ratio": 0.0}
                 n_batches = 0
                 for start in range(0, n_samples, args.finetune_batch_size):
                     idx = perm[start:start + args.finetune_batch_size]
                     xb = calib_x[idx].to(device)
                     yb = calib_y[idx].to(device)
                     optimizer.zero_grad()
-                    pred_y = _predict_base(coarse_lut, coarse_address, residual_luts, residual_addresses,
-                                           xb, group_ids, args.group_size, device)
+                    with torch.no_grad():
+                        pred_y = _predict_base(coarse_lut, coarse_address, residual_luts, residual_addresses,
+                                               xb, group_ids, args.group_size, device)
                     pred_y = pred_y + apply_lowrank_correction(xb, coarse_address, lowrank_V, lowrank_A)
-                    loss = F.mse_loss(pred_y, yb)
+
+                    mse = F.mse_loss(pred_y, yb)
+                    cos_output = F.cosine_similarity(pred_y, yb, dim=-1).mean()
+                    pred_residual = xb + pred_y
+                    true_residual = xb + yb
+                    cos_residual = F.cosine_similarity(pred_residual, true_residual, dim=-1).mean()
+                    pred_norm = torch.norm(pred_y, dim=-1)
+                    true_norm = torch.norm(yb, dim=-1)
+                    log_norm_loss = (torch.log((pred_norm + 1e-6) / (true_norm + 1e-6)) ** 2).mean()
+
+                    if args.lowrank_loss_mode == "mse":
+                        loss = mse
+                    else:
+                        loss = (mse +
+                                args.finetune_cosine_alpha * (1 - cos_output) +
+                                args.finetune_residual_cosine_alpha * (1 - cos_residual) +
+                                args.finetune_norm_alpha * log_norm_loss)
+
                     loss.backward()
                     optimizer.step()
-                    epoch_loss += loss.item()
+                    epoch_metrics["loss"] += loss.item()
+                    epoch_metrics["mse"] += mse.item()
+                    epoch_metrics["cos"] += cos_output.item()
+                    epoch_metrics["res_cos"] += cos_residual.item()
+                    epoch_metrics["norm_ratio"] += (pred_norm / (true_norm + 1e-6)).mean().item()
                     n_batches += 1
                 scheduler.step()
                 if (epoch + 1) % 5 == 0 or epoch == 0:
-                    print(f"  epoch {epoch + 1}/{args.lowrank_finetune_epochs}: loss={epoch_loss/max(n_batches,1):.6e}")
+                    print(f"  epoch {epoch + 1}/{args.lowrank_finetune_epochs}: "
+                          f"loss={epoch_metrics['loss']/max(n_batches,1):.6e}, "
+                          f"cos={epoch_metrics['cos']/max(n_batches,1):.4f}, "
+                          f"res_cos={epoch_metrics['res_cos']/max(n_batches,1):.4f}, "
+                          f"norm_ratio={epoch_metrics['norm_ratio']/max(n_batches,1):.4f}")
 
     # Save final checkpoints
     save_dict = {

@@ -51,6 +51,12 @@ def load_v3_base(ckpt_dir: Path, hidden_size: int, group_size: int, device: torc
     if lowrank_V is not None:
         print(f"  loaded lowrank correction: rank={lowrank_V.shape[1]}, A shape={tuple(lowrank_A.shape)}")
 
+    pairwise_state = None
+    pairwise_path = ckpt_dir / "pairwise.pt"
+    if pairwise_path.exists():
+        pairwise_state = torch.load(pairwise_path, map_location="cpu", weights_only=False)
+        print(f"  loaded pairwise correction: pairs={pairwise_state['pairs']}, rank={pairwise_state['rank']}")
+
     residual_addresses = {}
     residual_luts = {}
     max_group = hidden_size // group_size
@@ -70,7 +76,7 @@ def load_v3_base(ckpt_dir: Path, hidden_size: int, group_size: int, device: torc
 
     group_ids = sorted(residual_luts.keys())
     print(f"  loaded coarse entries={coarse_address.num_entries}, groups={len(group_ids)}")
-    return coarse_address, coarse_lut, residual_addresses, residual_luts, lowrank_V, lowrank_A, group_ids
+    return coarse_address, coarse_lut, residual_addresses, residual_luts, lowrank_V, lowrank_A, pairwise_state, group_ids
 
 
 def main():
@@ -79,6 +85,8 @@ def main():
     parser.add_argument("--output_root", required=True)
     parser.add_argument("--group_size", type=int, default=64)
     parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--pairwise_path", type=str, default=None,
+                        help="Path to pairwise.pt. Default: v3_checkpoint_dir/pairwise.pt")
     args = parser.parse_args()
 
     device = torch.device(args.device)
@@ -95,9 +103,18 @@ def main():
     hidden_size = max_group * group_size
     print(f"Inferred hidden_size={hidden_size}, group_size={group_size}, num_groups={max_group}")
 
-    coarse_address, coarse_lut, residual_addresses, residual_luts, lowrank_V, lowrank_A, group_ids = load_v3_base(
+    coarse_address, coarse_lut, residual_addresses, residual_luts, lowrank_V, lowrank_A, pairwise_state, group_ids = load_v3_base(
         args.v3_checkpoint_dir, hidden_size, group_size, device
     )
+
+    if args.pairwise_path is not None:
+        pw_path = Path(args.pairwise_path)
+        if pw_path.exists():
+            pairwise_state = torch.load(pw_path, map_location="cpu", weights_only=False)
+            print(f"  loaded pairwise correction from {pw_path}")
+        else:
+            print(f"[Warning] pairwise_path not found: {pw_path}")
+            pairwise_state = None
 
     out_dir = Path(args.output_root)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -114,6 +131,11 @@ def main():
             "lowrank_rank": lowrank_V.shape[1],
         }, ckpt_out_dir / "lowrank.pt")
         print(f"  exported lowrank.pt (rank={lowrank_V.shape[1]})")
+
+    # Export optional pairwise correction
+    if pairwise_state is not None:
+        torch.save(pairwise_state, ckpt_out_dir / "pairwise.pt")
+        print(f"  exported pairwise.pt (pairs={pairwise_state['pairs']}, rank={pairwise_state['rank']})")
 
     for gid in group_ids:
         g_start = gid * group_size

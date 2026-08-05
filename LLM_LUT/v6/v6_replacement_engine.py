@@ -26,6 +26,13 @@ except Exception:
     def apply_lowrank_correction(*args, **kwargs):
         raise RuntimeError("apply_lowrank_correction not available; is build_lut_ffn_output_v3_lowrank.py present?")
 
+try:
+    from build_pairwise_correction_v3 import PairwiseCorrections, apply_pairwise_correction
+except Exception:
+    PairwiseCorrections = None
+    def apply_pairwise_correction(*args, **kwargs):
+        raise RuntimeError("apply_pairwise_correction not available; is build_pairwise_correction_v3.py present?")
+
 # Allow loading V6 checkpoints built by build_lut_ffn_output.py across different
 # __main__ contexts. These classes are trusted because we built the checkpoints.
 # Also allow v3 shared-coarse classes if the module is importable.
@@ -129,6 +136,26 @@ class V6ReplacementEngine:
             print(f"[V6Engine] Loaded lowrank correction: rank={self.lowrank_V.shape[1]}, "
                   f"A shape={tuple(self.lowrank_A.shape)}")
 
+        # Per-group residual addresses needed for pairwise correction
+        self.residual_addresses = {}
+        for gid in self.group_ids:
+            self.residual_addresses[gid] = self.group_specs[gid]["addresses"][1]
+
+        # Load optional factorized pairwise correction
+        self.pairwise_module = None
+        pairwise_path = ckpt_dir / "pairwise.pt"
+        if pairwise_path.exists():
+            pw_ckpt = _load_v6_checkpoint(pairwise_path)
+            pairs = pw_ckpt["pairs"]
+            num_leaves = pw_ckpt["num_leaves"]
+            rank = pw_ckpt["rank"]
+            hidden = pw_ckpt["hidden_size"]
+            self.pairwise_module = PairwiseCorrections(hidden, pairs, num_leaves, rank)
+            self.pairwise_module.load_state_dict(pw_ckpt["state_dict"])
+            if self.device is not None:
+                self.pairwise_module = self.pairwise_module.to(self.device)
+            print(f"[V6Engine] Loaded pairwise correction: pairs={pairs}, rank={rank}")
+
         print(f"[V6Engine] loaded {len(self.group_ids)} groups from {ckpt_dir}: {self.group_ids}")
 
         if hook_path is None:
@@ -188,6 +215,11 @@ class V6ReplacementEngine:
         if self.lowrank_V is not None:
             correction = apply_lowrank_correction(x_3d, self.coarse_address, self.lowrank_V, self.lowrank_A)
             out = out + correction.to(device=device, dtype=out.dtype)
+
+        # Apply factorized pairwise correction if available
+        if self.pairwise_module is not None:
+            pw_correction = apply_pairwise_correction(x_3d, self.residual_addresses, self.pairwise_module)
+            out = out + pw_correction.to(device=device, dtype=out.dtype)
 
         return out
 
