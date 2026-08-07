@@ -22,11 +22,14 @@ from transformers import AutoModelForCausalLM
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", required=True)
-    parser.add_argument("--layer_idx", type=int, required=True)
-    parser.add_argument("--output_path", required=True)
+    parser.add_argument("--layer_idx", type=int, action="append", required=True)
+    parser.add_argument("--output_path", type=str, action="append", required=True)
     parser.add_argument("--device_map", default="balanced_low_0")
     parser.add_argument("--torch_dtype", default="bfloat16")
     args = parser.parse_args()
+
+    if len(args.layer_idx) != len(args.output_path):
+        raise ValueError("Number of --layer_idx and --output_path must match")
 
     if args.device_map == "auto":
         raise ValueError("device_map='auto' forbidden. Use 'balanced_low_0' or explicit map.")
@@ -43,21 +46,23 @@ def main():
         trust_remote_code=True,
     )
 
-    # Extract shared_expert weights
-    layer = model.model.layers[args.layer_idx]
-    expert = layer.mlp.shared_expert
+    for layer_idx, output_path in zip(args.layer_idx, args.output_path):
+        # Extract shared_expert weights
+        layer = model.model.layers[layer_idx]
+        expert = layer.mlp.shared_expert
 
-    state_dict = expert.state_dict()
-    # Add shared_expert_gate if exists (the weighting gate)
-    gate_weight = getattr(layer.mlp, "shared_expert_gate", None)
-    if gate_weight is not None:
-        state_dict["shared_expert_gate.weight"] = gate_weight.weight.detach().cpu()
+        state_dict = expert.state_dict()
+        # Add shared_expert_gate if exists (the weighting gate)
+        gate_weight = getattr(layer.mlp, "shared_expert_gate", None)
+        if gate_weight is not None:
+            state_dict["shared_expert_gate.weight"] = gate_weight.weight.detach().cpu()
 
-    torch.save(state_dict, args.output_path)
-    print(f"\nSaved shared_expert layer {args.layer_idx} to {args.output_path}")
-    print("Keys:")
-    for k in state_dict.keys():
-        print(f"  {k}: {tuple(state_dict[k].shape)}")
+        torch.save(state_dict, output_path)
+        print(f"\nSaved shared_expert layer {layer_idx} to {output_path}")
+        print("Keys:")
+        for k in state_dict.keys():
+            print(f"  {k}: {tuple(state_dict[k].shape)}")
+
 
 
 if __name__ == "__main__":
