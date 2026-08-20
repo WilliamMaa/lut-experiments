@@ -99,7 +99,7 @@ python -u /home/u/mmy/build_lut_ffn_output_v3_shared_coarse.py \
   --group_size 64 --group_ids "0-31" \
   --coarse_num_bits 14 --residual_num_bits 16 \
   --tree_candidates 256 --tree_min_samples 4 --tree_max_samples 400000 \
-  --calib_size 1000000 --eval_size 100000 \
+  --calib_size 600000 --eval_size 50000 \
   --coarse_finetune_epochs 10 --residual_finetune_epochs 10 --finetune_epochs 50 \
   --finetune_loss_mode multi --device cuda:0 \
   > train_l38_v3_onpolicy.log 2>&1 &
