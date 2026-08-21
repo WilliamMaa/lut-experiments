@@ -7,7 +7,8 @@ Usage:
   cd LLM_LUT/v8
   python -u run_baseline_eval.py \
     --model_path /data/models/Qwen3.6-35B-A3B \
-    --eval_file eval.jsonl \
+    --eval_file /data/ppl_texts.jsonl \
+    --prompt_file /data/1000_prompts.jsonl \
     --max_eval_samples 128 \
     --max_new_tokens 256 \
     --device_map balanced_low_0 \

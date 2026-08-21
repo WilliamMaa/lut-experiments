@@ -48,7 +48,7 @@ from metrics import (
     measure_peak_memory_mb,
     reset_peak_memory_stats,
 )
-from prompts import DEFAULT_PROMPTS, load_eval_texts
+from prompts import DEFAULT_PROMPTS, load_eval_texts, load_prompts
 
 
 class EvalPatch:
@@ -275,7 +275,8 @@ def main():
 
     parser = argparse.ArgumentParser(description="v8 unified model-level baseline evaluation")
     parser.add_argument("--model_path", required=True, help="HuggingFace model name or local path")
-    parser.add_argument("--eval_file", default=None, help="JSONL/JSON/text file with eval sentences")
+    parser.add_argument("--eval_file", default=None, help="JSONL/JSON/text file with LONG texts for PPL evaluation")
+    parser.add_argument("--prompt_file", default=None, help="JSONL/JSON/text file with SHORT prompts for generation evaluation")
     parser.add_argument("--max_eval_samples", type=int, default=128)
     parser.add_argument("--max_new_tokens", type=int, default=128)
     parser.add_argument("--max_length", type=int, default=512)
@@ -287,11 +288,17 @@ def main():
     parser.add_argument("--prompt", action="append", default=None, help="Custom generation prompt; repeat for multiple")
     args = parser.parse_args()
 
-    prompts = args.prompt if args.prompt else DEFAULT_PROMPTS
+    if args.prompt_file:
+        prompts = load_prompts(args.prompt_file, args.max_eval_samples)
+    elif args.prompt:
+        prompts = args.prompt
+    else:
+        prompts = DEFAULT_PROMPTS
+
     if args.eval_file:
         texts = load_eval_texts(args.eval_file, args.max_eval_samples)
     else:
-        print("No --eval_file provided, using prompts for PPL")
+        print("No --eval_file provided, using prompts for PPL (noisy on short prompts)")
         texts = prompts[: args.max_eval_samples]
 
     evaluator = Evaluator(

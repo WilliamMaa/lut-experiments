@@ -5,7 +5,8 @@ Usage:
   cd LLM_LUT/v8
   python -u vqk/eval_vqk.py \
     --model_path /data/models/Qwen3.6-35B-A3B \
-    --eval_file /data/eval.jsonl \
+    --eval_file /data/ppl_texts.jsonl \
+    --prompt_file /data/1000_prompts.jsonl \
     --layer_idx 39 \
     --module_path self_attn.o_proj \
     --quant_method vqk \
@@ -24,14 +25,15 @@ import sys
 from pathlib import Path
 
 from common.evaluator import Evaluator
-from common.prompts import DEFAULT_PROMPTS, load_eval_texts
+from common.prompts import DEFAULT_PROMPTS, load_eval_texts, load_prompts
 from vqk.vqk_patch import VQKPatch
 
 
 def main():
     parser = argparse.ArgumentParser(description="VQK single-module model-level evaluation")
     parser.add_argument("--model_path", required=True)
-    parser.add_argument("--eval_file", default=None)
+    parser.add_argument("--eval_file", default=None, help="JSONL/text file with long texts for PPL evaluation")
+    parser.add_argument("--prompt_file", default=None, help="JSONL/text file with short prompts for generation evaluation")
     parser.add_argument("--layer_idx", type=int, default=39)
     parser.add_argument("--module_path", default="self_attn.o_proj")
     parser.add_argument("--quant_method", default="vqk", choices=["vqk", "int"])
@@ -48,11 +50,17 @@ def main():
     parser.add_argument("--prompt", action="append", default=None)
     args = parser.parse_args()
 
-    prompts = args.prompt if args.prompt else DEFAULT_PROMPTS
+    if args.prompt_file:
+        prompts = load_prompts(args.prompt_file, args.max_eval_samples)
+    elif args.prompt:
+        prompts = args.prompt
+    else:
+        prompts = DEFAULT_PROMPTS
+
     if args.eval_file:
         texts = load_eval_texts(args.eval_file, args.max_eval_samples)
     else:
-        print("No --eval_file provided, using prompts for PPL")
+        print("No --eval_file provided, using prompts for PPL (noisy on short prompts)")
         texts = prompts[: args.max_eval_samples]
 
     patch = VQKPatch(

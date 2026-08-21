@@ -114,12 +114,30 @@ cd LLM_LUT/v8/vqk
 # 编写 vqk_linear.py、standard_quant.py、vqk_patch.py、eval_vqk.py
 ```
 
-### 5.2 跑 BF16 baseline
+### 5.2 准备 PPL 评估文本（从 prompts 生成）
+
+如果你的 prompt 文件不是自然长文本（如 `candidate_prompts.jsonl`），**不要直接用它当 `--eval_file`算 PPL**。应该先让 baseline 模型从 prompt 续写一段，把 `prompt + continuation` 保存成 eval 文本：
+
+```bash
+python -u common/generate_eval_texts.py \
+  --model_path /data/models/Qwen3.6-35B-A3B \
+  --prompt_file /data/1000_prompts.jsonl \
+  --max_samples 128 \
+  --max_new_tokens 512 \
+  --device_map balanced_low_0 \
+  --torch_dtype bfloat16 \
+  --output_jsonl /data/v8_eval_texts.jsonl
+```
+
+这样 `--eval_file` 就是合适的 PPL 数据；`--prompt_file` 仍用于 generation 评估。
+
+### 5.3 跑 BF16 baseline
 
 ```bash
 python -u run_baseline_eval.py \
   --model_path /data/models/Qwen3.6-35B-A3B \
-  --eval_file /data/eval.jsonl \
+  --eval_file /data/v8_eval_texts.jsonl \
+  --prompt_file /data/1000_prompts.jsonl \
   --max_eval_samples 128 \
   --max_new_tokens 256 \
   --device_map balanced_low_0 \
@@ -128,12 +146,13 @@ python -u run_baseline_eval.py \
   --output_json results/vqk_b0_bf16.json
 ```
 
-### 5.3 跑 Standard INT8 / INT4 baseline
+### 5.4 跑 Standard INT8 / INT4 baseline
 
 ```bash
 python -u vqk/eval_vqk.py \
   --model_path /data/models/Qwen3.6-35B-A3B \
-  --eval_file /data/eval.jsonl \
+  --eval_file /data/v8_eval_texts.jsonl \
+  --prompt_file /data/1000_prompts.jsonl \
   --layer_idx 39 \
   --module_path self_attn.o_proj \
   --quant_method int \
@@ -147,7 +166,8 @@ python -u vqk/eval_vqk.py \
 
 python -u vqk/eval_vqk.py \
   --model_path /data/models/Qwen3.6-35B-A3B \
-  --eval_file /data/eval.jsonl \
+  --eval_file /data/v8_eval_texts.jsonl \
+  --prompt_file /data/1000_prompts.jsonl \
   --layer_idx 39 \
   --module_path self_attn.o_proj \
   --quant_method int \
@@ -160,13 +180,14 @@ python -u vqk/eval_vqk.py \
   --output_json results/vqk_b2_int4.json
 ```
 
-### 5.4 跑 VQK bit sweep（block=64）
+### 5.5 跑 VQK bit sweep（block=64）
 
 ```bash
 for bits in 8 6 4 3; do
   python -u vqk/eval_vqk.py \
     --model_path /data/models/Qwen3.6-35B-A3B \
-    --eval_file /data/eval.jsonl \
+    --eval_file /data/v8_eval_texts.jsonl \
+    --prompt_file /data/1000_prompts.jsonl \
     --layer_idx 39 \
     --module_path self_attn.o_proj \
     --quant_method vqk \
@@ -181,13 +202,14 @@ for bits in 8 6 4 3; do
 done
 ```
 
-### 5.5 跑 VQK block sweep（bits=4）
+### 5.6 跑 VQK block sweep（bits=4）
 
 ```bash
 for block in 32 128 256; do
   python -u vqk/eval_vqk.py \
     --model_path /data/models/Qwen3.6-35B-A3B \
-    --eval_file /data/eval.jsonl \
+    --eval_file /data/v8_eval_texts.jsonl \
+    --prompt_file /data/1000_prompts.jsonl \
     --layer_idx 39 \
     --module_path self_attn.o_proj \
     --quant_method vqk \

@@ -18,7 +18,11 @@ DEFAULT_PROMPTS = [
 
 
 def load_eval_texts(eval_file: str, max_samples: int):
-    """Load evaluation texts from JSONL / JSON / plain text."""
+    """Load evaluation texts from JSONL / JSON / plain text.
+
+    These texts are used to compute PPL.  Prefer longer passages over short
+    prompts because PPL on very short sequences is noisy.
+    """
     texts = []
     path = Path(eval_file)
     if not path.exists():
@@ -44,3 +48,36 @@ def load_eval_texts(eval_file: str, max_samples: int):
                 if len(texts) >= max_samples:
                     break
     return texts
+
+
+def load_prompts(prompt_file: str, max_samples: int):
+    """Load generation prompts from a JSONL / JSON / plain text file.
+
+    Each line should contain a prompt; accepted JSON fields are:
+        prompt / text / content / sentence
+    """
+    prompts = []
+    path = Path(prompt_file)
+    if not path.exists():
+        raise FileNotFoundError(f"prompt_file not found: {prompt_file}")
+    if path.suffix in (".jsonl", ".json"):
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                prompt = obj.get("prompt", obj.get("text", obj.get("content", obj.get("sentence", ""))))
+                if prompt:
+                    prompts.append(prompt)
+                if len(prompts) >= max_samples:
+                    break
+    else:
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    prompts.append(line)
+                if len(prompts) >= max_samples:
+                    break
+    return prompts

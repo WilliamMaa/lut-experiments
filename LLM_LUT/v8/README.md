@@ -66,15 +66,29 @@ result = ev.evaluate(
 
 ## 快速开始
 
-### 1. 跑基线
+### 1. 准备 PPL eval 文本
 
-所有 v8 脚本默认从 `LLM_LUT/v8/` 目录运行：
+如果只有 prompts（如 `candidate_prompts.jsonl`），先用 baseline 模型续写成长文本：
 
 ```bash
 cd LLM_LUT/v8
+python -u common/generate_eval_texts.py \
+  --model_path /data/models/Qwen3.6-35B-A3B \
+  --prompt_file /data/1000_prompts.jsonl \
+  --max_samples 128 \
+  --max_new_tokens 512 \
+  --device_map balanced_low_0 \
+  --torch_dtype bfloat16 \
+  --output_jsonl /data/v8_eval_texts.jsonl
+```
+
+### 2. 跑基线
+
+```bash
 python -u run_baseline_eval.py \
   --model_path /data/models/Qwen3.6-35B-A3B \
-  --eval_file eval.jsonl \
+  --eval_file /data/v8_eval_texts.jsonl \
+  --prompt_file /data/1000_prompts.jsonl \
   --max_eval_samples 128 \
   --max_new_tokens 256 \
   --device_map balanced_low_0 \
@@ -83,6 +97,6 @@ python -u run_baseline_eval.py \
   --output_json results/v8_baseline.json
 ```
 
-### 2. 实现 VQK / KV Cache patch
+### 3. 实现 VQK / KV Cache patch
 
 参考各子目录 README 实现一个 `EvalPatch` 子类，然后调用 `Evaluator.evaluate()`。
