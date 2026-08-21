@@ -9,7 +9,7 @@ A patch must implement:
 """
 
 from typing import Any, Dict
-from evaluator import EvalPatch
+from common.evaluator import EvalPatch
 
 
 class ExamplePatch(EvalPatch):

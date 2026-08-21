@@ -20,18 +20,9 @@ from build_lut_ffn_output_v3_shared_coarse import (
     _TreeNode as _V3TreeNode,
     LUTGroup,
 )
-try:
-    from build_lut_ffn_output_v3_lowrank import apply_lowrank_correction
-except Exception:
-    def apply_lowrank_correction(*args, **kwargs):
-        raise RuntimeError("apply_lowrank_correction not available; is build_lut_ffn_output_v3_lowrank.py present?")
+from build_lut_ffn_output_v3_lowrank import apply_lowrank_correction
 
-try:
-    from build_pairwise_correction_v3 import PairwiseCorrections, apply_pairwise_correction
-except Exception:
-    PairwiseCorrections = None
-    def apply_pairwise_correction(*args, **kwargs):
-        raise RuntimeError("apply_pairwise_correction not available; is build_pairwise_correction_v3.py present?")
+from build_pairwise_correction_v3 import PairwiseCorrections, apply_pairwise_correction
 
 # Allow loading V6 checkpoints built by build_lut_ffn_output.py across different
 # __main__ contexts. These classes are trusted because we built the checkpoints.

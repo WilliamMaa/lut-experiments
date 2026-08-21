@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 """Run a pure baseline model-level evaluation with the v8 framework.
 
 This is a thin wrapper around v8.common.evaluator.Evaluator with the NullPatch.

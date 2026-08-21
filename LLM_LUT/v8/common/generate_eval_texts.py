@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 """Generate evaluation texts from prompts using the baseline model.
 
 The produced JSONL can be used as --eval_file for v8 PPL evaluation.
@@ -22,8 +26,8 @@ from pathlib import Path
 
 import torch
 
-from utils import load_model_and_tokenizer
-from prompts import load_prompts
+from common.utils import load_model_and_tokenizer
+from common.prompts import load_prompts
 
 
 def main():

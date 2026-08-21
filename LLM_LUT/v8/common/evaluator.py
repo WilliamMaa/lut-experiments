@@ -39,8 +39,8 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from utils import load_model_and_tokenizer
-from metrics import (
+from common.utils import load_model_and_tokenizer
+from common.metrics import (
     compute_ppl,
     compute_logit_metrics,
     run_generation,
@@ -48,7 +48,7 @@ from metrics import (
     measure_peak_memory_mb,
     reset_peak_memory_stats,
 )
-from prompts import DEFAULT_PROMPTS, load_eval_texts, load_prompts
+from common.prompts import DEFAULT_PROMPTS, load_eval_texts, load_prompts
 
 
 class EvalPatch:
