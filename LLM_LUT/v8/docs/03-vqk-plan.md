@@ -1,6 +1,9 @@
 # VQK 评测计划（Layer 39 o_proj 首发）
 
-> 目标：验证 DSConv 风格的 VQK + block-wise KDS 在 Transformer Linear 上是否优于普通 INT quantization。
+> 目标：对 `layer39.self_attn.o_proj`，验证 VQK-style block-wise integer kernel + scale 是否能在相同 bit budget 下，比 RTN / standard INT4 更好地保持 PPL / logit KL / 生成质量。
+>
+> 当前阶段是 **weight representation 实验**：运行时先把 `W_q, S` 反量化成 BF16 再做普通 `Linear`，先验证表示质量，不直接承诺 INT4 GEMM 收益。
+>
 > 首轮只跑 `layer39.self_attn.o_proj` 的 bit/block sweep，快速拿到 go / no-go 决策。
 
 ---
@@ -20,11 +23,12 @@
 
 ## 1. 核心原则
 
-1. **先 o_proj，再 v_proj / down_proj**：`o_proj` 对 attention score 的影响是间接的，最适合做第一轮可行性测试。
-2. **关键是同 bit 对比**：核心问题不是 VQK vs BF16，而是 **VQK-4 vs INT4、VQK-3 vs INT3**。
+1. **先 o_proj，再 v_proj / down_proj**：`o_proj` 不直接修改 attention score，适合第一轮可行性测试；但 layer39 紧邻 logits，敏感度由实验决定，不是预设安全。
+2. **关键是同 bit 对比**：核心问题不是 VQK vs BF16，而是 **VQK-4 vs RTN INT4、VQK-3 vs RTN INT3**。
 3. **不看 local cosine，只看 PPL / generation / logit KL**：权重 MSE 和输出 cosine 只作辅助参考。
 4. **block size 必须 sweep**：32/64/128/256 都跑，不能只看一个 block。
 5. **patch 必须可逆**：`install()` 替换 Linear，`uninstall()` 恢复原模块，保证多次 eval 不互相污染。
+6. **当前阶段是 weight representation 实验**：不改动计算图，不承诺 INT4 GEMM 加速，只验证低 bit + block scale 表示是否优于 RTN。
 
 ---
 
@@ -65,24 +69,24 @@ y = (S * W_q) @ x
 
 ### 3.2 `standard_quant.py`
 
-- 用于生成 baseline：
+- 用于生成 RTN baseline：
   - `BF16`
-  - `INT8`（per-token / per-channel 都行，先选简单 per-token）
-  - `INT4`（同样 per-token）
+  - `RTN INT8`（per-channel symmetric round-to-nearest）
+  - `RTN INT4`（同上）
 
 ### 3.3 `vqk_patch.py`
 
 - `VQKPatch(EvalPatch)`：
-  - `__init__(layer_idx, module_path, bits, block_size)`
-  - `install(model)`：定位 module，替换为 `VQKLinear`
+  - `__init__(layer_idx, module_path, bits, block_size, quant_method)`
+  - `install(model)`：定位 module，替换为 `VQKLinear` 或 `StandardQuantLinear`
   - `uninstall(model)`：恢复原 `nn.Linear`
   - `name()` / `config()`
 
 ### 3.4 `eval_vqk.py`
 
-- 从命令行接收 `--layer_idx`、`--module_path`、`--bits`、`--block_size`。
+- 从命令行接收 `--layer_idx`、`--module_path`、`--bits`、`--block_size`、`--quant_method`。
 - 加载模型，构造 `VQKPatch`，调用 `Evaluator.evaluate()`。
-- 支持 `--quant_method {vqk, int}` 用于跑 standard INT baseline。
+- `--quant_method {vqk, int}`：跑 VQK 或 RTN INT baseline。
 
 ---
 
@@ -91,8 +95,8 @@ y = (S * W_q) @ x
 | ID | Method | Bits | Block | 目标模块 |
 |----|--------|------|-------|----------|
 | B0 | BF16 | 16 | — | layer39.o_proj |
-| B1 | Standard INT8 | 8 | — | layer39.o_proj |
-| B2 | Standard INT4 | 4 | — | layer39.o_proj |
+| B1 | RTN INT8 | 8 | — | layer39.o_proj |
+| B2 | RTN INT4 | 4 | — | layer39.o_proj |
 | V1 | VQK | 8 | 64 | layer39.o_proj |
 | V2 | VQK | 6 | 64 | layer39.o_proj |
 | V3 | VQK | 4 | 64 | layer39.o_proj |
@@ -146,7 +150,7 @@ python -u run_baseline_eval.py \
   --output_json results/vqk_b0_bf16.json
 ```
 
-### 5.4 跑 Standard INT8 / INT4 baseline
+### 5.4 跑 RTN INT8 / INT4 baseline
 
 ```bash
 python -u vqk/eval_vqk.py \
@@ -252,16 +256,18 @@ python -u vqk/summarize_vqk_results.py \
 
 | 情况 | 判断 | 行动 |
 |---|---|---|
-| VQK-4 block=64 PPL 明显优于 INT4 | **通过** | 扩展 block sweep，然后试 v_proj / down_proj |
-| VQK-4 与 INT4 持平或略差 | 无价值 | 停止 VQK 线，转向 KV Cache Compression |
-| VQK-4 优于 INT4 但 3-bit 崩 | 有价值但有限 | 只保留 4-bit，看是否能在更小 block 下进一步压缩 |
+| VQK-4 block=64 PPL 明显优于 RTN INT4 | **通过** | 扩展 block sweep，然后试 v_proj / down_proj |
+| VQK-4 与 RTN INT4 持平或略差 | 无价值 | 停止 VQK 线，转向 KV Cache Compression |
+| VQK-4 优于 RTN INT4 但 3-bit 崩 | 有价值但有限 | 只保留 4-bit，看是否能在更小 block 下进一步压缩 |
 | 所有 VQK PPL 都崩 | 不可用 | 停止 VQK 线 |
 
 继续 VQK 的**必要条件**（至少满足一条）：
 
-1. **同 bit 优势**：VQK-4 明显优于 INT4。
+1. **同 bit 优势**：VQK-4 明显优于 RTN INT4。
 2. **同质量优势**：相同 PPL 下 VQK 使用更少 bit。
-3. **多层鲁棒性**：多层量化时 VQK 退化小于普通量化。
+3. **多层鲁棒性**：多层量化时 VQK 退化小于 RTN。
+
+下一阶段（若 VQK-4 优于 RTN）：引入 AWQ / GPTQ 作为更强 baseline。
 
 ---
 
@@ -269,6 +275,6 @@ python -u vqk/summarize_vqk_results.py \
 
 1. 实现 `LLM_LUT/v8/vqk/vqk_linear.py`、`standard_quant.py`、`vqk_patch.py`、`eval_vqk.py`。
 2. 先跑 **B0（BF16 baseline）** 确认 eval 框架通顺。
-3. 跑 **B1/B2（INT8/INT4 baseline）** 拿到对比基准。
+3. 跑 **B1/B2（RTN INT8/INT4 baseline）** 拿到对比基准。
 4. 跑 **V1–V4（VQK bit sweep, block=64）**。
-5. 如果 VQK-4 优于 INT4，继续 **V5–V7（block sweep）**。
+5. 如果 VQK-4 优于 RTN INT4，继续 **V5–V7（block sweep）**。

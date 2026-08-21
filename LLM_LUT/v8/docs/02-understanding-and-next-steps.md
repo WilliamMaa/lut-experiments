@@ -6,7 +6,7 @@ v6 的核心任务（FFN 输出 LUT 化，尤其是 `layer39.shared_expert`）�
 
 | 路线 | 目标对象 | 核心问题 | 来源文档 |
 |------|----------|----------|----------|
-| **VQK-based Quantization** | Transformer Linear 权重 | 低 bit 下 VQK + block-wise KDS 是否优于普通 INT quantization？ | `01-ideas-about-proj.md` |
+| **VQK-based Quantization** | Transformer Linear 权重 | 低 bit 下 VQK + block-wise KDS 是否优于 RTN INT quantization？ | `01-ideas-about-proj.md` |
 | **KV Cache Compression** | Attention KV memory / bandwidth | 能否用量化、驱逐、learned codebook 显著降低 KV 开销，同时保留 attention 行为和长上下文能力？ | `00-ideas.md` |
 
 两条线共享同一个底层信念：
@@ -25,8 +25,8 @@ v6 的核心任务（FFN 输出 LUT 化，尤其是 `layer39.shared_expert`）�
   - `W_q`：2/3/4/6/8-bit 整数权重。
   - `S`：每个 block 一个 FP16/BF16 scale，block 沿 input dimension 划分。
 - **首轮目标模块**：先 `layer39.o_proj`，再 `v_proj` / `down_proj`，最后才碰 `q_proj` / `k_proj` / `gate_proj` / `up_proj`。
-- **第一轮实验矩阵**：B0（BF16）、B1（INT8）、B2（INT4）、V1–V7（VQK 8/6/4/3 bit + block 32/64/128/256）。
-- **关键对比**：不是 VQK vs BF16，而是 **VQK-4 vs INT4、VQK-3 vs INT3**。同 bit 下没优势就直接停止。
+- **第一轮实验矩阵**：B0（BF16）、B1（RTN INT8）、B2（RTN INT4）、V1–V7（VQK 8/6/4/3 bit + block 32/64/128/256）。
+- **关键对比**：不是 VQK vs BF16，而是 **VQK-4 vs RTN INT4、VQK-3 vs RTN INT3**。同 bit 下没优势就直接停止。
 - **后续升级**：activation-aware scale calibration → logit-aware calibration → 多层扩展 → VQK + activation quantization → bit-sliced / LUT arithmetic。
 
 ### 2.2 KV Cache Compression 线
@@ -64,7 +64,7 @@ v6 的核心任务（FFN 输出 LUT 化，尤其是 `layer39.shared_expert`）�
 原因：
 - 思路直接，实现量相对可控（一层 Linear 的替换 + scale 搜索）。
 - 只要跑 `layer39.o_proj` 的 bit/block sweep，就能在一两天内得到"VQK 是否值得做"的决策依据。
-- 失败成本低；如果 VQK-4 不如 INT4，可以立刻停掉。
+- 失败成本低；如果 VQK-4 不如 RTN INT4，可以立刻停掉。
 
 第一步具体动作：
 1. 在 `LLM_LUT/v8/` 下创建 `vqk/` 子目录。
@@ -74,7 +74,7 @@ v6 的核心任务（FFN 输出 LUT 化，尤其是 `layer39.shared_expert`）�
    - 支持 bit={8,6,4,3,2}，block={32,64,128,256}，默认 L2 initialization 求 scale。
 3. 写一个 `apply_vqk_to_model.py` 工具：把指定 module（如 `model.model.layers[39].self_attn.o_proj`）替换成 VQK 版本。
 4. 复用 v6 的模型级 eval 入口跑 B0/B1/B2 + V1–V7。
-5. 输出对比表：同 bit 下 VQK vs standard INT 的 PPL、logit KL、generation score。
+5. 输出对比表：同 bit 下 VQK vs RTN INT 的 PPL、logit KL、generation score。
 
 ### 4.2 建议 B：同时启动 KV Cache Compression Phase 0
 
@@ -106,7 +106,7 @@ Phase 0: 统一模型级 eval framework
 
 | 风险 | 影响 | 应对 |
 |------|------|------|
-| VQK-4 不如普通 INT4 | 直接停止 VQK 线 | 第一阶段就设好决策标准 |
+| VQK-4 不如 RTN INT4 | 直接停止 VQK 线 | 第一阶段就设好决策标准 |
 | KV 量化到 2-bit 时 PPL 崩掉 | 说明当前模型对 KV 精度敏感，后续重点转向 eviction / codebook | 记录 baseline 曲线即可 |
 | 模型级 eval 太慢 | 影响迭代速度 | 先用小 eval 集（128 samples / 2048 tokens），后续再补全 benchmark |
 | 自动多卡分配死锁 | 违反项目红线 | 所有加载必须显式指定 `device` 或 `device_map`，严禁 `device_map="auto"` |

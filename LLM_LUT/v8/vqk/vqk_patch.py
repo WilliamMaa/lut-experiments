@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""VQK EvalPatch implementation for v8 unified evaluator."""
+"""VQK / RTN INT EvalPatch implementation for v8 unified evaluator."""
 
 from typing import Any, Dict
 
@@ -11,13 +11,13 @@ from .standard_quant import StandardQuantLinear
 
 
 class VQKPatch(EvalPatch):
-    """Replace a single Transformer Linear with VQK or standard INT quantization.
+    """Replace a single Transformer Linear with VQK or RTN INT quantization.
 
     Args:
         layer_idx: layer index in model.model.layers
         module_path: attribute path within the layer, e.g. "self_attn.o_proj"
         bits: quantization bit width
-        block_size: VQK block size along input dimension; ignored for standard INT
+        block_size: VQK block size along input dimension; ignored for RTN INT
         quant_method: "vqk" or "int"
     """
 

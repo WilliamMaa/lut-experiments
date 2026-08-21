@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Standard INT quantization baseline for VQK comparison.
+"""RTN (Round-To-Nearest) INT quantization baseline for VQK comparison.
 
 Implements per-channel symmetric round-to-nearest quantization.
 """
