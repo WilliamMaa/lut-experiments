@@ -108,8 +108,8 @@ class VQKLinear(nn.Module):
         w_q = self.weight_q.view(out_features, num_blocks, self.block_size)
         # scales: (num_blocks,) -> broadcast to (out_features, num_blocks, block_size)
         s = self.scales.view(1, num_blocks, 1).to(dtype)
-        w_hat = w_q.float() * s
-        return w_hat.view(out_features, in_features).to(dtype)
+        w_hat = w_q.to(dtype) * s
+        return w_hat.view(out_features, in_features)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w_hat = self.get_dequantized_weight(x.dtype)

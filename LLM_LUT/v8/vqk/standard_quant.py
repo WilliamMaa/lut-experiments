@@ -47,7 +47,7 @@ class StandardQuantLinear(nn.Module):
 
     def get_dequantized_weight(self, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         s = self.scales.view(-1, 1).to(dtype)
-        return self.weight_q.float() * s
+        return self.weight_q.to(dtype) * s
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         w_hat = self.get_dequantized_weight(x.dtype)
