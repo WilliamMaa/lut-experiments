@@ -110,8 +110,9 @@ class IntegerVQKLinear(nn.Module):
             # s_x: (*, 1) -> (*, 1, 1)
             s_x_b = s_x.to(x.dtype).unsqueeze(-1)
         elif self.activation_mode == "per-token-per-block":
-            # s_x: (*, num_blocks) -> (*, num_blocks, 1)
-            s_x_b = s_x.to(x.dtype).unsqueeze(-1)
+            # s_x: (*, num_blocks, 1) is already broadcastable against
+            # acc (*, num_blocks, out_features) on the last dim.
+            s_x_b = s_x.to(x.dtype)
         else:
             raise ValueError(f"Unknown activation mode: {self.activation_mode}")
 
