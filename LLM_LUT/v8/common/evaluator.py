@@ -70,6 +70,10 @@ class EvalPatch:
         """Configuration dict to include in the output JSON."""
         return {}
 
+    def storage_stats(self) -> Dict[str, Any]:
+        """Optional storage / arithmetic statistics from the patch."""
+        return {}
+
 
 class NullPatch(EvalPatch):
     """No-op patch; useful for running a pure baseline eval."""
@@ -169,6 +173,9 @@ class Evaluator:
         patch.install(self.student)
         if verbose:
             print("\n[Patched] patch installed")
+        storage_stats = patch.storage_stats()
+        if storage_stats and verbose:
+            print(f"  Storage stats: {storage_stats}")
 
         # ---- Patched evaluation ----
         if verbose:
@@ -256,6 +263,7 @@ class Evaluator:
                 ),
             },
             "logit_metrics": logit_metrics,
+            "storage_stats": storage_stats,
         }
 
         if output_json:
