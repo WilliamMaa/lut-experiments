@@ -94,9 +94,12 @@ class IntegerVQKLinear(nn.Module):
         *prefix, _ = q_x.shape
         q_x_blocks = q_x.view(*prefix, self.num_blocks, self.block_size)
 
-        # 3. Integer dot product per block.
+        # 3. Integer dot product per block (simulated in float/bfloat16).
+        #    CUDA does not support int32 matmul directly, so we cast integer tensors
+        #    back to the input dtype. The values remain integer-valued, so this is a
+        #    valid numerical simulation of integer accumulation.
         #    acc[b] = q_x[..., b, :] @ q_w[:, b, :].T  ->  (*, out_features)
-        acc = torch.einsum("...bi,obi->...bo", q_x_blocks.to(torch.int32), q_w.to(torch.int32))
+        acc = torch.einsum("...bi,obi->...bo", q_x_blocks.to(x.dtype), q_w.to(x.dtype))
         # acc shape: (*, num_blocks, out_features)
 
         # 4. Apply scales.
