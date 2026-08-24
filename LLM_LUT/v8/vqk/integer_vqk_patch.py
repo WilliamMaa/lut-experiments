@@ -45,6 +45,7 @@ class IntegerVQKPatch(EvalPatch):
         self._parent: nn.Module = None
         self._attr_name: str = None
         self._replacement: IntegerVQKLinear = None
+        self._cached_storage_stats: Dict[str, Any] = {}
 
     def _resolve(self, model: nn.Module):
         layer = model.model.layers[self.layer_idx]
@@ -71,6 +72,8 @@ class IntegerVQKPatch(EvalPatch):
             activation_mode=self.activation_mode,
         )
         setattr(self._parent, self._attr_name, self._replacement)
+        # Cache storage stats at install time so they survive uninstall().
+        self._cached_storage_stats = self._replacement.get_weight_storage_stats()
 
     def uninstall(self, model: nn.Module) -> None:
         if self._parent is not None and self._attr_name is not None:
@@ -97,8 +100,12 @@ class IntegerVQKPatch(EvalPatch):
             "activation_mode": self.activation_mode,
         }
 
-    def get_storage_stats(self, scale_bits: int = 16) -> Dict[str, Any]:
-        """Return storage statistics for the replaced module."""
-        if self._replacement is None:
-            return {}
-        return self._replacement.get_weight_storage_stats(scale_bits)
+    def storage_stats(self, scale_bits: int = 16) -> Dict[str, Any]:
+        """Return storage statistics for the replaced module.
+
+        Uses cached stats computed at install() time so the numbers are still
+        available after the patch is uninstalled.
+        """
+        if self._replacement is not None:
+            self._cached_storage_stats = self._replacement.get_weight_storage_stats(scale_bits)
+        return self._cached_storage_stats
