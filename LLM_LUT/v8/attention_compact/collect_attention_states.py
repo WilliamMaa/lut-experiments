@@ -31,6 +31,36 @@ from common.utils import load_model_and_tokenizer
 from common.prompts import load_eval_texts
 
 
+def _find_attention_module(layer):
+    """Auto-detect the attention submodule name in a decoder layer."""
+    for name in ("self_attn", "attn", "self_attention", "attention"):
+        if hasattr(layer, name):
+            return name, getattr(layer, name)
+    raise AttributeError(
+        f"Cannot find attention module in {type(layer).__name__}. "
+        f"Available attrs: {[n for n in dir(layer) if not n.startswith('_')]}."
+    )
+
+
+def _find_projections(attn):
+    """Auto-detect Q/K/V/O projection names in an attention module."""
+    q_names = ["q_proj", "q", "query_proj", "query"]
+    k_names = ["k_proj", "k", "key_proj", "key"]
+    v_names = ["v_proj", "v", "value_proj", "value"]
+    o_names = ["o_proj", "out_proj", "output_proj", "dense", "o"]
+
+    def find(names):
+        for n in names:
+            if hasattr(attn, n):
+                return n, getattr(attn, n)
+        raise AttributeError(
+            f"Cannot find projection in {type(attn).__name__}. "
+            f"Tried {names}; available: {[n for n in dir(attn) if not n.startswith('_')]}."
+        )
+
+    return find(q_names), find(k_names), find(v_names), find(o_names)
+
+
 class AttentionStateCollector:
     """Hook attention projections and attention output in selected layers."""
 
@@ -39,15 +69,25 @@ class AttentionStateCollector:
         self.layers = layers
         self.hooks = []
         self._buffers = {l: {} for l in layers}
+        self._layer_info = {}
         self._register_hooks()
 
     def _register_hooks(self):
         for layer_idx in self.layers:
             layer = self.model.model.layers[layer_idx]
+            attn_name, attn = _find_attention_module(layer)
+            q_info, k_info, v_info, o_info = _find_projections(attn)
+            self._layer_info[layer_idx] = {
+                "attn_name": attn_name,
+                "q_name": q_info[0],
+                "k_name": k_info[0],
+                "v_name": v_info[0],
+                "o_name": o_info[0],
+            }
+            print(f"  Layer {layer_idx}: using {attn_name}.{q_info[0]}/{k_info[0]}/{v_info[0]}/{o_info[0]}")
 
             def make_input_hook(layer_idx):
                 def hook(module, inputs, output):
-                    # inputs is a tuple; first element is hidden_states
                     x = inputs[0]
                     self._buffers[layer_idx]["residual_input"] = x.detach().cpu()
                 return hook
@@ -69,17 +109,16 @@ class AttentionStateCollector:
 
             def make_attn_hook(layer_idx):
                 def hook(module, inputs, output):
-                    # For Qwen3-5-MoE, self_attn returns (attn_output, attn_weights)
                     attn_output = output[0] if isinstance(output, tuple) else output
                     self._buffers[layer_idx]["attention_output"] = attn_output.detach().cpu()
                 return hook
 
-            # Capture residual input at self_attn entry.
-            self.hooks.append(layer.self_attn.register_forward_pre_hook(make_input_hook(layer_idx)))
-            self.hooks.append(layer.self_attn.q_proj.register_forward_hook(make_q_hook(layer_idx)))
-            self.hooks.append(layer.self_attn.k_proj.register_forward_hook(make_k_hook(layer_idx)))
-            self.hooks.append(layer.self_attn.v_proj.register_forward_hook(make_v_hook(layer_idx)))
-            self.hooks.append(layer.self_attn.register_forward_hook(make_attn_hook(layer_idx)))
+            # Capture residual input at attention entry.
+            self.hooks.append(attn.register_forward_pre_hook(make_input_hook(layer_idx)))
+            self.hooks.append(q_info[1].register_forward_hook(make_q_hook(layer_idx)))
+            self.hooks.append(k_info[1].register_forward_hook(make_k_hook(layer_idx)))
+            self.hooks.append(v_info[1].register_forward_hook(make_v_hook(layer_idx)))
+            self.hooks.append(attn.register_forward_hook(make_attn_hook(layer_idx)))
 
     def remove(self):
         for h in self.hooks:
