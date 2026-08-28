@@ -48,8 +48,11 @@ def quantize_per_block_symmetric(
     )
     num_blocks = in_features // block_size
     w_blocks = weight.view(out_features, num_blocks, block_size)
-    # One scale per input block: max abs over (out_features, block_size).
-    max_abs = w_blocks.abs().max(dim=2, keepdim=True).values.max(dim=0, keepdim=True).values.clamp_min(1e-8)
+    # Per-output-channel max per block, then mean across output channels.
+    # This matches the VQK/DSConv-style per-block scale to avoid a single
+    # outlier channel blowing up the entire block's scale.
+    max_abs_per_channel = w_blocks.abs().max(dim=2, keepdim=True).values  # (out_features, num_blocks, 1)
+    max_abs = max_abs_per_channel.mean(dim=0, keepdim=True).clamp_min(1e-8)  # (1, num_blocks, 1)
     scales = (max_abs / qmax).squeeze()  # (num_blocks,)
     w_q = torch.clamp(torch.round(w_blocks / scales.view(1, num_blocks, 1) * qmax), -qmax, qmax).to(torch.int8)
     w_q = w_q.view(out_features, in_features)
