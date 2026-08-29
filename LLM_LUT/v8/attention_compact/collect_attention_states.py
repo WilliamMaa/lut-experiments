@@ -33,7 +33,7 @@ from common.prompts import load_eval_texts
 
 def _find_attention_module(layer):
     """Auto-detect the attention submodule name in a decoder layer."""
-    for name in ("self_attn", "attn", "self_attention", "attention"):
+    for name in ("self_attn", "attn", "self_attention", "attention", "linear_attn"):
         if hasattr(layer, name):
             return name, getattr(layer, name)
     raise AttributeError(
