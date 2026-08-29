@@ -48,7 +48,8 @@ def _low_rank_error_for_stack(stack, rank):
     U_r = U[..., :rank]
     S_r = S[..., :rank]
     Vh_r = Vh[..., :rank, :]
-    approx = U_r * S_r.unsqueeze(-1) @ Vh_r
+    # Scale columns of U by singular values: S_r shape (..., rank) -> (..., 1, rank)
+    approx = (U_r * S_r.unsqueeze(-2)) @ Vh_r
     return _relative_frobenius_error(x, approx)
 
 
