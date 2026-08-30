@@ -39,6 +39,19 @@ def _relative_error(a, b, eps=1e-12):
     return (diff / denom).squeeze(-1).squeeze(-1)
 
 
+def _apply_qk_norm(q, k, eps=1e-6):
+    """Match the official GDN kernel's use_qk_l2norm_in_kernel behavior exactly.
+
+    The kernel only scales query by 1/sqrt(head_dim); key is only l2-normalized.
+    """
+    q_inv_norm = torch.rsqrt((q * q).sum(dim=-1, keepdim=True) + eps)
+    k_inv_norm = torch.rsqrt((k * k).sum(dim=-1, keepdim=True) + eps)
+    q = q * q_inv_norm
+    k = k * k_inv_norm
+    scale = 1.0 / (q.shape[-1] ** 0.5)
+    return q * scale, k
+
+
 def _dense_update_step(S, q, k, v, g, beta):
     """Single-token GDN update using dense state.
 
@@ -48,6 +61,7 @@ def _dense_update_step(S, q, k, v, g, beta):
         v, out: (B, H, V)
         g, beta: (B, H)
     """
+    q, k = _apply_qk_norm(q, k)
     decay = g.exp().unsqueeze(-1).unsqueeze(-1)  # (B, H, 1, 1)
     S_decayed = S * decay
     # kv_mem = k^T S -> (B, H, V)
@@ -65,6 +79,7 @@ def _factorized_update_step(U, V, q, k, v, g, beta, return_dense=False):
     V: (B, H, V, r)
     Returns new U, V. Optionally returns dense S_new for comparison.
     """
+    q, k = _apply_qk_norm(q, k)
     B, H, K, r = U.shape
     V_dim = V.shape[2]
     decay = g.exp().unsqueeze(-1).unsqueeze(-1)  # (B, H, 1, 1)
@@ -102,6 +117,17 @@ def _factorized_update_step(U, V, q, k, v, g, beta, return_dense=False):
         S_new = U_new @ V_new.transpose(-2, -1)
         return U_new, V_new, out, S_new
     return U_new, V_new, out
+
+
+def _squeeze_decode(t):
+    """Drop the singleton sequence dimension from collected step tensors."""
+    if t is None:
+        return None
+    if t.ndim == 4 and t.shape[1] == 1:
+        return t.squeeze(1)
+    if t.ndim == 3 and t.shape[1] == 1:
+        return t.squeeze(1)
+    return t
 
 
 def _factorize(S, rank):
@@ -163,6 +189,7 @@ def _real_experiment(step_data_path, rank):
     errs_S = []
     errs_out = []
     errs_S_accum = []
+    errs_S_dense_teacher = []
 
     # Use first step's S_in as initial state, factorize it.
     S0 = data[0]["S_in"]
@@ -172,13 +199,13 @@ def _real_experiment(step_data_path, rank):
 
     S_dense = S0
     for i, step in enumerate(data):
-        q = step["q"]
-        k = step["k"]
-        v = step["v"]
-        g = step["g"]
-        beta = step["beta"]
+        q = _squeeze_decode(step["q"])
+        k = _squeeze_decode(step["k"])
+        v = _squeeze_decode(step["v"])
+        g = _squeeze_decode(step["g"])
+        beta = _squeeze_decode(step["beta"])
         S_dense_teacher = step["S_out"]
-        out_teacher = step["out"]
+        out_teacher = _squeeze_decode(step["out"])
 
         if S_dense_teacher is None or out_teacher is None:
             continue
@@ -189,6 +216,7 @@ def _real_experiment(step_data_path, rank):
         errs_S.append(_relative_error(S_dense_teacher, S_low).mean().item())
         errs_out.append(_relative_error(out_teacher, out_low).mean().item())
         errs_S_accum.append(_relative_error(S_dense, S_low).mean().item())
+        errs_S_dense_teacher.append(_relative_error(S_dense_teacher, S_dense).mean().item())
 
     return {
         "mode": "real",
@@ -200,9 +228,12 @@ def _real_experiment(step_data_path, rank):
         "max_rel_err_out": max(errs_out),
         "mean_rel_err_S_accum": sum(errs_S_accum) / len(errs_S_accum),
         "max_rel_err_S_accum": max(errs_S_accum),
+        "mean_rel_err_S_dense_teacher": sum(errs_S_dense_teacher) / len(errs_S_dense_teacher),
+        "max_rel_err_S_dense_teacher": max(errs_S_dense_teacher),
         "final_rel_err_S": errs_S[-1],
         "final_rel_err_out": errs_out[-1],
         "final_rel_err_S_accum": errs_S_accum[-1],
+        "final_rel_err_S_dense_teacher": errs_S_dense_teacher[-1],
     }
 
 
