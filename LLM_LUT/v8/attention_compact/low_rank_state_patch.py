@@ -84,13 +84,16 @@ class LowRankStatePatch(EvalPatch):
     def install(self, model: torch.nn.Module) -> None:
         from transformers.cache_utils import LinearAttentionLayer
 
-        self._orig_init = LinearAttentionLayer.__init__
-        self._orig_update = LinearAttentionLayer.update_recurrent_state
-        self._orig_reset = LinearAttentionLayer.reset
+        orig_init = LinearAttentionLayer.__init__
+        orig_update = LinearAttentionLayer.update_recurrent_state
+        orig_reset = LinearAttentionLayer.reset
+        self._orig_init = orig_init
+        self._orig_update = orig_update
+        self._orig_reset = orig_reset
         rank = self.rank
 
         def new_init(self, *args, **kwargs):
-            self._orig_init(self, *args, **kwargs)
+            orig_init(self, *args, **kwargs)
             self.recurrent_states = LowRankStateContainer(
                 rank, list(self.recurrent_states.keys()), self.dtype, self.device
             )
