@@ -36,9 +36,9 @@ class FixedBasisStatePatch(GDNReplacementPatch):
     def config(self) -> Dict[str, Any]:
         return {"layer_idx": self.layer_idx, "rank": self.rank}
 
-    def _get_basis(self, K: int, device, dtype):
+    def _get_basis(self, K: int, device):
         if self._basis is None or self._K != K:
-            B = torch.randn(K, self.rank, device=device, dtype=dtype)
+            B = torch.randn(K, self.rank, device=device, dtype=torch.float32)
             B = B / (B.norm(dim=0, keepdim=True) + 1e-12)
             self._basis = B
             self._K = K
@@ -47,16 +47,16 @@ class FixedBasisStatePatch(GDNReplacementPatch):
     def init_state(self, S0: torch.Tensor):
         # S0: (B, H, K, V)
         B, H, K, V = S0.shape
-        basis = self._get_basis(K, S0.device, S0.dtype)
+        basis = self._get_basis(K, S0.device)
         # Project S onto basis: C = B^T S, shape (B, H, r, V)
-        C = torch.matmul(basis.t(), S0)  # (B, H, r, V)
+        C = torch.matmul(basis.t(), S0.float())  # (B, H, r, V)
         return {"C": C}
 
     def step(self, q, k, v, g, beta, state):
         # q,k: (B,H,K); v,y: (B,H,V); g,beta: (B,H); C: (B,H,r,V)
         C = state["C"]
         K = k.shape[-1]
-        B = self._get_basis(K, C.device, C.dtype)
+        B = self._get_basis(K, C.device)
         # Project keys/queries: (B,H,K) @ (K,r) -> (B,H,r)
         k_proj = torch.matmul(k, B)
         q_proj = torch.matmul(q, B)
@@ -82,7 +82,7 @@ class FixedBasisStatePatch(GDNReplacementPatch):
     def final_state(self, state) -> torch.Tensor:
         # Reconstruct dense S = B @ C for cache compatibility.
         C = state["C"]
-        B = self._get_basis(self._K, C.device, C.dtype)
+        B = self._get_basis(self._K, C.device)
         return torch.matmul(B, C)  # (B,H,K,V)
 
     def storage_stats(self) -> Dict[str, Any]:

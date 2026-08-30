@@ -211,3 +211,141 @@ def reset_peak_memory_stats():
     if torch.cuda.is_available():
         for i in range(torch.cuda.device_count()):
             torch.cuda.reset_peak_memory_stats(i)
+
+
+def _logits_for_trajectory(model, tokenizer, input_ids, attention_mask, traj):
+    """Force-feed a fixed token trajectory and collect per-step next-token logits.
+
+    traj: 1-D tensor of token ids (length T).
+    Returns logits of shape (T, vocab_size). Logits[t] is the distribution over
+    the token at position t given the prefix (prompt + traj[:t]).
+    """
+    model.eval()
+    with torch.no_grad():
+        # Prefill.
+        out = model(
+            input_ids,
+            attention_mask=attention_mask,
+            use_cache=True,
+            past_key_values=None,
+        )
+        past_key_values = out.past_key_values
+        logits = [out.logits[:, -1, :]]  # distribution for traj[0]
+
+        for i in range(len(traj) - 1):
+            token = traj[i].unsqueeze(0).unsqueeze(0)
+            out = model(
+                token,
+                use_cache=True,
+                past_key_values=past_key_values,
+            )
+            past_key_values = out.past_key_values
+            logits.append(out.logits[:, -1, :])
+
+    return torch.cat(logits, dim=0)  # (T, vocab_size)
+
+
+def compute_decode_divergence_metrics(
+    teacher_model,
+    student_model,
+    tokenizer,
+    prompts,
+    device,
+    max_new_tokens: int = 128,
+    temperature: float = 1.0,
+):
+    """Fixed-trajectory decode divergence metrics.
+
+    1. Greedy-generate a fixed trajectory from the teacher.
+    2. Force both teacher and student to consume the exact same trajectory.
+    3. Compare next-token distributions at every decode step.
+
+    Returns:
+        avg_decode_kl: mean KL(student || teacher) per decode position.
+        decode_top1_agreement: fraction where argmax matches.
+        decode_top5_agreement: fraction where top-5 sets overlap.
+        avg_teacher_greedy_token_prob_under_student: mean probability the student
+            assigns to the teacher's greedy token.
+        total_decode_positions: total number of positions evaluated.
+    """
+    teacher_model.eval()
+    student_model.eval()
+
+    all_kl = []
+    all_top1_match = []
+    all_top5_match = []
+    all_teacher_token_probs = []
+    total_positions = 0
+
+    with torch.no_grad():
+        for prompt in prompts:
+            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+            input_ids = inputs["input_ids"].to(device)
+            attention_mask = inputs.get("attention_mask")
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+
+            # 1. Fixed trajectory from teacher greedy decoding.
+            gen_ids = teacher_model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=tokenizer.pad_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
+            prompt_len = input_ids.shape[1]
+            traj = gen_ids[0, prompt_len:]
+            if traj.numel() == 0:
+                continue
+
+            # 2. Both models consume the same trajectory.
+            teacher_logits = _logits_for_trajectory(
+                teacher_model, tokenizer, input_ids, attention_mask, traj
+            )
+            student_logits = _logits_for_trajectory(
+                student_model, tokenizer, input_ids, attention_mask, traj
+            )
+
+            # 3. Compare distributions.
+            teacher_logp = F.log_softmax(teacher_logits / temperature, dim=-1)
+            student_logp = F.log_softmax(student_logits / temperature, dim=-1)
+            teacher_p = torch.exp(teacher_logp)
+
+            kl = (teacher_p * (teacher_logp - student_logp)).sum(dim=-1)
+            all_kl.extend(kl.tolist())
+
+            teacher_top1 = teacher_logits.argmax(dim=-1)
+            student_top1 = student_logits.argmax(dim=-1)
+            all_top1_match.extend((teacher_top1 == student_top1).tolist())
+
+            teacher_top5 = teacher_logits.topk(5, dim=-1).indices
+            student_top5 = student_logits.topk(5, dim=-1).indices
+            for t in range(traj.shape[0]):
+                if len(set(teacher_top5[t].tolist()) & set(student_top5[t].tolist())) > 0:
+                    all_top5_match.append(1)
+                else:
+                    all_top5_match.append(0)
+
+            student_p = torch.exp(student_logp)
+            teacher_token_probs = student_p[torch.arange(traj.shape[0]), traj]
+            all_teacher_token_probs.extend(teacher_token_probs.tolist())
+
+            total_positions += traj.shape[0]
+
+    if total_positions == 0:
+        return {
+            "avg_decode_kl": float("inf"),
+            "decode_top1_agreement": 0.0,
+            "decode_top5_agreement": 0.0,
+            "avg_teacher_greedy_token_prob_under_student": 0.0,
+            "total_decode_positions": 0,
+        }
+
+    return {
+        "avg_decode_kl": sum(all_kl) / len(all_kl),
+        "decode_top1_agreement": sum(all_top1_match) / len(all_top1_match),
+        "decode_top5_agreement": sum(all_top5_match) / len(all_top5_match),
+        "avg_teacher_greedy_token_prob_under_student": sum(all_teacher_token_probs) / len(all_teacher_token_probs),
+        "total_decode_positions": total_positions,
+    }

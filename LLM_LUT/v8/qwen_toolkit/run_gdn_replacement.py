@@ -29,10 +29,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.evaluator import Evaluator
 from common.prompts import load_eval_texts, load_prompts
 from qwen_toolkit.patches.fixed_basis_state_patch import FixedBasisStatePatch
+from qwen_toolkit.patches.double_basis_state_patch import DoubleBasisStatePatch
+from qwen_toolkit.patches.atom_state_patch import AtomStatePatch
+from qwen_toolkit.patches.block_transition_lut_patch import BlockTransitionLUTPatch
 
 
 PATCH_REGISTRY = {
     "fixed_basis": FixedBasisStatePatch,
+    "double_basis": DoubleBasisStatePatch,
+    "atom": AtomStatePatch,
+    "block_vq": BlockTransitionLUTPatch,
 }
 
 
@@ -41,6 +47,11 @@ def main():
     parser.add_argument("--patch", required=True, choices=list(PATCH_REGISTRY.keys()))
     parser.add_argument("--layer_idx", type=int, default=20)
     parser.add_argument("--rank", type=int, default=32)
+    parser.add_argument("--rank_k", type=int, default=32)
+    parser.add_argument("--rank_v", type=int, default=32)
+    parser.add_argument("--num_atoms", type=int, default=512)
+    parser.add_argument("--block_size", type=int, default=16)
+    parser.add_argument("--num_codes", type=int, default=256)
     parser.add_argument("--model_path", required=True)
     parser.add_argument("--eval_file", required=True)
     parser.add_argument("--prompt_file", required=True)
@@ -59,6 +70,12 @@ def main():
     patch_cls = PATCH_REGISTRY[args.patch]
     if args.patch == "fixed_basis":
         patch = patch_cls(layer_idx=args.layer_idx, rank=args.rank)
+    elif args.patch == "double_basis":
+        patch = patch_cls(layer_idx=args.layer_idx, rank_k=args.rank_k, rank_v=args.rank_v)
+    elif args.patch == "atom":
+        patch = patch_cls(layer_idx=args.layer_idx, num_atoms=args.num_atoms)
+    elif args.patch == "block_vq":
+        patch = patch_cls(layer_idx=args.layer_idx, block_size=args.block_size, num_codes=args.num_codes)
     else:
         patch = patch_cls(layer_idx=args.layer_idx)
 

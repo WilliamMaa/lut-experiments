@@ -45,6 +45,7 @@ from common.metrics import (
     compute_logit_metrics,
     run_generation,
     compute_generation_metrics,
+    compute_decode_divergence_metrics,
     measure_peak_memory_mb,
     reset_peak_memory_stats,
 )
@@ -142,6 +143,15 @@ class Evaluator:
         """Run baseline and patched evaluation, return structured results."""
         prompts = prompts if prompts is not None else DEFAULT_PROMPTS
 
+        # GDN replacement patches intercept the recurrent decode path and therefore
+        # need independent teacher/student instances to compare unpatched vs patched
+        # decode distributions. This requires logit_metrics=True.
+        if hasattr(patch, "verify_decode_calls") and self.student is self.teacher:
+            raise RuntimeError(
+                "GDN replacement patches require logit_metrics=True so that teacher and student "
+                "are independent model instances. Re-run with --logit_metrics."
+            )
+
         print(f"\n{'='*60}")
         print(f"Evaluating patch: {patch.name()}")
         print(f"  eval samples: {len(texts)}")
@@ -195,6 +205,32 @@ class Evaluator:
             print(f"  EOS success rate: {patched_gen_metrics['eos_success_rate']:.2%}")
             print(f"  Avg output length: {patched_gen_metrics['avg_output_length']:.1f}")
             print(f"  Repetition rate: {patched_gen_metrics['repetition_rate']:.2%}")
+
+        # ---- Runtime assertion: decode replacement path was hit ----
+        # The first generated token for each prompt comes from the prefill logits,
+        # so the number of decode forward calls is total_output_length - num_prompts.
+        expected_decode_calls = sum(g["output_length"] for g in patched_gen) - len(patched_gen)
+        if hasattr(patch, "verify_decode_calls"):
+            patch.verify_decode_calls(expected_decode_calls)
+            if verbose:
+                print(f"  Decode replacement calls verified: {expected_decode_calls}")
+
+        # ---- Fixed-trajectory decode divergence metrics ----
+        if verbose:
+            print("\n[Decode divergence] fixed-trajectory decode metrics ...")
+        decode_metrics = compute_decode_divergence_metrics(
+            self.teacher,
+            self.student,
+            self.tokenizer,
+            prompts,
+            self.teacher_device,
+            max_new_tokens=max_new_tokens,
+        )
+        if verbose:
+            print(f"  Avg decode KL: {decode_metrics['avg_decode_kl']:.6f}")
+            print(f"  Decode top-1 agreement: {decode_metrics['decode_top1_agreement']:.2%}")
+            print(f"  Decode top-5 agreement: {decode_metrics['decode_top5_agreement']:.2%}")
+            print(f"  Teacher greedy token prob under student: {decode_metrics['avg_teacher_greedy_token_prob_under_student']:.4f}")
 
         # ---- Logit-level functional metrics ----
         logit_metrics = {}
@@ -262,6 +298,7 @@ class Evaluator:
                     patched_gen_metrics["repetition_rate"] - baseline_gen_metrics["repetition_rate"], 6
                 ),
             },
+            "decode_metrics": decode_metrics,
             "logit_metrics": logit_metrics,
             "storage_stats": storage_stats,
         }

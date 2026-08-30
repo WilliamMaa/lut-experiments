@@ -32,13 +32,13 @@ def _l2norm(x, eps=1e-6):
 
 
 def _prepare_gdn_inputs(query, key, value, g, beta):
-    """Squeeze singleton sequence dim and apply the official q/k normalization."""
+    """Squeeze singleton sequence dim, normalize q/k, and cast to float32."""
     # Inputs arrive as [B, seq_len=1, H, D]; squeeze to [B, H, D].
-    q = query.squeeze(1)
-    k = key.squeeze(1)
-    v = value.squeeze(1)
-    g = g.squeeze(1)
-    beta = beta.squeeze(1)
+    q = query.squeeze(1).float()
+    k = key.squeeze(1).float()
+    v = value.squeeze(1).float()
+    g = g.squeeze(1).float()
+    beta = beta.squeeze(1).float()
 
     # Official kernel normalization: l2norm + query scaled by 1/sqrt(head_dim).
     q = _l2norm(q) / (q.shape[-1] ** 0.5)
@@ -53,6 +53,7 @@ class GDNReplacementPatch(EvalPatch):
         self.layer_idx = layer_idx
         self._orig_fn = None
         self._state = None
+        self.decode_calls = 0
 
     # ----- subclass interface -----
 
@@ -103,7 +104,9 @@ class GDNReplacementPatch(EvalPatch):
                     **kwargs,
                 )
 
+            original_dtype = query.dtype
             q, k, v, g, beta = _prepare_gdn_inputs(query, key, value, g, beta)
+            self_model.decode_calls += 1
 
             if self_model._state is None:
                 if initial_state is None:
@@ -115,7 +118,9 @@ class GDNReplacementPatch(EvalPatch):
 
             final = self_model.final_state(new_state) if output_final_state else None
             # Output expected as [B, seq_len=1, H, V].
-            output = output.unsqueeze(1)
+            output = output.unsqueeze(1).to(original_dtype)
+            if final is not None:
+                final = final.to(original_dtype)
             return output, final
 
         layer.linear_attn.recurrent_gated_delta_rule = replacement
@@ -126,3 +131,15 @@ class GDNReplacementPatch(EvalPatch):
             layer.linear_attn.recurrent_gated_delta_rule = self._orig_fn
             self._orig_fn = None
         self._state = None
+        self.decode_calls = 0
+
+    def verify_decode_calls(self, expected: int) -> None:
+        """Runtime assertion: the replacement path must have been hit exactly
+        `expected` times during generation. Raises RuntimeError otherwise.
+        """
+        actual = self.decode_calls
+        if actual != expected:
+            raise RuntimeError(
+                f"{self.name()}: expected {expected} decode replacement calls, got {actual}. "
+                "The patch did not intercept the recurrent decode path as expected."
+            )
