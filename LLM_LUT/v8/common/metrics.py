@@ -119,20 +119,36 @@ def compute_logit_metrics(
     }
 
 
-def run_generation(model, tokenizer, prompts, device, max_new_tokens: int = 128):
-    """Run generation for a list of prompts and collect outputs + basic stats."""
+def run_generation(
+    model,
+    tokenizer,
+    prompts,
+    device,
+    max_new_tokens: int = 128,
+    cache_factory=None,
+):
+    """Run generation for a list of prompts and collect outputs + basic stats.
+
+    cache_factory: optional callable(device) -> Cache, used to provide a custom
+    KV cache (e.g. quantized cache) for each prompt.
+    """
     model.eval()
     results = []
     for prompt in prompts:
         inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
         inputs = {k: v.to(device) for k, v in inputs.items()}
+        gen_kwargs = {
+            "max_new_tokens": max_new_tokens,
+            "do_sample": False,
+            "pad_token_id": tokenizer.pad_token_id,
+            "eos_token_id": tokenizer.eos_token_id,
+        }
+        if cache_factory is not None:
+            gen_kwargs["past_key_values"] = cache_factory(device)
         with torch.no_grad():
             output_ids = model.generate(
                 **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
+                **gen_kwargs,
             )
         generated_ids = output_ids[0][inputs["input_ids"].shape[1]:]
         generated = tokenizer.decode(generated_ids, skip_special_tokens=True)

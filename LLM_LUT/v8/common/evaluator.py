@@ -172,7 +172,11 @@ class Evaluator:
         if verbose:
             print(f"  Baseline PPL: {baseline_ppl:.4f}  ({baseline_ppl_time:.1f}s)")
             print("\n[Baseline] running generation ...")
-        baseline_gen = run_generation(self.teacher, self.tokenizer, prompts, self.teacher_device, max_new_tokens)
+        baseline_cache_factory = getattr(patch, "get_baseline_cache", None)
+        baseline_gen = run_generation(
+            self.teacher, self.tokenizer, prompts, self.teacher_device, max_new_tokens,
+            cache_factory=baseline_cache_factory,
+        )
         baseline_gen_metrics = compute_generation_metrics(baseline_gen)
         if verbose:
             print(f"  EOS success rate: {baseline_gen_metrics['eos_success_rate']:.2%}")
@@ -199,7 +203,11 @@ class Evaluator:
         if verbose:
             print(f"  Patched PPL: {patched_ppl:.4f}  ({patched_ppl_time:.1f}s)")
             print("\n[Patched] running generation ...")
-        patched_gen = run_generation(self.student, self.tokenizer, prompts, self.student_device, max_new_tokens)
+        patched_cache_factory = getattr(patch, "get_cache", None)
+        patched_gen = run_generation(
+            self.student, self.tokenizer, prompts, self.student_device, max_new_tokens,
+            cache_factory=patched_cache_factory,
+        )
         patched_gen_metrics = compute_generation_metrics(patched_gen)
         if verbose:
             print(f"  EOS success rate: {patched_gen_metrics['eos_success_rate']:.2%}")
