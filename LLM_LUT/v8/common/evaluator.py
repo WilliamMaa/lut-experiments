@@ -173,9 +173,13 @@ class Evaluator:
             print(f"  Baseline PPL: {baseline_ppl:.4f}  ({baseline_ppl_time:.1f}s)")
             print("\n[Baseline] running generation ...")
         baseline_cache_factory = getattr(patch, "get_baseline_cache", None)
+        baseline_cache_kwargs = {}
+        if baseline_cache_factory is not None and hasattr(self.teacher, "config"):
+            baseline_cache_kwargs["config"] = self.teacher.config
         baseline_gen = run_generation(
             self.teacher, self.tokenizer, prompts, self.teacher_device, max_new_tokens,
             cache_factory=baseline_cache_factory,
+            cache_kwargs=baseline_cache_kwargs,
         )
         baseline_gen_metrics = compute_generation_metrics(baseline_gen)
         if verbose:
@@ -204,9 +208,13 @@ class Evaluator:
             print(f"  Patched PPL: {patched_ppl:.4f}  ({patched_ppl_time:.1f}s)")
             print("\n[Patched] running generation ...")
         patched_cache_factory = getattr(patch, "get_cache", None)
+        patched_cache_kwargs = {}
+        if patched_cache_factory is not None and hasattr(self.student, "config"):
+            patched_cache_kwargs["config"] = self.student.config
         patched_gen = run_generation(
             self.student, self.tokenizer, prompts, self.student_device, max_new_tokens,
             cache_factory=patched_cache_factory,
+            cache_kwargs=patched_cache_kwargs,
         )
         patched_gen_metrics = compute_generation_metrics(patched_gen)
         if verbose:

@@ -22,7 +22,7 @@ class KVCachePatch(EvalPatch):
     def storage_stats(self) -> Dict[str, Any]:
         return {}
 
-    def get_cache(self, device):
+    def get_cache(self, device, config=None):
         """Return a fresh cache instance for one generation."""
         raise NotImplementedError
 
@@ -48,8 +48,8 @@ class KIVICachePatch(KVCachePatch):
     def config(self) -> Dict[str, Any]:
         return {"k_bits": self.k_bits, "v_bits": self.v_bits}
 
-    def get_cache(self, device):
-        return KIVICache(k_bits=self.k_bits, v_bits=self.v_bits).to(device)
+    def get_cache(self, device, config=None):
+        return KIVICache(k_bits=self.k_bits, v_bits=self.v_bits, config=config).to(device)
 
     def storage_stats(self) -> Dict[str, Any]:
         # Qwen full-attention: 2 KV heads, head_dim=256, 10 full-attention layers.

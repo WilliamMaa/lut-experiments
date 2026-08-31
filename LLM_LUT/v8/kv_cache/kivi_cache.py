@@ -13,69 +13,75 @@ from kv_cache.kv_quantizers import (
 
 
 class KIVICache(DynamicCache):
-    """DynamicCache that stores quantized K/V.
+    """DynamicCache that stores quantized K/V for standard attention layers.
 
     K is quantized per-channel (min/max over token dim for each head/channel).
     V is quantized per-token (min/max over channel dim for each head/token).
-    On get(), the tensors are dequantized back to the original dtype.
-
-    This is a simplified implementation: after each update, the entire cached
-    tensor for that layer is re-quantized using fresh scales. It is sufficient
-    for measuring end-to-end quality; a production version would update scales
-    incrementally.
+    Linear attention / GDN layers are left untouched (original DynamicCache behavior).
     """
 
-    def __init__(self, k_bits=4, v_bits=4, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, k_bits=4, v_bits=4, config=None):
+        # Initialize DynamicCache with the model config so that layer types
+        # (attention / linear_attention) match the model's structure.
+        super().__init__(config=config)
         self.k_bits = k_bits
         self.v_bits = v_bits
         self._k_meta = {}  # layer_idx -> (scale, zero_point)
         self._v_meta = {}  # layer_idx -> (scale, zero_point)
 
     def update(self, key_states, value_states, layer_idx, *args, **kwargs):
-        """Append new key/value states, then re-quantize the full layer cache."""
-        # Append original values to raw cache first.
-        if layer_idx >= len(self._key_cache):
-            self._key_cache.append(key_states)
-            self._value_cache.append(value_states)
+        """Append new key/value states, re-quantize the full layer, return dequantized tensors."""
+        # Ensure the layer exists (same logic as DynamicCache.update).
+        if self.layer_class_to_replicate is not None:
+            while len(self.layers) <= layer_idx:
+                self.layers.append(self.layer_class_to_replicate())
+
+        # Only quantize standard attention layers. GDN / linear attention layers keep full precision.
+        if layer_idx < len(self.layers) and getattr(self.layers[layer_idx], "_layer_type", "attention") != "attention":
+            return super().update(key_states, value_states, layer_idx, *args, **kwargs)
+
+        layer = self.layers[layer_idx]
+
+        if layer.keys is None or not layer.is_initialized:
+            # First update for this layer.
+            full_k = key_states
+            full_v = value_states
         else:
-            self._key_cache[layer_idx] = torch.cat(
-                [self._key_cache[layer_idx], key_states], dim=-2
-            )
-            self._value_cache[layer_idx] = torch.cat(
-                [self._value_cache[layer_idx], value_states], dim=-2
-            )
+            # Dequantize existing cached states if they have been quantized before.
+            if layer_idx in self._k_meta:
+                old_k = dequantize_per_channel(layer.keys, *self._k_meta[layer_idx])
+                old_v = dequantize_per_token(layer.values, *self._v_meta[layer_idx])
+            else:
+                old_k = layer.keys
+                old_v = layer.values
+
+            # Concatenate with new states.
+            full_k = torch.cat([old_k, key_states], dim=-2)
+            full_v = torch.cat([old_v, value_states], dim=-2)
 
         if self.k_bits >= 16 or self.v_bits >= 16:
-            # No quantization; keep raw tensors.
-            return self
+            layer.keys = full_k
+            layer.values = full_v
+            return full_k, full_v
 
         # Re-quantize the full layer using current min/max.
-        k = self._key_cache[layer_idx]
-        v = self._value_cache[layer_idx]
-        qk, s_k, z_k = quantize_per_channel(k, self.k_bits)
-        qv, s_v, z_v = quantize_per_token(v, self.v_bits)
-        self._key_cache[layer_idx] = qk
-        self._value_cache[layer_idx] = qv
+        qk, s_k, z_k = quantize_per_channel(full_k, self.k_bits)
+        qv, s_v, z_v = quantize_per_token(full_v, self.v_bits)
+        layer.keys = qk
+        layer.values = qv
         self._k_meta[layer_idx] = (s_k, z_k)
         self._v_meta[layer_idx] = (s_v, z_v)
-        return self
 
-    def get(self, layer_idx, *args, **kwargs):
-        """Return dequantized K/V for attention computation."""
-        if self.k_bits >= 16 or self.v_bits >= 16:
-            return super().get(layer_idx, *args, **kwargs)
-        qk = self._key_cache[layer_idx]
-        qv = self._value_cache[layer_idx]
-        s_k, z_k = self._k_meta[layer_idx]
-        s_v, z_v = self._v_meta[layer_idx]
-        k = dequantize_per_channel(qk, s_k, z_k)
-        v = dequantize_per_token(qv, s_v, z_v)
-        return k, v
+        # Return dequantized tensors for attention computation.
+        return dequantize_per_channel(qk, s_k, z_k), dequantize_per_token(qv, s_v, z_v)
 
     def to(self, device):
-        """Move metadata to device. Raw uint8 tensors are moved by base class."""
-        super().to(device)
+        """Move cache tensors and quantization metadata to device."""
+        for layer in self.layers:
+            if hasattr(layer, "keys") and layer.keys is not None:
+                layer.keys = layer.keys.to(device)
+            if hasattr(layer, "values") and layer.values is not None:
+                layer.values = layer.values.to(device)
         for layer_idx in self._k_meta:
             s_k, z_k = self._k_meta[layer_idx]
             s_v, z_v = self._v_meta[layer_idx]

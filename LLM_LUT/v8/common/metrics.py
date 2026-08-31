@@ -126,13 +126,16 @@ def run_generation(
     device,
     max_new_tokens: int = 128,
     cache_factory=None,
+    cache_kwargs=None,
 ):
     """Run generation for a list of prompts and collect outputs + basic stats.
 
-    cache_factory: optional callable(device) -> Cache, used to provide a custom
-    KV cache (e.g. quantized cache) for each prompt.
+    cache_factory: optional callable(device, **cache_kwargs) -> Cache, used to
+    provide a custom KV cache (e.g. quantized cache) for each prompt.
     """
     model.eval()
+    if cache_kwargs is None:
+        cache_kwargs = {}
     results = []
     for prompt in prompts:
         inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
@@ -144,7 +147,7 @@ def run_generation(
             "eos_token_id": tokenizer.eos_token_id,
         }
         if cache_factory is not None:
-            gen_kwargs["past_key_values"] = cache_factory(device)
+            gen_kwargs["past_key_values"] = cache_factory(device, **cache_kwargs)
         with torch.no_grad():
             output_ids = model.generate(
                 **inputs,
