@@ -232,21 +232,25 @@ def reset_peak_memory_stats():
             torch.cuda.reset_peak_memory_stats(i)
 
 
-def _logits_for_trajectory(model, tokenizer, input_ids, attention_mask, traj):
+def _logits_for_trajectory(model, tokenizer, input_ids, attention_mask, traj, cache_factory=None, cache_kwargs=None):
     """Force-feed a fixed token trajectory and collect per-step next-token logits.
 
     traj: 1-D tensor of token ids (length T).
+    cache_factory: optional callable(device, **cache_kwargs) -> Cache for the first prefill.
     Returns logits of shape (T, vocab_size). Logits[t] is the distribution over
     the token at position t given the prefix (prompt + traj[:t]).
     """
     model.eval()
+    if cache_kwargs is None:
+        cache_kwargs = {}
     with torch.no_grad():
-        # Prefill.
+        # Prefill with custom cache if provided.
+        initial_cache = cache_factory(input_ids.device, **cache_kwargs) if cache_factory is not None else None
         out = model(
             input_ids,
             attention_mask=attention_mask,
             use_cache=True,
-            past_key_values=None,
+            past_key_values=initial_cache,
         )
         past_key_values = out.past_key_values
         logits = [out.logits[:, -1, :]]  # distribution for traj[0]
@@ -272,6 +276,8 @@ def compute_decode_divergence_metrics(
     device,
     max_new_tokens: int = 128,
     temperature: float = 1.0,
+    student_cache_factory=None,
+    student_cache_kwargs=None,
 ):
     """Fixed-trajectory decode divergence metrics.
 
@@ -323,7 +329,9 @@ def compute_decode_divergence_metrics(
                 teacher_model, tokenizer, input_ids, attention_mask, traj
             )
             student_logits = _logits_for_trajectory(
-                student_model, tokenizer, input_ids, attention_mask, traj
+                student_model, tokenizer, input_ids, attention_mask, traj,
+                cache_factory=student_cache_factory,
+                cache_kwargs=student_cache_kwargs,
             )
 
             # 3. Compare distributions.

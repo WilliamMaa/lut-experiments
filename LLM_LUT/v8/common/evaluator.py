@@ -241,6 +241,8 @@ class Evaluator:
             prompts,
             self.teacher_device,
             max_new_tokens=max_new_tokens,
+            student_cache_factory=patched_cache_factory,
+            student_cache_kwargs=patched_cache_kwargs,
         )
         if verbose:
             print(f"  Avg decode KL: {decode_metrics['avg_decode_kl']:.6f}")

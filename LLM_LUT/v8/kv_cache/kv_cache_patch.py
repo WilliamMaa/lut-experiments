@@ -8,6 +8,7 @@ from typing import Any, Dict
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.evaluator import EvalPatch
 from kv_cache.kivi_cache import KIVICache
+from kv_cache.retention_cache import RetentionCache
 
 
 class KVCachePatch(EvalPatch):
@@ -52,18 +53,53 @@ class KIVICachePatch(KVCachePatch):
         return KIVICache(k_bits=self.k_bits, v_bits=self.v_bits, config=config).to(device)
 
     def storage_stats(self) -> Dict[str, Any]:
-        # Qwen full-attention: 2 KV heads, head_dim=256, 10 full-attention layers.
-        # Per token: 2 heads * 256 dim * (k_bits + v_bits) / 8 bytes.
         kv_heads = 2
         head_dim = 256
         full_attn_layers = 10
         bytes_per_token = kv_heads * head_dim * (self.k_bits + self.v_bits) / 8
-        bf16_bytes_per_token = kv_heads * head_dim * 4  # bf16 = 2 bytes each for K and V
+        bf16_bytes_per_token = kv_heads * head_dim * 4
         return {
             "kv_bits": self.k_bits + self.v_bits,
             "bytes_per_token": bytes_per_token,
             "bf16_bytes_per_token": bf16_bytes_per_token,
             "compression_ratio": bf16_bytes_per_token / bytes_per_token,
             "estimated_128k_context_bytes": bytes_per_token * 128000 * full_attn_layers,
+            "estimated_128k_context_bf16_bytes": bf16_bytes_per_token * 128000 * full_attn_layers,
+        }
+
+
+class RetentionCachePatch(KVCachePatch):
+    """Retention-based KV cache: keep sink + recent tokens."""
+
+    def __init__(self, max_cache_len: int = 512, sink_tokens: int = 4):
+        self.max_cache_len = max_cache_len
+        self.sink_tokens = sink_tokens
+
+    def name(self) -> str:
+        return f"retention_l{self.max_cache_len}_s{self.sink_tokens}"
+
+    def config(self) -> Dict[str, Any]:
+        return {"max_cache_len": self.max_cache_len, "sink_tokens": self.sink_tokens}
+
+    def get_cache(self, device, config=None):
+        return RetentionCache(
+            max_cache_len=self.max_cache_len,
+            sink_tokens=self.sink_tokens,
+            config=config,
+        ).to(device)
+
+    def storage_stats(self) -> Dict[str, Any]:
+        kv_heads = 2
+        head_dim = 256
+        full_attn_layers = 10
+        bf16_bytes_per_token = kv_heads * head_dim * 4
+        effective_bytes_per_token = bf16_bytes_per_token * (self.max_cache_len / 128000)
+        return {
+            "max_cache_len": self.max_cache_len,
+            "sink_tokens": self.sink_tokens,
+            "bf16_bytes_per_token": bf16_bytes_per_token,
+            "effective_bytes_per_token_128k": effective_bytes_per_token,
+            "compression_ratio": bf16_bytes_per_token / effective_bytes_per_token,
+            "estimated_128k_context_bytes": self.max_cache_len * bf16_bytes_per_token * full_attn_layers,
             "estimated_128k_context_bf16_bytes": bf16_bytes_per_token * 128000 * full_attn_layers,
         }

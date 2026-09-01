@@ -10,11 +10,12 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.evaluator import Evaluator
 from common.prompts import load_eval_texts, load_prompts
-from kv_cache.kv_cache_patch import KIVICachePatch
+from kv_cache.kv_cache_patch import KIVICachePatch, RetentionCachePatch
 
 
 PATCH_REGISTRY = {
     "kivi": KIVICachePatch,
+    "retention": RetentionCachePatch,
 }
 
 
@@ -23,6 +24,8 @@ def main():
     parser.add_argument("--patch", required=True, choices=list(PATCH_REGISTRY.keys()))
     parser.add_argument("--k_bits", type=int, default=4)
     parser.add_argument("--v_bits", type=int, default=4)
+    parser.add_argument("--max_cache_len", type=int, default=512)
+    parser.add_argument("--sink_tokens", type=int, default=4)
     parser.add_argument("--model_path", required=True)
     parser.add_argument("--eval_file", required=True)
     parser.add_argument("--prompt_file", required=True)
@@ -39,7 +42,12 @@ def main():
     prompts = load_prompts(args.prompt_file, args.max_eval_samples)
 
     patch_cls = PATCH_REGISTRY[args.patch]
-    patch = patch_cls(k_bits=args.k_bits, v_bits=args.v_bits)
+    if args.patch == "kivi":
+        patch = patch_cls(k_bits=args.k_bits, v_bits=args.v_bits)
+    elif args.patch == "retention":
+        patch = patch_cls(max_cache_len=args.max_cache_len, sink_tokens=args.sink_tokens)
+    else:
+        patch = patch_cls()
 
     print(f"Running patch: {patch.name()}")
     print(f"Config: {patch.config()}")
