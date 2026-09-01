@@ -13,7 +13,7 @@ class RetentionCache(DynamicCache):
 
     def __init__(self, max_cache_len=512, sink_tokens=4, config=None):
         super().__init__(config=config)
-        self.max_cache_len = max_cache_len
+        self.retention_max_cache_len = max_cache_len
         self.sink_tokens = sink_tokens
 
     def update(self, key_states, value_states, layer_idx, *args, **kwargs):
@@ -32,8 +32,8 @@ class RetentionCache(DynamicCache):
         values = torch.cat([layer.values, value_states], dim=-2)
 
         total_len = keys.shape[-2]
-        if total_len > self.max_cache_len:
-            keep_recent = self.max_cache_len - self.sink_tokens
+        if total_len > self.retention_max_cache_len:
+            keep_recent = self.retention_max_cache_len - self.sink_tokens
             sink_keys = keys[..., : self.sink_tokens, :]
             sink_values = values[..., : self.sink_tokens, :]
             recent_keys = keys[..., -keep_recent:, :]
