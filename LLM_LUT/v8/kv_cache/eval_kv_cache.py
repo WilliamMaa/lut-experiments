@@ -30,6 +30,7 @@ def main():
     parser.add_argument("--eval_file", required=True)
     parser.add_argument("--prompt_file", required=True)
     parser.add_argument("--max_eval_samples", type=int, default=64)
+    parser.add_argument("--min_prompt_length", type=int, default=0)
     parser.add_argument("--max_new_tokens", type=int, default=128)
     parser.add_argument("--max_length", type=int, default=512)
     parser.add_argument("--device_map", default="balanced_low_0")
@@ -38,8 +39,14 @@ def main():
     parser.add_argument("--output_json", required=True)
     args = parser.parse_args()
 
-    texts = load_eval_texts(args.eval_file, args.max_eval_samples)
-    prompts = load_prompts(args.prompt_file, args.max_eval_samples)
+    texts = load_eval_texts(
+        args.eval_file, args.max_eval_samples,
+        min_length=args.min_prompt_length, sort_by_length=args.min_prompt_length > 0,
+    )
+    prompts = load_prompts(
+        args.prompt_file, args.max_eval_samples,
+        min_length=args.min_prompt_length, sort_by_length=args.min_prompt_length > 0,
+    )
 
     patch_cls = PATCH_REGISTRY[args.patch]
     if args.patch == "kivi":

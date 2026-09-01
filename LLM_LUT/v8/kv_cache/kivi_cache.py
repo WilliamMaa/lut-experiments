@@ -48,6 +48,16 @@ class KIVICache(DynamicCache):
             full_k = key_states
             full_v = value_states
         else:
+            # Align cached tensors with incoming states (multi-GPU device_map safety).
+            if layer.keys.device != key_states.device:
+                layer.keys = layer.keys.to(key_states.device)
+                layer.values = layer.values.to(key_states.device)
+                if layer_idx in self._k_meta:
+                    s_k, z_k = self._k_meta[layer_idx]
+                    s_v, z_v = self._v_meta[layer_idx]
+                    self._k_meta[layer_idx] = (s_k.to(key_states.device), z_k.to(key_states.device))
+                    self._v_meta[layer_idx] = (s_v.to(key_states.device), z_v.to(key_states.device))
+
             # Dequantize existing cached states if they have been quantized before.
             if layer_idx in self._k_meta:
                 old_k = dequantize_per_channel(layer.keys, *self._k_meta[layer_idx])

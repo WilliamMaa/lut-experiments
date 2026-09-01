@@ -28,6 +28,11 @@ class RetentionCache(DynamicCache):
         if not layer.is_initialized:
             layer.lazy_initialization(key_states, value_states)
 
+        # Align cached tensors with the incoming states (multi-GPU device_map safety).
+        if layer.keys.device != key_states.device:
+            layer.keys = layer.keys.to(key_states.device)
+            layer.values = layer.values.to(key_states.device)
+
         keys = torch.cat([layer.keys, key_states], dim=-2)
         values = torch.cat([layer.values, value_states], dim=-2)
 

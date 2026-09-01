@@ -17,11 +17,15 @@ DEFAULT_PROMPTS = [
 ]
 
 
-def load_eval_texts(eval_file: str, max_samples: int):
+def load_eval_texts(eval_file: str, max_samples: int, min_length: int = 0, sort_by_length: bool = False):
     """Load evaluation texts from JSONL / JSON / plain text.
 
     These texts are used to compute PPL.  Prefer longer passages over short
     prompts because PPL on very short sequences is noisy.
+
+    Args:
+        min_length: skip texts shorter than this.
+        sort_by_length: if True, return the longest texts up to max_samples.
     """
     texts = []
     path = Path(eval_file)
@@ -35,26 +39,28 @@ def load_eval_texts(eval_file: str, max_samples: int):
                     continue
                 obj = json.loads(line)
                 text = obj.get("text", obj.get("content", obj.get("sentence", "")))
-                if text:
+                if text and len(text) >= min_length:
                     texts.append(text)
-                if len(texts) >= max_samples:
-                    break
     else:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if line:
+                if line and len(line) >= min_length:
                     texts.append(line)
-                if len(texts) >= max_samples:
-                    break
-    return texts
+    if sort_by_length:
+        texts.sort(key=len, reverse=True)
+    return texts[:max_samples]
 
 
-def load_prompts(prompt_file: str, max_samples: int):
+def load_prompts(prompt_file: str, max_samples: int, min_length: int = 0, sort_by_length: bool = False):
     """Load generation prompts from a JSONL / JSON / plain text file.
 
     Each line should contain a prompt; accepted JSON fields are:
         prompt / text / content / sentence
+
+    Args:
+        min_length: skip prompts shorter than this.
+        sort_by_length: if True, return the longest prompts up to max_samples.
     """
     prompts = []
     path = Path(prompt_file)
@@ -68,16 +74,14 @@ def load_prompts(prompt_file: str, max_samples: int):
                     continue
                 obj = json.loads(line)
                 prompt = obj.get("prompt", obj.get("text", obj.get("content", obj.get("sentence", ""))))
-                if prompt:
+                if prompt and len(prompt) >= min_length:
                     prompts.append(prompt)
-                if len(prompts) >= max_samples:
-                    break
     else:
         with open(path, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if line:
+                if line and len(line) >= min_length:
                     prompts.append(line)
-                if len(prompts) >= max_samples:
-                    break
-    return prompts
+    if sort_by_length:
+        prompts.sort(key=len, reverse=True)
+    return prompts[:max_samples]
