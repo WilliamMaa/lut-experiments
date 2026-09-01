@@ -61,6 +61,19 @@ def main():
             print(e)
     print()
 
+    # Inspect Qwen config-created cache layer types.
+    print("=== Qwen config-created cache layer types ===")
+    try:
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained("/home/u/downloads/models/Qwen3.6-35B-A3B")
+        qwen_cache = DynamicCache(config=config)
+        print(f"num layers: {len(qwen_cache.layers)}")
+        for i, layer in enumerate(qwen_cache.layers):
+            print(f"layer {i}: type={type(layer).__name__}, _layer_type={getattr(layer, '_layer_type', 'N/A')}")
+    except Exception as e:
+        print(e)
+    print()
+
     print("=== public attrs ===")
     for name in sorted(dir(DynamicCache)):
         if not name.startswith("_"):

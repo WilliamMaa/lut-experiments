@@ -36,8 +36,9 @@ class KIVICache(DynamicCache):
             while len(self.layers) <= layer_idx:
                 self.layers.append(self.layer_class_to_replicate())
 
-        # Only quantize standard attention layers. GDN / linear attention layers keep full precision.
-        if layer_idx < len(self.layers) and getattr(self.layers[layer_idx], "_layer_type", "attention") != "attention":
+        # Only quantize standard attention layers (they expose .keys/.values).
+        # Linear attention / GDN layers use different internal state and are left untouched.
+        if layer_idx < len(self.layers) and not hasattr(self.layers[layer_idx], "keys"):
             return super().update(key_states, value_states, layer_idx, *args, **kwargs)
 
         layer = self.layers[layer_idx]
@@ -76,15 +77,5 @@ class KIVICache(DynamicCache):
         return dequantize_per_channel(qk, s_k, z_k), dequantize_per_token(qv, s_v, z_v)
 
     def to(self, device):
-        """Move cache tensors and quantization metadata to device."""
-        for layer in self.layers:
-            if hasattr(layer, "keys") and layer.keys is not None:
-                layer.keys = layer.keys.to(device)
-            if hasattr(layer, "values") and layer.values is not None:
-                layer.values = layer.values.to(device)
-        for layer_idx in self._k_meta:
-            s_k, z_k = self._k_meta[layer_idx]
-            s_v, z_v = self._v_meta[layer_idx]
-            self._k_meta[layer_idx] = (s_k.to(device), z_k.to(device))
-            self._v_meta[layer_idx] = (s_v.to(device), z_v.to(device))
+        """No-op: cache tensors are created/moved on the correct device during update()."""
         return self
