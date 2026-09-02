@@ -89,3 +89,7 @@ class KIVICache(DynamicCache):
     def to(self, device):
         """No-op: cache tensors are created/moved on the correct device during update()."""
         return self
+
+    def get_max_length(self) -> int | None:
+        # KIVI does not bound generation length; it grows as needed.
+        return None

@@ -57,3 +57,8 @@ class RetentionCache(DynamicCache):
             if hasattr(layer, "values") and layer.values is not None:
                 layer.values = layer.values.to(device)
         return self
+
+    def get_max_length(self) -> int | None:
+        # Do not let the cache's own capacity bound generation length.
+        # RetentionCache manually evicts; generation `max_length` should govern.
+        return None
