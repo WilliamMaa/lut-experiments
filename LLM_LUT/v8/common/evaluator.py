@@ -45,11 +45,13 @@ from common.metrics import (
     compute_logit_metrics,
     run_generation,
     compute_generation_metrics,
+    run_multi_turn_generation,
+    compute_multi_turn_metrics,
     compute_decode_divergence_metrics,
     measure_peak_memory_mb,
     reset_peak_memory_stats,
 )
-from common.prompts import DEFAULT_PROMPTS, load_eval_texts, load_prompts
+from common.prompts import DEFAULT_PROMPTS, load_eval_texts, load_prompts, load_multi_turn_prompts
 
 
 class EvalPatch:
@@ -135,6 +137,7 @@ class Evaluator:
         patch: EvalPatch,
         texts: List[str],
         prompts: Optional[List[str]] = None,
+        multi_turn_samples: Optional[List[Dict]] = None,
         max_length: int = 512,
         max_new_tokens: int = 128,
         output_json: Optional[str] = None,
@@ -169,19 +172,32 @@ class Evaluator:
         baseline_ppl_time = time.time() - t0
         baseline_peak_mem = measure_peak_memory_mb()
 
+        use_multi_turn = multi_turn_samples is not None and len(multi_turn_samples) > 0
+
         if verbose:
             print(f"  Baseline PPL: {baseline_ppl:.4f}  ({baseline_ppl_time:.1f}s)")
-            print("\n[Baseline] running generation ...")
+            if use_multi_turn:
+                print("\n[Baseline] running multi-turn generation ...")
+            else:
+                print("\n[Baseline] running generation ...")
         baseline_cache_factory = getattr(patch, "get_baseline_cache", None)
         baseline_cache_kwargs = {}
         if baseline_cache_factory is not None and hasattr(self.teacher, "config"):
             baseline_cache_kwargs["config"] = self.teacher.config
-        baseline_gen = run_generation(
-            self.teacher, self.tokenizer, prompts, self.teacher_device, max_new_tokens,
-            cache_factory=baseline_cache_factory,
-            cache_kwargs=baseline_cache_kwargs,
-        )
-        baseline_gen_metrics = compute_generation_metrics(baseline_gen)
+        if use_multi_turn:
+            baseline_gen = run_multi_turn_generation(
+                self.teacher, self.tokenizer, multi_turn_samples, self.teacher_device, max_new_tokens,
+                cache_factory=baseline_cache_factory,
+                cache_kwargs=baseline_cache_kwargs,
+            )
+            baseline_gen_metrics = compute_multi_turn_metrics(baseline_gen)
+        else:
+            baseline_gen = run_generation(
+                self.teacher, self.tokenizer, prompts, self.teacher_device, max_new_tokens,
+                cache_factory=baseline_cache_factory,
+                cache_kwargs=baseline_cache_kwargs,
+            )
+            baseline_gen_metrics = compute_generation_metrics(baseline_gen)
         if verbose:
             print(f"  EOS success rate: {baseline_gen_metrics['eos_success_rate']:.2%}")
             print(f"  Avg output length: {baseline_gen_metrics['avg_output_length']:.1f}")
@@ -206,17 +222,28 @@ class Evaluator:
 
         if verbose:
             print(f"  Patched PPL: {patched_ppl:.4f}  ({patched_ppl_time:.1f}s)")
-            print("\n[Patched] running generation ...")
+            if use_multi_turn:
+                print("\n[Patched] running multi-turn generation ...")
+            else:
+                print("\n[Patched] running generation ...")
         patched_cache_factory = getattr(patch, "get_cache", None)
         patched_cache_kwargs = {}
         if patched_cache_factory is not None and hasattr(self.student, "config"):
             patched_cache_kwargs["config"] = self.student.config
-        patched_gen = run_generation(
-            self.student, self.tokenizer, prompts, self.student_device, max_new_tokens,
-            cache_factory=patched_cache_factory,
-            cache_kwargs=patched_cache_kwargs,
-        )
-        patched_gen_metrics = compute_generation_metrics(patched_gen)
+        if use_multi_turn:
+            patched_gen = run_multi_turn_generation(
+                self.student, self.tokenizer, multi_turn_samples, self.student_device, max_new_tokens,
+                cache_factory=patched_cache_factory,
+                cache_kwargs=patched_cache_kwargs,
+            )
+            patched_gen_metrics = compute_multi_turn_metrics(patched_gen)
+        else:
+            patched_gen = run_generation(
+                self.student, self.tokenizer, prompts, self.student_device, max_new_tokens,
+                cache_factory=patched_cache_factory,
+                cache_kwargs=patched_cache_kwargs,
+            )
+            patched_gen_metrics = compute_generation_metrics(patched_gen)
         if verbose:
             print(f"  EOS success rate: {patched_gen_metrics['eos_success_rate']:.2%}")
             print(f"  Avg output length: {patched_gen_metrics['avg_output_length']:.1f}")
@@ -225,20 +252,32 @@ class Evaluator:
         # ---- Runtime assertion: decode replacement path was hit ----
         # The first generated token for each prompt comes from the prefill logits,
         # so the number of decode forward calls is total_output_length - num_prompts.
-        expected_decode_calls = sum(g["output_length"] for g in patched_gen) - len(patched_gen)
+        if use_multi_turn:
+            total_turns = sum(len(sample["turns"]) for sample in patched_gen)
+            expected_decode_calls = (
+                sum(turn["output_length"] for sample in patched_gen for turn in sample["turns"]) - total_turns
+            )
+        else:
+            expected_decode_calls = sum(g["output_length"] for g in patched_gen) - len(patched_gen)
         if hasattr(patch, "verify_decode_calls"):
             patch.verify_decode_calls(expected_decode_calls)
             if verbose:
                 print(f"  Decode replacement calls verified: {expected_decode_calls}")
 
         # ---- Fixed-trajectory decode divergence metrics ----
+        if use_multi_turn:
+            decode_prompts = [
+                f"{s['document']}\n\n{s['questions'][0]}" for s in multi_turn_samples
+            ]
+        else:
+            decode_prompts = prompts
         if verbose:
             print("\n[Decode divergence] fixed-trajectory decode metrics ...")
         decode_metrics = compute_decode_divergence_metrics(
             self.teacher,
             self.student,
             self.tokenizer,
-            prompts,
+            decode_prompts,
             self.teacher_device,
             max_new_tokens=max_new_tokens,
             student_cache_factory=patched_cache_factory,

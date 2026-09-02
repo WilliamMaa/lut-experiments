@@ -197,6 +197,120 @@ def compute_generation_metrics(generations: List[Dict]) -> Dict:
     }
 
 
+def run_multi_turn_generation(
+    model,
+    tokenizer,
+    multi_turn_samples,
+    device,
+    max_new_tokens: int = 128,
+    cache_factory=None,
+    cache_kwargs=None,
+):
+    """Run multi-turn generation with a shared KV cache across turns.
+
+    Each sample is a dict with:
+        document: long context text
+        questions: list of user questions
+
+    The cache is created once per sample and reused across all turns, so that
+    KV cache compression methods are stress-tested on long cumulative contexts.
+
+    Returns a list of dicts:
+        [{"document": str, "questions": list[str], "turns": list[dict]}]
+    """
+    model.eval()
+    if cache_kwargs is None:
+        cache_kwargs = {}
+    results = []
+
+    for sample in multi_turn_samples:
+        document = sample["document"]
+        questions = sample["questions"]
+        turns = []
+        cache = cache_factory(device, **cache_kwargs) if cache_factory is not None else None
+
+        for turn_idx, question in enumerate(questions):
+            # First turn feeds the document together with the first question.
+            # Subsequent turns only feed the new question, relying on the cache
+            # to retain prior context (document + previous answers).
+            prompt = f"{document}\n\n{question}" if turn_idx == 0 else question
+
+            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            gen_kwargs = {
+                "max_new_tokens": max_new_tokens,
+                "do_sample": False,
+                "pad_token_id": tokenizer.pad_token_id,
+                "eos_token_id": tokenizer.eos_token_id,
+            }
+            if cache is not None:
+                gen_kwargs["past_key_values"] = cache
+
+            with torch.no_grad():
+                output_ids = model.generate(**inputs, **gen_kwargs)
+
+            prompt_len = inputs["input_ids"].shape[1]
+            generated_ids = output_ids[0][prompt_len:]
+            generated = tokenizer.decode(generated_ids, skip_special_tokens=True)
+            turns.append({
+                "turn": turn_idx,
+                "question": question,
+                "output": generated,
+                "output_length": generated_ids.shape[0],
+                "ended_with_eos": (
+                    generated_ids[-1].item() == tokenizer.eos_token_id
+                    if generated_ids.numel() > 0 else False
+                ),
+            })
+            # The cache object is updated in-place by generate().
+            # Subsequent turns will therefore see all prior context.
+
+        results.append({
+            "document": document,
+            "questions": questions,
+            "turns": turns,
+        })
+
+    return results
+
+
+def compute_multi_turn_metrics(multi_turn_results: List[Dict]) -> Dict:
+    """Aggregate metrics across all turns and samples."""
+    if not multi_turn_results:
+        return {"eos_success_rate": 0.0, "avg_output_length": 0.0, "repetition_rate": 0.0}
+
+    total_turns = 0
+    eos_count = 0
+    total_len = 0
+    repetition_count = 0
+
+    for sample in multi_turn_results:
+        for turn in sample["turns"]:
+            total_turns += 1
+            if turn.get("ended_with_eos", False):
+                eos_count += 1
+            total_len += turn["output_length"]
+
+            text = turn["output"]
+            words = text.split()
+            if len(words) >= 8:
+                ngrams = set()
+                repeats = 0
+                for i in range(len(words) - 4 + 1):
+                    gram = tuple(words[i:i + 4])
+                    if gram in ngrams:
+                        repeats += 1
+                    ngrams.add(gram)
+                if repeats > 0:
+                    repetition_count += 1
+
+    return {
+        "eos_success_rate": eos_count / total_turns if total_turns else 0.0,
+        "avg_output_length": total_len / total_turns if total_turns else 0.0,
+        "repetition_rate": repetition_count / total_turns if total_turns else 0.0,
+    }
+
+
 def compute_cosine_similarity(a: torch.Tensor, b: torch.Tensor, dim: int = -1) -> float:
     """Compute mean cosine similarity between two tensors along a dimension."""
     a_norm = F.normalize(a.float(), dim=dim, eps=1e-8)

@@ -85,3 +85,29 @@ def load_prompts(prompt_file: str, max_samples: int, min_length: int = 0, sort_b
     if sort_by_length:
         prompts.sort(key=len, reverse=True)
     return prompts[:max_samples]
+
+
+def load_multi_turn_prompts(prompt_file: str, max_samples: int):
+    """Load multi-turn conversation prompts from a JSONL file.
+
+    Each line must be a JSON object with:
+        document: long context text
+        questions: list of user questions
+
+    Returns a list of dicts: [{"document": str, "questions": list[str]}]
+    """
+    samples = []
+    path = Path(prompt_file)
+    if not path.exists():
+        raise FileNotFoundError(f"multi_turn prompt_file not found: {prompt_file}")
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            document = obj.get("document", "")
+            questions = obj.get("questions", [])
+            if document and questions:
+                samples.append({"document": document, "questions": questions})
+    return samples[:max_samples]
