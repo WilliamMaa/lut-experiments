@@ -20,6 +20,15 @@ class KIVICache(DynamicCache):
     Linear attention / GDN layers are left untouched (original DynamicCache behavior).
     """
 
+    # Override DynamicCache's length bound so generation uses --max_length, not cache capacity.
+    @property
+    def max_cache_len(self):
+        return None
+
+    @max_cache_len.setter
+    def max_cache_len(self, value):
+        pass
+
     def __init__(self, k_bits=4, v_bits=4, config=None):
         # Initialize DynamicCache with the model config so that layer types
         # (attention / linear_attention) match the model's structure.
@@ -89,7 +98,3 @@ class KIVICache(DynamicCache):
     def to(self, device):
         """No-op: cache tensors are created/moved on the correct device during update()."""
         return self
-
-    def get_max_length(self) -> int | None:
-        # KIVI does not bound generation length; it grows as needed.
-        return None

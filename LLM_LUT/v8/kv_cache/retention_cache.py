@@ -11,10 +11,21 @@ class RetentionCache(DynamicCache):
     GDN / linear attention layers are left untouched.
     """
 
+    # Override DynamicCache's length bound so generation uses --max_length, not cache capacity.
+    @property
+    def max_cache_len(self):
+        return None
+
+    @max_cache_len.setter
+    def max_cache_len(self, value):
+        pass
+
     def __init__(self, max_cache_len=512, sink_tokens=4, config=None):
         super().__init__(config=config)
         self.retention_max_cache_len = max_cache_len
         self.sink_tokens = sink_tokens
+        # generation must not use the cache's capacity as a length bound.
+        self.max_cache_len = None
 
     def update(self, key_states, value_states, layer_idx, *args, **kwargs):
         if self.layer_class_to_replicate is not None:

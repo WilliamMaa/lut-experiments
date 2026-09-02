@@ -191,6 +191,10 @@ class Evaluator:
                 cache_kwargs=baseline_cache_kwargs,
             )
             baseline_gen_metrics = compute_multi_turn_metrics(baseline_gen)
+            baseline_answers = [
+                [turn["output"] for turn in sample["turns"]]
+                for sample in baseline_gen
+            ]
         else:
             baseline_gen = run_generation(
                 self.teacher, self.tokenizer, prompts, self.teacher_device, max_new_tokens,
@@ -235,6 +239,7 @@ class Evaluator:
                 self.student, self.tokenizer, multi_turn_samples, self.student_device, max_new_tokens,
                 cache_factory=patched_cache_factory,
                 cache_kwargs=patched_cache_kwargs,
+                teacher_answers=baseline_answers,
             )
             patched_gen_metrics = compute_multi_turn_metrics(patched_gen)
         else:

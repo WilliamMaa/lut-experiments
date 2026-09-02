@@ -6,7 +6,7 @@ Designed to be used by both VQK and KV Cache Compression experiments.
 """
 
 import math
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -205,15 +205,22 @@ def run_multi_turn_generation(
     max_new_tokens: int = 128,
     cache_factory=None,
     cache_kwargs=None,
+    teacher_answers: Optional[List[List[str]]] = None,
 ):
-    """Run multi-turn generation with a shared KV cache across turns.
+    """Run multi-turn generation using the model's chat template.
 
     Each sample is a dict with:
-        document: long context text
+        document: long context text (placed in the system message)
         questions: list of user questions
 
-    The cache is created once per sample and reused across all turns, so that
-    KV cache compression methods are stress-tested on long cumulative contexts.
+    The full conversation history is re-prefilled every turn using
+    `tokenizer.apply_chat_template`, so the model sees properly formatted
+    system/user/assistant turns. A fresh cache is created per turn to avoid
+    the cross-generate cache state bug while still stressing the cache with
+    a long cumulative context.
+
+    If `teacher_answers` is provided, the assistant turns are fixed to the
+    teacher (baseline) answers; otherwise the model's own answers are used.
 
     Returns a list of dicts:
         [{"document": str, "questions": list[str], "turns": list[dict]}]
@@ -223,19 +230,53 @@ def run_multi_turn_generation(
         cache_kwargs = {}
     results = []
 
-    for sample in multi_turn_samples:
+    for sample_idx, sample in enumerate(multi_turn_samples):
         document = sample["document"]
         questions = sample["questions"]
         turns = []
-        cache = cache_factory(device, **cache_kwargs) if cache_factory is not None else None
+        own_answers = []
+        history_answers = teacher_answers[sample_idx] if teacher_answers is not None else None
 
         for turn_idx, question in enumerate(questions):
-            # First turn feeds the document together with the first question.
-            # Subsequent turns only feed the new question, relying on the cache
-            # to retain prior context (document + previous answers).
-            prompt = f"{document}\n\n{question}" if turn_idx == 0 else question
+            # Build messages in chat format.
+            messages = [{"role": "system", "content": document}]
+            for prev_turn_idx in range(turn_idx):
+                prev_answer = (
+                    history_answers[prev_turn_idx]
+                    if history_answers is not None
+                    else own_answers[prev_turn_idx]
+                )
+                messages.append({"role": "user", "content": questions[prev_turn_idx]})
+                messages.append({"role": "assistant", "content": prev_answer})
+            messages.append({"role": "user", "content": question})
 
-            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
+            # Use chat template; fall back to plain text if unavailable.
+            if tokenizer.chat_template is not None:
+                input_ids = tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=True,
+                    return_tensors="pt",
+                    add_generation_prompt=True,
+                    truncation=True,
+                    max_length=4096,
+                )
+                attention_mask = torch.ones_like(input_ids)
+                inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
+            else:
+                # Plain-text fallback (unlikely for Qwen chat models).
+                parts = [document]
+                for prev_turn_idx in range(turn_idx):
+                    prev_answer = (
+                        history_answers[prev_turn_idx]
+                        if history_answers is not None
+                        else own_answers[prev_turn_idx]
+                    )
+                    parts.append(prev_answer)
+                    parts.append(questions[prev_turn_idx])
+                parts.append(question)
+                prompt = "\n\n".join(parts)
+                inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=4096)
+
             inputs = {k: v.to(device) for k, v in inputs.items()}
             gen_kwargs = {
                 "max_new_tokens": max_new_tokens,
@@ -243,8 +284,9 @@ def run_multi_turn_generation(
                 "pad_token_id": tokenizer.pad_token_id,
                 "eos_token_id": tokenizer.eos_token_id,
             }
-            if cache is not None:
-                gen_kwargs["past_key_values"] = cache
+            # Fresh cache per turn.
+            if cache_factory is not None:
+                gen_kwargs["past_key_values"] = cache_factory(device, **cache_kwargs)
 
             with torch.no_grad():
                 output_ids = model.generate(**inputs, **gen_kwargs)
@@ -262,8 +304,7 @@ def run_multi_turn_generation(
                     if generated_ids.numel() > 0 else False
                 ),
             })
-            # The cache object is updated in-place by generate().
-            # Subsequent turns will therefore see all prior context.
+            own_answers.append(generated)
 
         results.append({
             "document": document,
