@@ -238,21 +238,25 @@ def run_multi_turn_generation(
         history_answers = teacher_answers[sample_idx] if teacher_answers is not None else None
 
         for turn_idx, question in enumerate(questions):
-            # Build messages in chat format.
-            messages = [{"role": "system", "content": document}]
-            for prev_turn_idx in range(turn_idx):
-                prev_answer = (
-                    history_answers[prev_turn_idx]
-                    if history_answers is not None
-                    else own_answers[prev_turn_idx]
-                )
-                messages.append({"role": "user", "content": questions[prev_turn_idx]})
-                messages.append({"role": "assistant", "content": prev_answer})
-            messages.append({"role": "user", "content": question})
+            # Build messages in chat format. Put the long document in the first
+            # user message (not system) to match the model's training distribution.
+            if turn_idx == 0:
+                messages = [{"role": "user", "content": f"{document}\n\n{question}"}]
+            else:
+                messages = [{"role": "user", "content": document}]
+                for prev_turn_idx in range(turn_idx):
+                    prev_answer = (
+                        history_answers[prev_turn_idx]
+                        if history_answers is not None
+                        else own_answers[prev_turn_idx]
+                    )
+                    messages.append({"role": "user", "content": questions[prev_turn_idx]})
+                    messages.append({"role": "assistant", "content": prev_answer})
+                messages.append({"role": "user", "content": question})
 
             # Use chat template; fall back to plain text if unavailable.
             if tokenizer.chat_template is not None:
-                input_ids = tokenizer.apply_chat_template(
+                encoded = tokenizer.apply_chat_template(
                     messages,
                     tokenize=True,
                     return_tensors="pt",
@@ -260,6 +264,7 @@ def run_multi_turn_generation(
                     truncation=True,
                     max_length=4096,
                 )
+                input_ids = encoded["input_ids"] if isinstance(encoded, dict) else encoded
                 attention_mask = torch.ones_like(input_ids)
                 inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
             else:
