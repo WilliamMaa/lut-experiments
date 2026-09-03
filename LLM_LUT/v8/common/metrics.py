@@ -238,12 +238,17 @@ def run_multi_turn_generation(
         history_answers = teacher_answers[sample_idx] if teacher_answers is not None else None
 
         for turn_idx, question in enumerate(questions):
-            # Build messages in chat format. Put the long document in the first
-            # user message (not system) to match the model's training distribution.
+            # Build messages in chat format. Add a system instruction that
+            # forbids chain-of-thought / thinking output.
+            no_think_text = (
+                "直接给出最终回复，不要输出思考过程、分析步骤、'Here's a thinking process' "
+                "或任何元说明。"
+            )
+            messages = [{"role": "system", "content": no_think_text}]
             if turn_idx == 0:
-                messages = [{"role": "user", "content": f"{document}\n\n{question}"}]
+                messages.append({"role": "user", "content": f"{document}\n\n{question}"})
             else:
-                messages = [{"role": "user", "content": document}]
+                messages.append({"role": "user", "content": document})
                 for prev_turn_idx in range(turn_idx):
                     prev_answer = (
                         history_answers[prev_turn_idx]
@@ -256,30 +261,27 @@ def run_multi_turn_generation(
 
             # Use chat template; fall back to plain text if unavailable.
             if tokenizer.chat_template is not None:
-                # Two-step encoding avoids the inconsistent return types of
-                # apply_chat_template across transformers versions.
-                prompt_text = tokenizer.apply_chat_template(
-                    messages,
-                    tokenize=False,
-                    add_generation_prompt=True,
-                )
-                # Qwen3.6 defaults to thinking mode. Detect the thinking-start
-                # assistant prefix and force it to close immediately so the model
-                # answers directly instead of emitting a long reasoning trace.
+                tmpl_kwargs = {
+                    "tokenize": True,
+                    "return_tensors": "pt",
+                    "add_generation_prompt": True,
+                }
+                # Qwen3+ supports enable_thinking=False to suppress native CoT mode.
                 try:
-                    thinking_start = tokenizer.convert_ids_to_tokens(248068)
-                    thinking_end = tokenizer.convert_ids_to_tokens(248069)
-                except Exception:
-                    thinking_start = thinking_end = None
-                if thinking_start and thinking_end and prompt_text.rstrip().endswith(thinking_start + "\n"):
-                    prompt_text = prompt_text.rstrip() + "\n" + thinking_end + "\n\n"
-                inputs = tokenizer(
-                    prompt_text,
-                    return_tensors="pt",
-                    truncation=True,
-                    max_length=4096,
-                )
-                inputs = {k: v.to(device) for k, v in inputs.items()}
+                    input_ids = tokenizer.apply_chat_template(messages, **tmpl_kwargs, enable_thinking=False)
+                except TypeError:
+                    input_ids = tokenizer.apply_chat_template(messages, **tmpl_kwargs)
+                # apply_chat_template may return a BatchEncoding or a tensor
+                # depending on the tokenizer/transformers version.
+                if hasattr(input_ids, "input_ids"):
+                    input_ids = input_ids.input_ids
+                if not isinstance(input_ids, torch.Tensor):
+                    input_ids = torch.tensor(input_ids, dtype=torch.long)
+                if input_ids.dim() == 1:
+                    input_ids = input_ids.unsqueeze(0)
+                input_ids = input_ids.to(device)
+                attention_mask = torch.ones_like(input_ids)
+                inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
             else:
                 # Plain-text fallback (unlikely for Qwen chat models).
                 parts = [document]
