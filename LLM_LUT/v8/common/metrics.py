@@ -256,22 +256,20 @@ def run_multi_turn_generation(
 
             # Use chat template; fall back to plain text if unavailable.
             if tokenizer.chat_template is not None:
-                token_ids = tokenizer.apply_chat_template(
+                # Two-step encoding avoids the inconsistent return types of
+                # apply_chat_template across transformers versions.
+                prompt_text = tokenizer.apply_chat_template(
                     messages,
-                    tokenize=True,
+                    tokenize=False,
                     add_generation_prompt=True,
+                )
+                inputs = tokenizer(
+                    prompt_text,
+                    return_tensors="pt",
                     truncation=True,
                     max_length=4096,
                 )
-                # Return type varies across transformers versions; normalize to a 2-D tensor.
-                if isinstance(token_ids, (list, tuple)):
-                    input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
-                else:
-                    input_ids = token_ids.to(device) if torch.is_tensor(token_ids) else torch.tensor(
-                        [token_ids], dtype=torch.long, device=device
-                    )
-                attention_mask = torch.ones_like(input_ids)
-                inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
+                inputs = {k: v.to(device) for k, v in inputs.items()}
             else:
                 # Plain-text fallback (unlikely for Qwen chat models).
                 parts = [document]
