@@ -258,10 +258,12 @@ def run_multi_turn_generation(
             if tokenizer.chat_template is not None:
                 # Two-step encoding avoids the inconsistent return types of
                 # apply_chat_template across transformers versions.
+                # Qwen3.6 defaults to thinking mode; disable it for direct answers.
                 prompt_text = tokenizer.apply_chat_template(
                     messages,
                     tokenize=False,
                     add_generation_prompt=True,
+                    chat_template_kwargs={"enable_thinking": False},
                 )
                 inputs = tokenizer(
                     prompt_text,
