@@ -256,15 +256,20 @@ def run_multi_turn_generation(
 
             # Use chat template; fall back to plain text if unavailable.
             if tokenizer.chat_template is not None:
-                encoded = tokenizer.apply_chat_template(
+                token_ids = tokenizer.apply_chat_template(
                     messages,
                     tokenize=True,
-                    return_tensors="pt",
                     add_generation_prompt=True,
                     truncation=True,
                     max_length=4096,
                 )
-                input_ids = encoded["input_ids"] if isinstance(encoded, dict) else encoded
+                # Return type varies across transformers versions; normalize to a 2-D tensor.
+                if isinstance(token_ids, (list, tuple)):
+                    input_ids = torch.tensor([token_ids], dtype=torch.long, device=device)
+                else:
+                    input_ids = token_ids.to(device) if torch.is_tensor(token_ids) else torch.tensor(
+                        [token_ids], dtype=torch.long, device=device
+                    )
                 attention_mask = torch.ones_like(input_ids)
                 inputs = {"input_ids": input_ids, "attention_mask": attention_mask}
             else:
