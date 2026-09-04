@@ -31,6 +31,11 @@ class AttentionScoreBank:
 
 class _StashState:
     bank = None
+    obs_window = 64  # SnapKV-style observation window (last W query rows)
+
+
+def set_observation_window(w: int):
+    _StashState.obs_window = int(w)
 
 
 def _hh_eager_attention(module, query, key, value, attention_mask,
@@ -144,6 +149,12 @@ def _stashing_wrapper(module, query, key, value, attention_mask, *args, **kwargs
     layer_idx = getattr(module, "layer_idx", None)
     if layer_idx is None:
         return out, attn_weights
-    # weights: [batch, heads, q_len, k_len] -> column sum over heads/queries.
-    bank.scores[layer_idx] = attn_weights.detach().float().sum(dim=(0, 1, 2))
+    # SnapKV-style observation window: only the LAST W query rows contribute
+    # to importance. Summing over ALL prefill queries lets the document's
+    # self-attention (local structure, headers, repeated phrases) drown out
+    # the signal about which keys the actual question needs — measured as
+    # worse than the key-norm proxy at 256 budget (EOS 0.20 vs 0.80).
+    w = min(_StashState.obs_window, attn_weights.shape[-2])
+    obs = attn_weights[..., -w:, :]
+    bank.scores[layer_idx] = obs.detach().float().sum(dim=(0, 1, 2))
     return out, attn_weights

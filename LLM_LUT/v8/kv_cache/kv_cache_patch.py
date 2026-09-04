@@ -14,6 +14,7 @@ from kv_cache.attention_scores import (
     AttentionScoreBank,
     install_eager_score_stash,
     uninstall_eager_score_stash,
+    set_observation_window,
 )
 
 
@@ -161,20 +162,24 @@ class HeavyHitterAttnScorePatch(HeavyHitterCachePatch):
     Same retention structure as HeavyHitterCachePatch (sink + recent + heavy
     hitters), but importance comes from accumulated prefill attention mass
     (H2O/SnapKV-style) instead of the key-L2-norm proxy. install() forces
-    eager attention on the student and wraps the eager kernel to collect
-    per-key-position column sums during prefill.
+    eager attention on the student and routes it through a stashing kernel
+    that column-sums the last ``obs_window`` query rows per key position.
     """
 
-    def __init__(self, max_cache_len: int = 512, sink_tokens: int = 4, recent_tokens: int = 128):
+    def __init__(self, max_cache_len: int = 512, sink_tokens: int = 4,
+                 recent_tokens: int = 128, obs_window: int = 64):
         super().__init__(max_cache_len, sink_tokens, recent_tokens)
         self._bank = AttentionScoreBank()
+        self.obs_window = obs_window
 
     def name(self) -> str:
-        return f"heavy_hitter_attn_l{self.max_cache_len}_s{self.sink_tokens}_r{self.recent_tokens}"
+        return (f"heavy_hitter_attn_l{self.max_cache_len}_s{self.sink_tokens}"
+                f"_r{self.recent_tokens}_w{self.obs_window}")
 
     def config(self) -> Dict[str, Any]:
         cfg = super().config()
         cfg["importance"] = "prefill_attn_score"
+        cfg["obs_window"] = self.obs_window
         return cfg
 
     def get_cache(self, device, config=None):
@@ -190,6 +195,7 @@ class HeavyHitterAttnScorePatch(HeavyHitterCachePatch):
         ).to(device)
 
     def install(self, model):
+        set_observation_window(self.obs_window)
         install_eager_score_stash(model, self._bank)
 
     def uninstall(self, model):

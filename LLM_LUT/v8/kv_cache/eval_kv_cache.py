@@ -29,6 +29,8 @@ def main():
     parser.add_argument("--max_cache_len", type=int, default=512)
     parser.add_argument("--sink_tokens", type=int, default=4)
     parser.add_argument("--recent_tokens", type=int, default=128)
+    parser.add_argument("--obs_window", type=int, default=64,
+                        help="Observation window (last W query rows) for heavy_hitter_attn importance")
     parser.add_argument("--model_path", required=True)
     parser.add_argument("--eval_file", required=True)
     parser.add_argument("--prompt_file", required=True)
@@ -74,6 +76,7 @@ def main():
             max_cache_len=args.max_cache_len,
             sink_tokens=args.sink_tokens,
             recent_tokens=args.recent_tokens,
+            obs_window=args.obs_window,
         )
     else:
         patch = patch_cls()

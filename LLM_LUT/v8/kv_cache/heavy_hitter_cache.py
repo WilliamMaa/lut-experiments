@@ -163,7 +163,13 @@ class HeavyHitterCache(DynamicCache):
                 if pos_scores is not None:
                     scores = pos_scores[sink_n:sink_n + middle_len]
                 else:
-                    # Fallback: key-L2-norm proxy.
+                    # Fallback: key-L2-norm proxy. Loud about it: silently
+                    # degrading to the proxy would produce results
+                    # indistinguishable from the key_norm variant.
+                    if not getattr(layer, "_hh_fallback_warned", False):
+                        print(f"[heavy_hitter] layer {layer_idx}: no prefill "
+                              f"attention scores available, falling back to key-norm")
+                        layer._hh_fallback_warned = True
                     scores = self._importance_scores(middle_keys)[0]
                 scores = scores.unsqueeze(0).expand(B, -1)  # [B, M]
                 topk = scores.topk(hh_budget, dim=-1).indices  # [B, hh_budget]
