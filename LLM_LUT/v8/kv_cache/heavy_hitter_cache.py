@@ -32,13 +32,14 @@ class HeavyHitterCache(DynamicCache):
         pass
 
     def __init__(self, max_cache_len=512, sink_tokens=4, recent_tokens=128, config=None,
-                 importance_mode="key_norm", score_bank=None):
+                 importance_mode="key_norm", score_bank=None, obs_window=0):
         super().__init__(config=config)
         self.retention_max_cache_len = max_cache_len
         self.sink_tokens = sink_tokens
         self.recent_tokens = recent_tokens
         self.importance_mode = importance_mode
         self.score_bank = score_bank
+        self.obs_window = obs_window
 
     def _importance_scores(self, keys):
         """Compute per-token importance from key vectors.
@@ -72,8 +73,10 @@ class HeavyHitterCache(DynamicCache):
         plen = prefill.shape[-1]
         valid = orig_idx < plen
         safe_idx = orig_idx.clamp(max=plen - 1)
-        vals = torch.where(valid, prefill[safe_idx], torch.tensor(
-            float("inf"), device=device, dtype=prefill.dtype))
+        # Decode tokens (written after the prefill snapshot) compete at the
+        # *mean* attention mass. +inf here would let them flush every prefill
+        # heavy hitter out of the middle region within one generation.
+        vals = torch.where(valid, prefill[safe_idx], prefill.mean())
         return vals
 
     def update(self, key_states, value_states, layer_idx, *args, **kwargs):
@@ -162,6 +165,18 @@ class HeavyHitterCache(DynamicCache):
                 )
                 if pos_scores is not None:
                     scores = pos_scores[sink_n:sink_n + middle_len]
+                    if self.obs_window > 0:
+                        # SnapKV: tokens inside the observation window are
+                        # mostly chat-template tokens that attract sink-like
+                        # attention; they are already protected by recency, so
+                        # exclude them from heavy-hitter candidacy instead of
+                        # letting them eat the whole hh budget.
+                        plen = layer._hh_prefill_scores.shape[-1]
+                        cand_orig = orig_idx[sink_n:sink_n + middle_len]
+                        scores = torch.where(
+                            cand_orig >= plen - self.obs_window,
+                            torch.full_like(scores, float("-inf")), scores,
+                        )
                 else:
                     # Fallback: key-L2-norm proxy. Loud about it: silently
                     # degrading to the proxy would produce results
@@ -185,6 +200,16 @@ class HeavyHitterCache(DynamicCache):
                 sel_orig = torch.gather(
                     middle_orig.unsqueeze(0).expand(B, -1), 1, topk,
                 )[0]  # batch is always 1 in this eval
+                if not getattr(layer, "_hh_selection_logged", False):
+                    layer._hh_selection_logged = True
+                    plen = (layer._hh_prefill_scores.shape[-1]
+                            if getattr(layer, "_hh_prefill_scores", None) is not None
+                            else -1)
+                    in_win = (sel_orig >= plen - self.obs_window).sum().item() if plen > 0 else -1
+                    print(f"[heavy_hitter] layer {layer_idx}: first eviction "
+                          f"plen={plen} kept={sel_orig.numel()} "
+                          f"in_obs_window={in_win} "
+                          f"min_pos={sel_orig.min().item()} max_pos={sel_orig.max().item()}")
                 orig_idx = torch.cat([
                     orig_idx[:sink_n], sel_orig, orig_idx[-recent_n:],
                 ])

@@ -192,6 +192,7 @@ class HeavyHitterAttnScorePatch(HeavyHitterCachePatch):
             config=config,
             importance_mode="attn_score",
             score_bank=self._bank,
+            obs_window=self.obs_window,
         ).to(device)
 
     def install(self, model):
