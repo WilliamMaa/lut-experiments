@@ -87,8 +87,8 @@
 
 | 优先级 | 方法 | 理由 |
 |---|---|---|
-| **P0** | Heavy-Hitter 换成真实 attention score | 当前实现的 key norm proxy 太弱，真实 attention 是正确做法 |
-| **P0** | retention 512 结果 | 确认 retention 边界，已有基线 |
+| ~~P0~~ 已做 | Heavy-Hitter 换成真实 attention score | `heavy_hitter_attn` patch 已实现（eager kernel 包装 + prefill column-sum），待跑 `heavy_hitter_attn_l256_s4_r128` |
+| ~~P0~~ 已做 | retention 512 结果 | 边界确认：1024 无损、512 部分退化（丢文档前部事实）、256 不可用 |
 | **P1** | PyramidKV / Ada-KV | 分层类主流方向，layer-adaptive budget |
 | **P1** | SnapKV | 实现简单，attention-based eviction 的代表 |
 | **P2** | ClusteredKV（LUT-KV） | codebook 思路，与项目 LUT 主题契合 |
@@ -96,7 +96,7 @@
 
 ## 当前实验下一步
 
-1. 跑完 `retention_l512_s4_multiturn.json`（边界确认）
-2. 跑完 `heavy_hitter_l256_s4_r128_multiturn.json`（importance-aware vs 位置驱动）
-3. 把 Heavy-Hitter 的 importance 从 key norm 换成 **prefill attention score**（需要 hook attention 层）
-4. 根据 2/3 的结果决定走 PyramidKV 还是 SnapKV 方向
+1. ~~跑完 `retention_l512_s4_multiturn.json`（边界确认）~~ → 512 部分退化，250x
+2. ~~跑完 `heavy_hitter_l256_s4_r128_multiturn.json`（importance-aware vs 位置驱动）~~ → 全面优于 retention 256，但未达 retention 512；key-norm proxy 选错对象
+3. ~~把 Heavy-Hitter 的 importance 从 key norm 换成 **prefill attention score**（需要 hook attention 层）~~ → 已实现 `heavy_hitter_attn`
+4. 跑 `heavy_hitter_attn_l256_s4_r128_multiturn.json`，对照：retention 256 / heavy_hitter(key-norm) 256 / retention 512。若接近 512 水平，importance-aware 路线成立，再上 PyramidKV/SnapKV

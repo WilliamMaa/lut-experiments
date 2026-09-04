@@ -10,6 +10,11 @@ from common.evaluator import EvalPatch
 from kv_cache.kivi_cache import KIVICache
 from kv_cache.retention_cache import RetentionCache
 from kv_cache.heavy_hitter_cache import HeavyHitterCache
+from kv_cache.attention_scores import (
+    AttentionScoreBank,
+    install_eager_score_stash,
+    uninstall_eager_score_stash,
+)
 
 
 class KVCachePatch(EvalPatch):
@@ -148,3 +153,47 @@ class HeavyHitterCachePatch(KVCachePatch):
             "estimated_128k_context_bytes": self.max_cache_len * bf16_bytes_per_token * full_attn_layers,
             "estimated_128k_context_bf16_bytes": bf16_bytes_per_token * 128000 * full_attn_layers,
         }
+
+
+class HeavyHitterAttnScorePatch(HeavyHitterCachePatch):
+    """Heavy-hitter KV cache with prefill attention-score importance.
+
+    Same retention structure as HeavyHitterCachePatch (sink + recent + heavy
+    hitters), but importance comes from accumulated prefill attention mass
+    (H2O/SnapKV-style) instead of the key-L2-norm proxy. install() forces
+    eager attention on the student and wraps the eager kernel to collect
+    per-key-position column sums during prefill.
+    """
+
+    def __init__(self, max_cache_len: int = 512, sink_tokens: int = 4, recent_tokens: int = 128):
+        super().__init__(max_cache_len, sink_tokens, recent_tokens)
+        self._bank = AttentionScoreBank()
+        self._prev_attn_impl = None
+
+    def name(self) -> str:
+        return f"heavy_hitter_attn_l{self.max_cache_len}_s{self.sink_tokens}_r{self.recent_tokens}"
+
+    def config(self) -> Dict[str, Any]:
+        cfg = super().config()
+        cfg["importance"] = "prefill_attn_score"
+        return cfg
+
+    def get_cache(self, device, config=None):
+        # Fresh scores per generation: the bank only reflects the current prefill.
+        self._bank.clear()
+        return HeavyHitterCache(
+            max_cache_len=self.max_cache_len,
+            sink_tokens=self.sink_tokens,
+            recent_tokens=self.recent_tokens,
+            config=config,
+            importance_mode="attn_score",
+            score_bank=self._bank,
+        ).to(device)
+
+    def install(self, model):
+        self._prev_attn_impl = model.config._attn_implementation
+        install_eager_score_stash(model, self._bank)
+
+    def uninstall(self, model):
+        uninstall_eager_score_stash(model, self._prev_attn_impl)
+        self._prev_attn_impl = None

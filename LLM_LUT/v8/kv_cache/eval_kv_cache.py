@@ -10,13 +10,14 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.evaluator import Evaluator
 from common.prompts import load_eval_texts, load_prompts, load_multi_turn_prompts
-from kv_cache.kv_cache_patch import KIVICachePatch, RetentionCachePatch, HeavyHitterCachePatch
+from kv_cache.kv_cache_patch import KIVICachePatch, RetentionCachePatch, HeavyHitterCachePatch, HeavyHitterAttnScorePatch
 
 
 PATCH_REGISTRY = {
     "kivi": KIVICachePatch,
     "retention": RetentionCachePatch,
     "heavy_hitter": HeavyHitterCachePatch,
+    "heavy_hitter_attn": HeavyHitterAttnScorePatch,
 }
 
 
@@ -63,6 +64,12 @@ def main():
     elif args.patch == "retention":
         patch = patch_cls(max_cache_len=args.max_cache_len, sink_tokens=args.sink_tokens)
     elif args.patch == "heavy_hitter":
+        patch = patch_cls(
+            max_cache_len=args.max_cache_len,
+            sink_tokens=args.sink_tokens,
+            recent_tokens=args.recent_tokens,
+        )
+    elif args.patch == "heavy_hitter_attn":
         patch = patch_cls(
             max_cache_len=args.max_cache_len,
             sink_tokens=args.sink_tokens,
