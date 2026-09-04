@@ -9,6 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.evaluator import EvalPatch
 from kv_cache.kivi_cache import KIVICache
 from kv_cache.retention_cache import RetentionCache
+from kv_cache.heavy_hitter_cache import HeavyHitterCache
 
 
 class KVCachePatch(EvalPatch):
@@ -97,6 +98,50 @@ class RetentionCachePatch(KVCachePatch):
         return {
             "max_cache_len": self.max_cache_len,
             "sink_tokens": self.sink_tokens,
+            "bf16_bytes_per_token": bf16_bytes_per_token,
+            "effective_bytes_per_token_128k": effective_bytes_per_token,
+            "compression_ratio": bf16_bytes_per_token / effective_bytes_per_token,
+            "estimated_128k_context_bytes": self.max_cache_len * bf16_bytes_per_token * full_attn_layers,
+            "estimated_128k_context_bf16_bytes": bf16_bytes_per_token * 128000 * full_attn_layers,
+        }
+
+
+class HeavyHitterCachePatch(KVCachePatch):
+    """Heavy-hitter KV cache: sink + recent + important middle tokens."""
+
+    def __init__(self, max_cache_len: int = 512, sink_tokens: int = 4, recent_tokens: int = 128):
+        self.max_cache_len = max_cache_len
+        self.sink_tokens = sink_tokens
+        self.recent_tokens = recent_tokens
+
+    def name(self) -> str:
+        return f"heavy_hitter_l{self.max_cache_len}_s{self.sink_tokens}_r{self.recent_tokens}"
+
+    def config(self) -> Dict[str, Any]:
+        return {
+            "max_cache_len": self.max_cache_len,
+            "sink_tokens": self.sink_tokens,
+            "recent_tokens": self.recent_tokens,
+        }
+
+    def get_cache(self, device, config=None):
+        return HeavyHitterCache(
+            max_cache_len=self.max_cache_len,
+            sink_tokens=self.sink_tokens,
+            recent_tokens=self.recent_tokens,
+            config=config,
+        ).to(device)
+
+    def storage_stats(self) -> Dict[str, Any]:
+        kv_heads = 2
+        head_dim = 256
+        full_attn_layers = 10
+        bf16_bytes_per_token = kv_heads * head_dim * 4
+        effective_bytes_per_token = bf16_bytes_per_token * (self.max_cache_len / 128000)
+        return {
+            "max_cache_len": self.max_cache_len,
+            "sink_tokens": self.sink_tokens,
+            "recent_tokens": self.recent_tokens,
             "bf16_bytes_per_token": bf16_bytes_per_token,
             "effective_bytes_per_token_128k": effective_bytes_per_token,
             "compression_ratio": bf16_bytes_per_token / effective_bytes_per_token,

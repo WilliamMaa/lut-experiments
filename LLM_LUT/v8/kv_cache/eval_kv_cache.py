@@ -10,12 +10,13 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from common.evaluator import Evaluator
 from common.prompts import load_eval_texts, load_prompts, load_multi_turn_prompts
-from kv_cache.kv_cache_patch import KIVICachePatch, RetentionCachePatch
+from kv_cache.kv_cache_patch import KIVICachePatch, RetentionCachePatch, HeavyHitterCachePatch
 
 
 PATCH_REGISTRY = {
     "kivi": KIVICachePatch,
     "retention": RetentionCachePatch,
+    "heavy_hitter": HeavyHitterCachePatch,
 }
 
 
@@ -26,6 +27,7 @@ def main():
     parser.add_argument("--v_bits", type=int, default=4)
     parser.add_argument("--max_cache_len", type=int, default=512)
     parser.add_argument("--sink_tokens", type=int, default=4)
+    parser.add_argument("--recent_tokens", type=int, default=128)
     parser.add_argument("--model_path", required=True)
     parser.add_argument("--eval_file", required=True)
     parser.add_argument("--prompt_file", required=True)
@@ -60,6 +62,12 @@ def main():
         patch = patch_cls(k_bits=args.k_bits, v_bits=args.v_bits)
     elif args.patch == "retention":
         patch = patch_cls(max_cache_len=args.max_cache_len, sink_tokens=args.sink_tokens)
+    elif args.patch == "heavy_hitter":
+        patch = patch_cls(
+            max_cache_len=args.max_cache_len,
+            sink_tokens=args.sink_tokens,
+            recent_tokens=args.recent_tokens,
+        )
     else:
         patch = patch_cls()
 
