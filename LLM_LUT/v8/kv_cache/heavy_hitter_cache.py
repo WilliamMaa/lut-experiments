@@ -85,6 +85,21 @@ class HeavyHitterCache(DynamicCache):
         if not hasattr(layer, "keys"):
             return super().update(key_states, value_states, layer_idx, *args, **kwargs)
 
+        # Only take over layers that hold a standard 4-D KV state. v5 hybrid
+        # caches can route other state (recurrent/conv placeholders) through
+        # update as well; those must go through the base class untouched.
+        standard_kv = (
+            torch.is_tensor(layer.keys) and layer.keys.dim() == 4
+            and torch.is_tensor(layer.values) and layer.values.dim() == 4
+        )
+        if not standard_kv:
+            if layer.is_initialized and not getattr(layer, "_hh_bypass_warned", False):
+                print(f"[heavy_hitter] layer {layer_idx}: non-4D KV state "
+                      f"(keys shape={getattr(layer.keys, 'shape', None)}, "
+                      f"type={type(layer.keys).__name__}), delegating to base cache")
+                layer._hh_bypass_warned = True
+            return super().update(key_states, value_states, layer_idx, *args, **kwargs)
+
         if not layer.is_initialized:
             layer.lazy_initialization(key_states, value_states)
 
