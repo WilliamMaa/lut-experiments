@@ -168,7 +168,6 @@ class HeavyHitterAttnScorePatch(HeavyHitterCachePatch):
     def __init__(self, max_cache_len: int = 512, sink_tokens: int = 4, recent_tokens: int = 128):
         super().__init__(max_cache_len, sink_tokens, recent_tokens)
         self._bank = AttentionScoreBank()
-        self._prev_attn_impl = None
 
     def name(self) -> str:
         return f"heavy_hitter_attn_l{self.max_cache_len}_s{self.sink_tokens}_r{self.recent_tokens}"
@@ -191,9 +190,7 @@ class HeavyHitterAttnScorePatch(HeavyHitterCachePatch):
         ).to(device)
 
     def install(self, model):
-        self._prev_attn_impl = model.config._attn_implementation
         install_eager_score_stash(model, self._bank)
 
     def uninstall(self, model):
-        uninstall_eager_score_stash(model, self._prev_attn_impl)
-        self._prev_attn_impl = None
+        uninstall_eager_score_stash(model)
