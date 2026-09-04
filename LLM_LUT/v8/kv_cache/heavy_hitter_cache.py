@@ -107,6 +107,10 @@ class HeavyHitterCache(DynamicCache):
         if layer.keys.device != key_states.device:
             layer.keys = layer.keys.to(key_states.device)
             layer.values = layer.values.to(key_states.device)
+            if getattr(layer, "_hh_orig_idx", None) is not None:
+                layer._hh_orig_idx = layer._hh_orig_idx.to(key_states.device)
+            if getattr(layer, "_hh_prefill_scores", None) is not None:
+                layer._hh_prefill_scores = layer._hh_prefill_scores.to(key_states.device)
 
         incoming_len = key_states.shape[-2]
         prev_len = layer.keys.shape[-2]
