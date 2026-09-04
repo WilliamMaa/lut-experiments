@@ -49,25 +49,32 @@ class HeavyHitterCache(DynamicCache):
         # L2 norm per head, averaged over heads
         return keys.float().pow(2).sum(dim=-1).sqrt().mean(dim=1)
 
-    def _middle_importance(self, layer, layer_idx, sink_n, middle_len, total_len,
-                           middle_keys, device):
-        """Per-token importance for the evictable middle region: [1, middle_len]."""
-        if self.importance_mode == "attn_score" and self.score_bank is not None:
-            prefill_scores = self.score_bank.scores.get(layer_idx)
-            if prefill_scores is not None:
-                if getattr(layer, "_hh_prefill_scores", None) is None:
-                    layer._hh_prefill_scores = prefill_scores.to(device)
-                prefill = layer._hh_prefill_scores
-                # Prefill positions get their measured attention mass; tokens
-                # appended after the snapshot (post-compression decode tokens)
-                # are protected with +inf so they roll out gradually instead of
-                # being evicted before the prefill heavy hitters.
-                scores = torch.full((total_len,), float("inf"), device=device)
-                scores[:prefill.shape[-1]] = prefill
-                middle_scores = scores[sink_n:sink_n + middle_len]
-                return middle_scores.unsqueeze(0).expand(middle_keys.shape[0], -1)
-        # Fallback: key-L2-norm proxy.
-        return self._importance_scores(middle_keys)
+    def _position_scores(self, layer, layer_idx, orig_idx, device):
+        """Attention-mass score for each currently cached key position.
+
+        Maps every cached key back to its original prefill position via
+        ``orig_idx`` (the cache is compressed, so current positions are not
+        prefill positions anymore). Keys written after the prefill snapshot
+        get +inf so they roll out gradually instead of being evicted before
+        the prefill heavy hitters.
+
+        Returns [total_len], or None when no prefill scores are available.
+        """
+        if self.importance_mode != "attn_score" or self.score_bank is None:
+            return None
+        prefill = getattr(layer, "_hh_prefill_scores", None)
+        if prefill is None:
+            bank_scores = self.score_bank.scores.get(layer_idx)
+            if bank_scores is None:
+                return None
+            prefill = bank_scores.to(device)
+            layer._hh_prefill_scores = prefill
+        plen = prefill.shape[-1]
+        valid = orig_idx < plen
+        safe_idx = orig_idx.clamp(max=plen - 1)
+        vals = torch.where(valid, prefill[safe_idx], torch.tensor(
+            float("inf"), device=device, dtype=prefill.dtype))
+        return vals
 
     def update(self, key_states, value_states, layer_idx, *args, **kwargs):
         if self.layer_class_to_replicate is not None:
@@ -87,8 +94,20 @@ class HeavyHitterCache(DynamicCache):
             layer.values = layer.values.to(key_states.device)
 
         incoming_len = key_states.shape[-2]
+        prev_len = layer.keys.shape[-2]
         keys = torch.cat([layer.keys, key_states], dim=-2)
         values = torch.cat([layer.values, value_states], dim=-2)
+
+        # Track original prefill positions of cached keys. After eviction the
+        # current positions no longer match prefill positions, so importance
+        # scores are looked up through this index.
+        orig_idx = getattr(layer, "_hh_orig_idx", None)
+        if orig_idx is None:
+            orig_idx = torch.arange(prev_len, device=keys.device)
+        orig_idx = torch.cat([
+            orig_idx,
+            torch.arange(prev_len, prev_len + incoming_len, device=keys.device),
+        ])
 
         total_len = keys.shape[-2]
 
@@ -98,6 +117,7 @@ class HeavyHitterCache(DynamicCache):
             # defer compression to the first decode step.
             layer.keys = keys
             layer.values = values
+            layer._hh_orig_idx = orig_idx
             return keys, values
 
         if total_len > self.retention_max_cache_len:
@@ -118,10 +138,15 @@ class HeavyHitterCache(DynamicCache):
 
             if hh_budget > 0 and middle_len > hh_budget:
                 B, H, M, D = middle_keys.shape
-                scores = self._middle_importance(
-                    layer, layer_idx, sink_n, middle_len, total_len,
-                    middle_keys, keys.device,
-                )  # [B, M]
+                pos_scores = self._position_scores(
+                    layer, layer_idx, orig_idx, keys.device,
+                )
+                if pos_scores is not None:
+                    scores = pos_scores[sink_n:sink_n + middle_len]
+                else:
+                    # Fallback: key-L2-norm proxy.
+                    scores = self._importance_scores(middle_keys)[0]
+                scores = scores.unsqueeze(0).expand(B, -1)  # [B, M]
                 topk = scores.topk(hh_budget, dim=-1).indices  # [B, hh_budget]
                 topk, _ = topk.sort(dim=-1)  # maintain temporal order
 
@@ -129,6 +154,15 @@ class HeavyHitterCache(DynamicCache):
                 topk_expanded = topk.unsqueeze(1).unsqueeze(-1).expand(B, H, hh_budget, D)
                 hh_keys = torch.gather(middle_keys, dim=2, index=topk_expanded)
                 hh_values = torch.gather(middle_values, dim=2, index=topk_expanded)
+
+                # Keep original-position index in sync with the compressed keys.
+                middle_orig = orig_idx[sink_n:middle_end]
+                sel_orig = torch.gather(
+                    middle_orig.unsqueeze(0).expand(B, -1), 1, topk,
+                )[0]  # batch is always 1 in this eval
+                orig_idx = torch.cat([
+                    orig_idx[:sink_n], sel_orig, orig_idx[-recent_n:],
+                ])
 
                 keys = torch.cat([sink_keys, hh_keys, recent_keys], dim=-2)
                 values = torch.cat([sink_values, hh_values, recent_values], dim=-2)
@@ -138,6 +172,7 @@ class HeavyHitterCache(DynamicCache):
 
         layer.keys = keys
         layer.values = values
+        layer._hh_orig_idx = orig_idx
         return keys, values
 
     def to(self, device):
@@ -148,4 +183,6 @@ class HeavyHitterCache(DynamicCache):
                 layer.values = layer.values.to(device)
             if getattr(layer, "_hh_prefill_scores", None) is not None:
                 layer._hh_prefill_scores = layer._hh_prefill_scores.to(device)
+            if getattr(layer, "_hh_orig_idx", None) is not None:
+                layer._hh_orig_idx = layer._hh_orig_idx.to(device)
         return self
