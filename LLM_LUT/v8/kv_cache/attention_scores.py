@@ -43,9 +43,16 @@ def _hh_eager_attention(module, query, key, value, attention_mask,
                         head_mask=None, **kwargs):
     """Eager attention with GQA replication; returns (output, attn_weights).
 
-    Importance stash: during prefill (q_len > 1) we column-sum the softmax
-    probabilities and store them per layer in the shared bank.
+    Computes internally in float32 and rounds to the input dtype only at the
+    output boundary. A naive bf16 eager kernel (round probs to bf16 before
+    the P@V matmul) introduces ~1% per-layer error that compounds across 40
+    layers into a massive logit drift (measured: max diff 16.3, top-1
+    agreement 79.7% vs sdpa); flash/sdpa accumulate in fp32 internally.
     """
+    orig_dtype = value.dtype
+    query = query.float()
+    key = key.float()
+    value = value.float()
     if scaling is None:
         scaling = query.shape[-1] ** -0.5
 
@@ -69,7 +76,7 @@ def _hh_eager_attention(module, query, key, value, attention_mask,
             attn_weights = attn_weights.masked_fill(~attention_mask, min_val)
         else:
             # Additive float mask (0 / -inf), possibly 2D or 4D.
-            attn_weights = attn_weights + attention_mask[..., : key.shape[-2]]
+            attn_weights = attn_weights + attention_mask[..., : key.shape[-2]].float()
     else:
         # No mask provided: apply causal mask ourselves (prefill case).
         q_len, k_len = query.shape[-2], key.shape[-2]
@@ -80,12 +87,12 @@ def _hh_eager_attention(module, query, key, value, attention_mask,
             causal = torch.triu(causal, diagonal=1 + (k_len - q_len))
             attn_weights = attn_weights + causal
 
-    attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32)
+    attn_weights = torch.softmax(attn_weights, dim=-1)  # already float32
     if dropout and dropout > 0.0:
         attn_weights = torch.nn.functional.dropout(attn_weights, p=dropout,
                                                    training=module.training)
-    attn_output = torch.matmul(attn_weights.to(value.dtype), value)
-    return attn_output, attn_weights
+    attn_output = torch.matmul(attn_weights, value)
+    return attn_output.to(orig_dtype), attn_weights
 
 
 def _registry_target():
