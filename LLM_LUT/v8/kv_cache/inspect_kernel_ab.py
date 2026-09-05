@@ -27,7 +27,25 @@ import kv_cache.attention_scores as attn_scores
 PROBE = {"calls": []}
 
 
+def _fp64_reference(query, key, value, attention_mask, scaling):
+    """Ground-truth eager attention in float64 on CPU (same math, high precision)."""
+    q = query.detach().double().cpu()
+    k = key.detach().double().cpu()
+    v = value.detach().double().cpu()
+    n_rep = q.shape[1] // k.shape[1]
+    if n_rep > 1:
+        k = k.repeat_interleave(n_rep, dim=1)
+        v = v.repeat_interleave(n_rep, dim=1)
+    w = torch.matmul(q, k.transpose(-1, -2)) * scaling
+    if torch.is_tensor(attention_mask):
+        w = w + attention_mask.detach().double().cpu()[..., : k.shape[-2]]
+    p = torch.softmax(w, dim=-1)
+    return torch.matmul(p, v)
+
+
 def probing_kernel(module, query, key, value, attention_mask, *args, **kwargs):
+    out, attn_weights = attn_scores._ORIG_KERNEL(module, query, key, value,
+                                                 attention_mask, *args, **kwargs)
     if len(PROBE["calls"]) < 3:
         mask = attention_mask
         info = {
@@ -37,8 +55,8 @@ def probing_kernel(module, query, key, value, attention_mask, *args, **kwargs):
             "v_shape": tuple(value.shape),
             "mask_type": type(mask).__name__,
             "kwargs": {
-                k: (tuple(v.shape) if torch.is_tensor(v) else v)
-                for k, v in kwargs.items()
+                k2: (tuple(v2.shape) if torch.is_tensor(v2) else v2)
+                for k2, v2 in kwargs.items()
             },
         }
         if torch.is_tensor(mask):
@@ -55,12 +73,18 @@ def probing_kernel(module, query, key, value, attention_mask, *args, **kwargs):
                     mask.bool().float().mean().item(), 4)
         elif isinstance(mask, dict):
             info["mask_entries"] = {
-                k: (tuple(v.shape) if torch.is_tensor(v) else type(v).__name__)
-                for k, v in mask.items()
+                k2: (tuple(v2.shape) if torch.is_tensor(v2) else type(v2).__name__)
+                for k2, v2 in mask.items()
             }
+        # Per-layer ground truth check: is OUR output close to exact math?
+        scale = kwargs.get("scaling") or query.shape[-1] ** -0.5
+        ref = _fp64_reference(query, key, value, attention_mask, scale)
+        d = (out.detach().double().cpu() - ref).abs()
+        info["layer_vs_fp64_max"] = round(d.max().item(), 6)
+        info["layer_vs_fp64_mean"] = round(d.mean().item(), 6)
+        info["out_absmax"] = round(out.detach().abs().max().item(), 4)
         PROBE["calls"].append(info)
-    return attn_scores._ORIG_KERNEL(module, query, key, value, attention_mask,
-                                    *args, **kwargs)
+    return out, attn_weights
 
 
 def main():
