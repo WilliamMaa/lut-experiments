@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
-"""Attention-score collection for importance-aware KV cache eviction.
+"""Attention-score collection via an sdpa wrapper (no math changes).
 
-Provides an "eager" attention kernel (Q@K^T -> mask -> softmax -> @V, with
-GQA head replication) that additionally accumulates, per full-attention
-layer, the total attention mass each key position receives during prefill
-(column sum of attention probabilities over heads and query positions).
+Replaces the registry entry of the model's active attention implementation
+("sdpa") with a wrapper that:
 
-This is the H2O/SnapKV-style importance signal, replacing the key-L2-norm
-proxy (which cannot see *which* keys the queries actually attend to).
+  1. calls torch's scaled_dot_product_attention for the output, so the
+     patched forward is numerically identical to baseline. A previous version
+     implemented a custom eager kernel; even with float32 internals the
+     full-model logits drifted from baseline (measured max diff 16.3, top-1
+     agreement 75-80% over 40 bf16 layers) because any rounding difference
+     vs sdpa compounds chaotically through MoE routing. Do NOT reintroduce
+     custom attention math here.
+  2. stashes per-key attention mass from the last prefill's observation
+     window (last W query rows), computed in fp32 on the side, for
+     importance-aware KV cache eviction (HeavyHitterCache,
+     importance_mode="attn_score").
 
-Why a self-contained kernel: transformers v5 registers implementations
-lazily and "eager" is absent from ALL_ATTENTION_FUNCTIONS at patch time;
-importing the internal kernel is not reliable across versions. The math is
-identical to the reference eager attention.
+The config's attention implementation is left untouched; only the registry
+entry is swapped, so mask creation and backend selection follow the exact
+baseline path.
 """
 
 import torch
+import torch.nn.functional as F
+import transformers
 import transformers.modeling_utils as modeling_utils
 
 
@@ -38,61 +46,82 @@ def set_observation_window(w: int):
     _StashState.obs_window = int(w)
 
 
-def _hh_eager_attention(module, query, key, value, attention_mask,
-                        dropout=0.0, scaling=None, sliding_window=None,
-                        head_mask=None, **kwargs):
-    """Eager attention with GQA replication; returns (output, attn_weights).
+def _causal_rows(w, k_len, device, dtype):
+    """Additive causal mask rows for the LAST w query positions of a prefill
+    where q_len == k_len (row i at global position k_len - w + i)."""
+    rows = torch.arange(k_len - w, k_len, device=device)[:, None]
+    cols = torch.arange(k_len, device=device)[None, :]
+    keep = cols <= rows  # [W, K]
+    mask = torch.zeros(w, k_len, device=device, dtype=dtype)
+    mask.masked_fill_(~keep, torch.finfo(dtype).min)
+    return mask
 
-    Computes internally in float32 and rounds to the input dtype only at the
-    output boundary. A naive bf16 eager kernel (round probs to bf16 before
-    the P@V matmul) introduces ~1% per-layer error that compounds across 40
-    layers into a massive logit drift (measured: max diff 16.3, top-1
-    agreement 79.7% vs sdpa); flash/sdpa accumulate in fp32 internally.
-    """
-    orig_dtype = value.dtype
-    query = query.float()
-    key = key.float()
-    value = value.float()
+
+def _stash(module, query, key, value, attention_mask, scaling):
+    bank = _StashState.bank
+    if bank is None or module.training:
+        return
+    q_len = query.shape[-2]
+    if q_len <= 1:
+        # Decode step: eviction is driven by the prefill snapshot.
+        return
+    layer_idx = getattr(module, "layer_idx", None)
+    if layer_idx is None:
+        return
+    w = min(_StashState.obs_window, q_len)
+    k_len = key.shape[-2]
     if scaling is None:
         scaling = query.shape[-1] ** -0.5
-
-    # GQA: replicate k/v heads to match query heads.
-    n_rep = query.shape[1] // key.shape[1]
+    q = query[..., -w:, :].detach().float()
+    k = key.detach().float()
+    n_rep = q.shape[1] // k.shape[1]
     if n_rep > 1:
-        key = key.repeat_interleave(n_rep, dim=1)
-        value = value.repeat_interleave(n_rep, dim=1)
-
-    attn_weights = torch.matmul(query, key.transpose(-1, -2)) * scaling
-
-    if isinstance(attention_mask, dict):
-        # v5-style packed/boolean mask dict: True means "keep".
-        bool_mask = attention_mask.get("bool_mask")
-        if bool_mask is not None:
-            min_val = torch.finfo(attn_weights.dtype).min
-            attn_weights = attn_weights.masked_fill(~bool_mask, min_val)
-    elif attention_mask is not None:
+        k = k.repeat_interleave(n_rep, dim=1)
+    scores = torch.matmul(q, k.transpose(-1, -2)) * scaling  # [B, H, W, K]
+    if torch.is_tensor(attention_mask):
         if attention_mask.dtype == torch.bool:
-            min_val = torch.finfo(attn_weights.dtype).min
-            attn_weights = attn_weights.masked_fill(~attention_mask, min_val)
+            keep = attention_mask[..., -w:, :k_len].bool()
+            scores = scores.masked_fill(~keep, torch.finfo(scores.dtype).min)
         else:
-            # Additive float mask (0 / -inf), possibly 2D or 4D.
-            attn_weights = attn_weights + attention_mask[..., : key.shape[-2]].float()
+            scores = scores + attention_mask[..., -w:, :k_len].float()
     else:
-        # No mask provided: apply causal mask ourselves (prefill case).
-        q_len, k_len = query.shape[-2], key.shape[-2]
-        if q_len > 1:
-            min_val = torch.finfo(attn_weights.dtype).min
-            causal = torch.full((q_len, k_len), min_val,
-                                device=attn_weights.device, dtype=attn_weights.dtype)
-            causal = torch.triu(causal, diagonal=1 + (k_len - q_len))
-            attn_weights = attn_weights + causal
+        scores = scores + _causal_rows(w, k_len, scores.device, scores.dtype)[None, None]
+    probs = torch.softmax(scores, dim=-1)
+    bank.scores[layer_idx] = probs.sum(dim=(0, 1, 2))  # [K] float32
 
-    attn_weights = torch.softmax(attn_weights, dim=-1)  # already float32
-    if dropout and dropout > 0.0:
-        attn_weights = torch.nn.functional.dropout(attn_weights, p=dropout,
-                                                   training=module.training)
-    attn_output = torch.matmul(attn_weights, value)
-    return attn_output.to(orig_dtype), attn_weights
+
+def _sdpa_stash(module, query, key, value, attention_mask, dropout=0.0,
+                scaling=None, **kwargs):
+    _stash(module, query, key, value, attention_mask, scaling)
+    if isinstance(attention_mask, dict):
+        raise RuntimeError(
+            "sdpa stash wrapper received a dict mask; the model's attention "
+            "implementation is not the plain sdpa path this wrapper assumes."
+        )
+    is_causal = attention_mask is None and query.shape[-2] > 1
+    try:
+        out = F.scaled_dot_product_attention(
+            query, key, value,
+            attn_mask=attention_mask,
+            dropout_p=dropout if module.training else 0.0,
+            is_causal=is_causal,
+            scale=scaling,
+            enable_gqa=query.shape[1] != key.shape[1],
+        )
+    except TypeError:  # torch < 2.5: no enable_gqa
+        n_rep = query.shape[1] // key.shape[1]
+        k, v = key, value
+        if n_rep > 1:
+            k = k.repeat_interleave(n_rep, dim=1)
+            v = v.repeat_interleave(n_rep, dim=1)
+        out = F.scaled_dot_product_attention(
+            query, k, v,
+            attn_mask=attention_mask,
+            dropout_p=dropout if module.training else 0.0,
+            is_causal=is_causal,
+            scale=scaling,
+        )
+    return out
 
 
 def _registry_target():
@@ -101,67 +130,42 @@ def _registry_target():
 
 
 class _InstallState:
-    prev_impl = None
-    prev_eager = None
+    prev_sdpa = None
     installed = False
 
 
 def install_eager_score_stash(model, bank):
-    """Route the model's full-attention layers through the stashing kernel."""
-    if getattr(model.config, "sliding_window", None):
-        raise RuntimeError(
-            "model uses sliding_window attention; the stashing eager kernel "
-            "does not handle sliding windows. Aborting instead of running silently wrong."
-        )
+    """Wrap the active 'sdpa' registry entry with the score-stashing wrapper.
+
+    The model config is NOT modified: mask creation and backend selection
+    follow the exact baseline path, so the patched forward is numerically
+    identical to baseline (asserted by inspect_kernel_ab.py).
+    """
+    impl = model.config._attn_implementation
     target = _registry_target()
-    _InstallState.prev_eager = target.get("eager")  # None on transformers v5
-    target["eager"] = _stashing_wrapper
+    orig = target.get(impl)
+    if orig is None:
+        raise RuntimeError(
+            f"attention implementation '{impl}' is not registered in "
+            f"ALL_ATTENTION_FUNCTIONS (transformers {transformers.__version__}). "
+            "Registry keys: " + ", ".join(sorted(str(k) for k in target.keys()))
+        )
+    if impl != "sdpa":
+        raise RuntimeError(
+            f"score stash wrapper assumes the model uses 'sdpa' (got '{impl}'). "
+            "Extend _sdpa_stash to wrap the active implementation instead."
+        )
+    _InstallState.prev_sdpa = orig
+    target["sdpa"] = _sdpa_stash
     _StashState.bank = bank
-    _InstallState.prev_impl = model.config._attn_implementation
-    model.config._attn_implementation = "eager"
     _InstallState.installed = True
-    print("[heavy_hitter_attn] eager kernel installed "
-          f"(transformers eager registered: {_InstallState.prev_eager is not None})")
+    print(f"[heavy_hitter_attn] sdpa stash wrapper installed over '{impl}'")
 
 
 def uninstall_eager_score_stash(model):
     if not _InstallState.installed:
         return
     _StashState.bank = None
-    target = _registry_target()
-    if _InstallState.prev_eager is None:
-        target.pop("eager", None)
-    else:
-        target["eager"] = _InstallState.prev_eager
-    model.config._attn_implementation = _InstallState.prev_impl
+    _registry_target()["sdpa"] = _InstallState.prev_sdpa
+    _InstallState.prev_sdpa = None
     _InstallState.installed = False
-
-
-# Attach the stash logic to the kernel via a thin wrapper registered below.
-# (Kept separate so the kernel stays readable.)
-_ORIG_KERNEL = _hh_eager_attention
-
-
-def _stashing_wrapper(module, query, key, value, attention_mask, *args, **kwargs):
-    out, attn_weights = _ORIG_KERNEL(module, query, key, value, attention_mask,
-                                     *args, **kwargs)
-    bank = _StashState.bank
-    if bank is None or module.training:
-        return out, attn_weights
-    if query.shape[-2] <= 1:
-        # Decode step: attention over the compressed cache is not a reliable
-        # importance signal and is not needed anyway (eviction is driven by
-        # the prefill scores).
-        return out, attn_weights
-    layer_idx = getattr(module, "layer_idx", None)
-    if layer_idx is None:
-        return out, attn_weights
-    # SnapKV-style observation window: only the LAST W query rows contribute
-    # to importance. Summing over ALL prefill queries lets the document's
-    # self-attention (local structure, headers, repeated phrases) drown out
-    # the signal about which keys the actual question needs — measured as
-    # worse than the key-norm proxy at 256 budget (EOS 0.20 vs 0.80).
-    w = min(_StashState.obs_window, attn_weights.shape[-2])
-    obs = attn_weights[..., -w:, :]
-    bank.scores[layer_idx] = obs.detach().float().sum(dim=(0, 1, 2))
-    return out, attn_weights
