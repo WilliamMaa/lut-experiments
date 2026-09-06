@@ -121,7 +121,9 @@ def _sdpa_stash(module, query, key, value, attention_mask, dropout=0.0,
             is_causal=is_causal,
             scale=scaling,
         )
-    return out
+    # transformers 5.x unpacks `attn_output, attn_weights = interface(...)`;
+    # sdpa has no weights to return, so pass None for the second value.
+    return out, None
 
 
 def _registry_target():
