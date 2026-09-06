@@ -93,37 +93,14 @@ def _stash(module, query, key, value, attention_mask, scaling):
 def _sdpa_stash(module, query, key, value, attention_mask, dropout=0.0,
                 scaling=None, **kwargs):
     _stash(module, query, key, value, attention_mask, scaling)
-    if isinstance(attention_mask, dict):
-        raise RuntimeError(
-            "sdpa stash wrapper received a dict mask; the model's attention "
-            "implementation is not the plain sdpa path this wrapper assumes."
-        )
-    is_causal = attention_mask is None and query.shape[-2] > 1
-    try:
-        out = F.scaled_dot_product_attention(
-            query, key, value,
-            attn_mask=attention_mask,
-            dropout_p=dropout if module.training else 0.0,
-            is_causal=is_causal,
-            scale=scaling,
-            enable_gqa=query.shape[1] != key.shape[1],
-        )
-    except TypeError:  # torch < 2.5: no enable_gqa
-        n_rep = query.shape[1] // key.shape[1]
-        k, v = key, value
-        if n_rep > 1:
-            k = k.repeat_interleave(n_rep, dim=1)
-            v = v.repeat_interleave(n_rep, dim=1)
-        out = F.scaled_dot_product_attention(
-            query, k, v,
-            attn_mask=attention_mask,
-            dropout_p=dropout if module.training else 0.0,
-            is_causal=is_causal,
-            scale=scaling,
-        )
-    # transformers 5.x unpacks `attn_output, attn_weights = interface(...)`;
-    # sdpa has no weights to return, so pass None for the second value.
-    return out, None
+    # Delegate to the exact function the baseline run uses: identical call,
+    # identical backend, identical rounding. Any hand-rolled sdpa call
+    # (enable_gqa layout, is_causal, scale passing) diverges from it and the
+    # drift compounds across 40 bf16 layers (measured max logit diff 16-17).
+    return _InstallState.prev_sdpa(
+        module, query, key, value, attention_mask,
+        dropout=dropout, scaling=scaling, **kwargs,
+    )
 
 
 def _registry_target():
