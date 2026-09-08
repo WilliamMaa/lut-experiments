@@ -217,6 +217,12 @@ class HeavyHitterCache(DynamicCache):
                 keys = torch.cat([sink_keys, hh_keys, recent_keys], dim=-2)
                 values = torch.cat([sink_values, hh_values, recent_values], dim=-2)
             else:
+                if hh_budget <= 0 and not getattr(layer, "_hh_nobudget_warned", False):
+                    print(f"[heavy_hitter] layer {layer_idx}: hh_budget=0 "
+                          f"(budget={budget}, sink={sink_n}, recent={recent_n}), "
+                          f"eviction disabled — cache grows unbounded, "
+                          f"result will equal baseline")
+                    layer._hh_nobudget_warned = True
                 keys = torch.cat([sink_keys, middle_keys, recent_keys], dim=-2)
                 values = torch.cat([sink_values, middle_values, recent_values], dim=-2)
 
