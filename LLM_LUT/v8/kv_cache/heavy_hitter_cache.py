@@ -139,8 +139,8 @@ class HeavyHitterCache(DynamicCache):
         tgt_slot = torch.searchsorted(kept, ev_pos, right=True).clamp(max=hh - 1)
         ev_orig = middle_orig[ev_pos]          # [E]
         tgt_orig = middle_orig[kept[tgt_slot]]  # [E]
-        w = ph[:, ev_orig] / (ph[:, tgt_orig] + 1e-8)  # [H, E]
-        w = w.clamp(max=1.0)
+        w = (ph[:, ev_orig] / (ph[:, tgt_orig] + 1e-8)).clamp(max=1.0)  # [H, E]
+        w = w.to(hh_values.dtype)
         contrib = w.unsqueeze(0).unsqueeze(-1) * middle_values[:, :, ev_pos, :]
         hh_values.index_add_(2, tgt_slot, contrib)
         if not getattr(layer, "_hh_merge_logged", False):
