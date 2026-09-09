@@ -167,19 +167,23 @@ class HeavyHitterAttnScorePatch(HeavyHitterCachePatch):
     """
 
     def __init__(self, max_cache_len: int = 512, sink_tokens: int = 4,
-                 recent_tokens: int = 128, obs_window: int = 64):
+                 recent_tokens: int = 128, obs_window: int = 64,
+                 merge_evicted: bool = False):
         super().__init__(max_cache_len, sink_tokens, recent_tokens)
         self._bank = AttentionScoreBank()
         self.obs_window = obs_window
+        self.merge_evicted = merge_evicted
 
     def name(self) -> str:
-        return (f"heavy_hitter_attn_l{self.max_cache_len}_s{self.sink_tokens}"
+        base = (f"heavy_hitter_attn_l{self.max_cache_len}_s{self.sink_tokens}"
                 f"_r{self.recent_tokens}_w{self.obs_window}")
+        return f"{base}_m" if self.merge_evicted else base
 
     def config(self) -> Dict[str, Any]:
         cfg = super().config()
         cfg["importance"] = "prefill_attn_score"
         cfg["obs_window"] = self.obs_window
+        cfg["merge_evicted"] = self.merge_evicted
         return cfg
 
     def get_cache(self, device, config=None):
@@ -193,6 +197,7 @@ class HeavyHitterAttnScorePatch(HeavyHitterCachePatch):
             importance_mode="attn_score",
             score_bank=self._bank,
             obs_window=self.obs_window,
+            merge_evicted=self.merge_evicted,
         ).to(device)
 
     def install(self, model):

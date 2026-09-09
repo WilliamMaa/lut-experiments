@@ -28,13 +28,22 @@ import transformers.modeling_utils as modeling_utils
 
 
 class AttentionScoreBank:
-    """Per-layer per-position accumulated attention mass from the last prefill."""
+    """Per-layer per-position accumulated attention mass from the last prefill.
+
+    scores:           layer_idx -> [seq_len] float32, summed over all q-heads
+                      and obs-window rows (used for eviction selection).
+    scores_per_head:  layer_idx -> [kv_heads, seq_len] float32, summed over
+                      the q-heads each kv-head serves and over obs-window
+                      rows (used for per-head merge weights).
+    """
 
     def __init__(self):
-        self.scores = {}  # layer_idx -> FloatTensor [seq_len]
+        self.scores = {}
+        self.scores_per_head = {}
 
     def clear(self):
         self.scores.clear()
+        self.scores_per_head.clear()
 
 
 class _StashState:
@@ -88,6 +97,13 @@ def _stash(module, query, key, value, attention_mask, scaling):
         scores = scores + _causal_rows(w, k_len, scores.device, scores.dtype)[None, None]
     probs = torch.softmax(scores, dim=-1)
     bank.scores[layer_idx] = probs.sum(dim=(0, 1, 2))  # [K] float32
+    n_kv = key.shape[1]
+    if probs.shape[1] % n_kv == 0:
+        # Per-kv-head mass: group the q-heads each kv-head serves (the sdpa
+        # GQA repeat_interleave layout) so merge weights are per-head.
+        bank.scores_per_head[layer_idx] = probs.reshape(
+            probs.shape[0], n_kv, -1, w, k_len,
+        ).sum(dim=(0, 2, 3)).float()  # [H_kv, K]
 
 
 def _sdpa_stash(module, query, key, value, attention_mask, dropout=0.0,

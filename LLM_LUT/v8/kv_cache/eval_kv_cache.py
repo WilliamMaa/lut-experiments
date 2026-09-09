@@ -31,6 +31,8 @@ def main():
     parser.add_argument("--recent_tokens", type=int, default=128)
     parser.add_argument("--obs_window", type=int, default=64,
                         help="Observation window (last W query rows) for heavy_hitter_attn importance")
+    parser.add_argument("--merge_evicted", action="store_true",
+                        help="Fold evicted tokens' values into kept neighbors (compensation eviction)")
     parser.add_argument("--model_path", required=True)
     parser.add_argument("--eval_file", required=True)
     parser.add_argument("--prompt_file", required=True)
@@ -77,6 +79,7 @@ def main():
             sink_tokens=args.sink_tokens,
             recent_tokens=args.recent_tokens,
             obs_window=args.obs_window,
+            merge_evicted=args.merge_evicted,
         )
     else:
         patch = patch_cls()

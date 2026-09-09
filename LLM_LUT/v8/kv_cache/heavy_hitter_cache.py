@@ -32,7 +32,8 @@ class HeavyHitterCache(DynamicCache):
         pass
 
     def __init__(self, max_cache_len=512, sink_tokens=4, recent_tokens=128, config=None,
-                 importance_mode="key_norm", score_bank=None, obs_window=0):
+                 importance_mode="key_norm", score_bank=None, obs_window=0,
+                 merge_evicted=False):
         super().__init__(config=config)
         self.retention_max_cache_len = max_cache_len
         self.sink_tokens = sink_tokens
@@ -40,6 +41,12 @@ class HeavyHitterCache(DynamicCache):
         self.importance_mode = importance_mode
         self.score_bank = score_bank
         self.obs_window = obs_window
+        # Compensation eviction: fold each evicted token's value (weighted by
+        # its per-head attention mass relative to the target kept token,
+        # capped at 1) into its nearest kept successor. Selection no longer
+        # has to be perfect — a fact living in an evicted token survives in
+        # the value of a token that stays.
+        self.merge_evicted = merge_evicted
 
     def _importance_scores(self, keys):
         """Compute per-token importance from key vectors.
@@ -79,6 +86,69 @@ class HeavyHitterCache(DynamicCache):
         vals = torch.where(valid, prefill[safe_idx], prefill.mean())
         return vals
 
+    def _per_head_scores(self, layer, layer_idx, device, n_heads):
+        """Per-kv-head prefill attention mass [H_kv, plen], cached per layer.
+
+        Falls back to spreading the head-summed scores evenly across heads
+        when the bank has no per-head data (older stash).
+        """
+        ph = getattr(layer, "_hh_prefill_scores_per_head", None)
+        if ph is None:
+            ph = self.score_bank.scores_per_head.get(layer_idx) if self.score_bank else None
+            if ph is None:
+                summed = getattr(layer, "_hh_prefill_scores", None)
+                if summed is None:
+                    bank_scores = self.score_bank.scores.get(layer_idx) if self.score_bank else None
+                    if bank_scores is None:
+                        return None
+                    summed = bank_scores.to(device)
+                    layer._hh_prefill_scores = summed
+                ph = (summed / n_heads).unsqueeze(0).expand(n_heads, -1).contiguous()
+            else:
+                ph = ph.to(device)
+            layer._hh_prefill_scores_per_head = ph
+        return ph
+
+    def _fold_evicted_values(self, layer, layer_idx, hh_values, middle_values,
+                             topk, middle_orig):
+        """Fold evicted middle tokens' values into their nearest kept successor.
+
+        Each evicted token i folds into the first kept token at a later
+        original position (fallback: the last kept token). Per-head weight is
+        min(1, mass_i / mass_target): an evicted token contributes at most one
+        full copy of itself, so a single hot token cannot dominate its target.
+
+        hh_values: [B, H, hh, D] gathered heavy-hitter values (fresh tensor,
+        safe to modify in place). topk: [B, hh] middle-relative kept indices,
+        sorted ascending. middle_orig: [M] original prefill positions of the
+        middle region. middle_values: [B, H, M, D] (read-only view).
+        """
+        B, H, hh, D = hh_values.shape
+        M = middle_values.shape[2]
+        kept = topk[0]  # [hh], ascending
+        ev_mask = torch.ones(M, dtype=torch.bool, device=middle_values.device)
+        ev_mask[kept] = False
+        ev_pos = ev_mask.nonzero(as_tuple=True)[0]  # [E]
+        if ev_pos.numel() == 0:
+            return hh_values
+        ph = self._per_head_scores(layer, layer_idx, middle_values.device, H)
+        if ph is None:
+            return hh_values
+        # First kept slot whose middle position is >= evicted position; an
+        # evicted token folds FORWARD (causally later queries look backward).
+        tgt_slot = torch.searchsorted(kept, ev_pos, right=True).clamp(max=hh - 1)
+        ev_orig = middle_orig[ev_pos]          # [E]
+        tgt_orig = middle_orig[kept[tgt_slot]]  # [E]
+        w = ph[:, ev_orig] / (ph[:, tgt_orig] + 1e-8)  # [H, E]
+        w = w.clamp(max=1.0)
+        contrib = w.unsqueeze(0).unsqueeze(-1) * middle_values[:, :, ev_pos, :]
+        hh_values.index_add_(2, tgt_slot, contrib)
+        if not getattr(layer, "_hh_merge_logged", False):
+            layer._hh_merge_logged = True
+            print(f"[heavy_hitter] layer {layer_idx}: folded {ev_pos.numel()} "
+                  f"evicted values into {hh} kept slots")
+        return hh_values
+
     def update(self, key_states, value_states, layer_idx, *args, **kwargs):
         if self.layer_class_to_replicate is not None:
             while len(self.layers) <= layer_idx:
@@ -114,6 +184,8 @@ class HeavyHitterCache(DynamicCache):
                 layer._hh_orig_idx = layer._hh_orig_idx.to(key_states.device)
             if getattr(layer, "_hh_prefill_scores", None) is not None:
                 layer._hh_prefill_scores = layer._hh_prefill_scores.to(key_states.device)
+            if getattr(layer, "_hh_prefill_scores_per_head", None) is not None:
+                layer._hh_prefill_scores_per_head = layer._hh_prefill_scores_per_head.to(key_states.device)
 
         incoming_len = key_states.shape[-2]
         prev_len = layer.keys.shape[-2]
@@ -190,13 +262,20 @@ class HeavyHitterCache(DynamicCache):
                 topk = scores.topk(hh_budget, dim=-1).indices  # [B, hh_budget]
                 topk, _ = topk.sort(dim=-1)  # maintain temporal order
 
+                # Keep original-position index in sync with the compressed keys.
+                middle_orig = orig_idx[sink_n:middle_end]
+
                 # Gather heavy hitters: [B, H, hh_budget, D]
                 topk_expanded = topk.unsqueeze(1).unsqueeze(-1).expand(B, H, hh_budget, D)
                 hh_keys = torch.gather(middle_keys, dim=2, index=topk_expanded)
                 hh_values = torch.gather(middle_values, dim=2, index=topk_expanded)
 
-                # Keep original-position index in sync with the compressed keys.
-                middle_orig = orig_idx[sink_n:middle_end]
+                if self.merge_evicted and pos_scores is not None:
+                    hh_values = self._fold_evicted_values(
+                        layer, layer_idx, hh_values, middle_values,
+                        topk, middle_orig,
+                    )
+
                 sel_orig = torch.gather(
                     middle_orig.unsqueeze(0).expand(B, -1), 1, topk,
                 )[0]  # batch is always 1 in this eval

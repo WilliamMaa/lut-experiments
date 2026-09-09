@@ -59,3 +59,89 @@ nohup python -u kv_cache/eval_kv_cache.py \
 ```
 
 注意：`--torch_dtype bfloat16` 和 `--logit_metrics` 之间必须有空格。输出文件名不要覆盖旧结果。
+
+## 3. budget 128 内重分预算（1000x：recent 32 / hh 92）
+
+2026-09-08 的 l128/r64 run 结论：1000x 越界（退化循环 + mid-document 事实错误，
+EOS 0.717）。decode KL 与 500x 几乎相同但生成崩了，说明轨迹级指标不敏感，
+应以退化轮次 + 事实正确率为主指标。先试把 middle 预算从 60 提到 92（recent 64→32），
+专打事实丢失。
+
+```bash
+nohup python -u kv_cache/eval_kv_cache.py \
+  --patch heavy_hitter_attn \
+  --max_cache_len 128 \
+  --sink_tokens 4 \
+  --recent_tokens 32 \
+  --obs_window 64 \
+  --model /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --eval_file v8_eval_texts.jsonl \
+  --prompt_file candidate_prompts.jsonl \
+  --multi_turn \
+  --multi_turn_file data/multi_turn_prompts_v3.jsonl \
+  --max_eval_samples 8 \
+  --max_new_tokens 128 \
+  --max_length 4096 \
+  --device_map balanced_low_0 \
+  --torch_dtype bfloat16 \
+  --logit_metrics \
+  --output_json results/heavy_hitter_attn_l128_s4_r32_w64_multiturn_v3set.json \
+  > heavy_hitter_attn_l128_r32_v3set.log 2>&1 &
+```
+
+## 4. 哨兵题修复探测（1000x：obs_window 64 → 256）
+
+2026-09-09 结论：l128/r32 全面好于 r64（EOS 0.830、零循环、新加坡/积碳/温哥华全对），
+middle 预算比 recency 值钱。但哨兵题 doc0 T4（全年指引 178-182 亿）在 500x/1000x、
+hh 60/124 下全部答错——不是容量问题，是选择机制问题：obs_window=64 里约 40 行是
+chat template，真正携带问题信息的 query 行太少。以下 run 只放大打分窗口。
+
+```bash
+nohup python -u kv_cache/eval_kv_cache.py \
+  --patch heavy_hitter_attn \
+  --max_cache_len 128 \
+  --sink_tokens 4 \
+  --recent_tokens 32 \
+  --obs_window 256 \
+  --model /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --eval_file v8_eval_texts.jsonl \
+  --prompt_file candidate_prompts.jsonl \
+  --multi_turn \
+  --multi_turn_file data/multi_turn_prompts_v3.jsonl \
+  --max_eval_samples 8 \
+  --max_new_tokens 128 \
+  --max_length 4096 \
+  --device_map balanced_low_0 \
+  --torch_dtype bfloat16 \
+  --logit_metrics \
+  --output_json results/heavy_hitter_attn_l128_s4_r32_w256_multiturn_v3set.json \
+  > heavy_hitter_attn_l128_r32_w256_v3set.log 2>&1 &
+```
+
+## 5. M1 补偿式淘汰（1000x，同 l128/s4/r32/w64 配置 + --merge_evicted）
+
+与 2026-09-09 的 l128/s4/r32/w64 run 唯一差异是 folding。对比重点：
+哨兵题 doc0 T4（178-182 亿）是否修复、退化轮次是否增加。patch 名带 `_m` 后缀。
+
+```bash
+nohup python -u kv_cache/eval_kv_cache.py \
+  --patch heavy_hitter_attn \
+  --max_cache_len 128 \
+  --sink_tokens 4 \
+  --recent_tokens 32 \
+  --obs_window 64 \
+  --merge_evicted \
+  --model /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --eval_file v8_eval_texts.jsonl \
+  --prompt_file candidate_prompts.jsonl \
+  --multi_turn \
+  --multi_turn_file data/multi_turn_prompts_v3.jsonl \
+  --max_eval_samples 8 \
+  --max_new_tokens 128 \
+  --max_length 4096 \
+  --device_map balanced_low_0 \
+  --torch_dtype bfloat16 \
+  --logit_metrics \
+  --output_json results/heavy_hitter_attn_l128_s4_r32_w64_m_multiturn_v3set.json \
+  > heavy_hitter_attn_l128_r32_w64_m_v3set.log 2>&1 &
+```
