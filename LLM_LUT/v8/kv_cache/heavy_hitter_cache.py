@@ -134,11 +134,16 @@ class HeavyHitterCache(DynamicCache):
         ph = self._per_head_scores(layer, layer_idx, middle_values.device, H)
         if ph is None:
             return hh_values
+        # Clamp every index against its table: the score table comes from the
+        # prefill snapshot and any length mismatch must never turn into a CUDA
+        # device-side assert.
+        kept = kept.clamp(max=M - 1).long()
+        ev_pos = ev_pos.clamp(max=M - 1).long()
         # First kept slot whose middle position is >= evicted position; an
         # evicted token folds FORWARD (causally later queries look backward).
-        tgt_slot = torch.searchsorted(kept, ev_pos, right=True).clamp(max=hh - 1)
-        ev_orig = middle_orig[ev_pos]          # [E]
-        tgt_orig = middle_orig[kept[tgt_slot]]  # [E]
+        tgt_slot = torch.searchsorted(kept, ev_pos, right=True).clamp(max=hh - 1).long()
+        ev_orig = middle_orig[ev_pos].clamp(max=ph.shape[-1] - 1).long()           # [E]
+        tgt_orig = middle_orig[kept[tgt_slot]].clamp(max=ph.shape[-1] - 1).long()  # [E]
         w = (ph[:, ev_orig] / (ph[:, tgt_orig] + 1e-8)).clamp(max=1.0)  # [H, E]
         w = w.to(hh_values.dtype)
         contrib = w.unsqueeze(0).unsqueeze(-1) * middle_values[:, :, ev_pos, :]

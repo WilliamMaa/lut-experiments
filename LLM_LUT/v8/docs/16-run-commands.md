@@ -123,8 +123,12 @@ nohup python -u kv_cache/eval_kv_cache.py \
 与 2026-09-09 的 l128/s4/r32/w64 run 唯一差异是 folding。对比重点：
 哨兵题 doc0 T4（178-182 亿）是否修复、退化轮次是否增加。patch 名带 `_m` 后缀。
 
+注意：2026-09-09 首次 M1 run 在首次淘汰全部完成后崩于 device-side assert（index out of
+bounds，异步上报，栈不可靠）。已对 fold 索引全部加钳制，并加 CUDA_LAUNCH_BLOCKING=1
+重跑：若仍崩，栈会指向真实 kernel，把新的报错发回来。
+
 ```bash
-nohup python -u kv_cache/eval_kv_cache.py \
+CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/eval_kv_cache.py \
   --patch heavy_hitter_attn \
   --max_cache_len 128 \
   --sink_tokens 4 \
