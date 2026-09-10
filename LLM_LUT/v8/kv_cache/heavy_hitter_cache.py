@@ -18,9 +18,23 @@ Two importance signals are supported:
 import torch
 from transformers.cache_utils import DynamicCache
 
+from kv_cache.kv_quantizers import (
+    quantize_per_channel,
+    dequantize_per_channel,
+    quantize_per_token,
+    dequantize_per_token,
+)
+
 
 class HeavyHitterCache(DynamicCache):
-    """DynamicCache that retains sink + recent + heavy-hitter middle tokens."""
+    """DynamicCache that retains sink + recent + heavy-hitter middle tokens.
+
+    Optional K/V storage quantization (k_bits/v_bits, 16 = off): the stored
+    cache is quantized once the post-eviction state is reached (decode
+    steps); update() dequantizes at entry and returns dequantized tensors
+    for attention, KIVI-style (per-channel K, per-token V). Prefill growth
+    stays bf16 — the compression target is the decode-time cache.
+    """
 
     # Override DynamicCache's length bound so generation uses --max_length, not cache capacity.
     @property
@@ -33,7 +47,7 @@ class HeavyHitterCache(DynamicCache):
 
     def __init__(self, max_cache_len=512, sink_tokens=4, recent_tokens=128, config=None,
                  importance_mode="key_norm", score_bank=None, obs_window=0,
-                 merge_evicted=False):
+                 merge_evicted=False, k_bits=16, v_bits=16):
         super().__init__(config=config)
         self.retention_max_cache_len = max_cache_len
         self.sink_tokens = sink_tokens
@@ -47,6 +61,36 @@ class HeavyHitterCache(DynamicCache):
         # has to be perfect — a fact living in an evicted token survives in
         # the value of a token that stays.
         self.merge_evicted = merge_evicted
+        self.k_bits = k_bits
+        self.v_bits = v_bits
+        self._k_meta = {}  # layer_idx -> (scale, min) for quantized stored K
+        self._v_meta = {}  # layer_idx -> (scale, min) for quantized stored V
+
+    def _maybe_quantize(self, layer, layer_idx, keys, values, incoming_len):
+        """Quantize the stored post-eviction state on decode steps.
+
+        Returns the tensors attention should use this forward (dequantized).
+        Prefill growth (incoming_len > 1) stays bf16: storage is transient
+        there and the compression target is the decode-time cache.
+        """
+        if (self.k_bits >= 16 and self.v_bits >= 16) or incoming_len > 1:
+            return keys, values
+        qk, qv = keys, values
+        if self.k_bits < 16:
+            qk, s_k, m_k = quantize_per_channel(keys, self.k_bits)
+            self._k_meta[layer_idx] = (s_k, m_k)
+        else:
+            self._k_meta.pop(layer_idx, None)
+        if self.v_bits < 16:
+            qv, s_v, m_v = quantize_per_token(values, self.v_bits)
+            self._v_meta[layer_idx] = (s_v, m_v)
+        else:
+            self._v_meta.pop(layer_idx, None)
+        layer.keys = qk
+        layer.values = qv
+        out_k = dequantize_per_channel(qk, *self._k_meta[layer_idx]) if self.k_bits < 16 else qk
+        out_v = dequantize_per_token(qv, *self._v_meta[layer_idx]) if self.v_bits < 16 else qv
+        return out_k, out_v
 
     def _importance_scores(self, keys):
         """Compute per-token importance from key vectors.
@@ -210,6 +254,17 @@ class HeavyHitterCache(DynamicCache):
                 layer._hh_prefill_scores = layer._hh_prefill_scores.to(key_states.device)
             if getattr(layer, "_hh_prefill_scores_per_head", None) is not None:
                 layer._hh_prefill_scores_per_head = layer._hh_prefill_scores_per_head.to(key_states.device)
+            if layer_idx in self._k_meta:
+                self._k_meta[layer_idx] = tuple(t.to(key_states.device) for t in self._k_meta[layer_idx])
+            if layer_idx in self._v_meta:
+                self._v_meta[layer_idx] = tuple(t.to(key_states.device) for t in self._v_meta[layer_idx])
+
+        # Stored state is quantized after the first post-eviction decode step;
+        # dequantize back to bf16 for this step's concat/eviction/fold math.
+        if layer_idx in self._k_meta:
+            layer.keys = dequantize_per_channel(layer.keys, *self._k_meta[layer_idx])
+        if layer_idx in self._v_meta:
+            layer.values = dequantize_per_token(layer.values, *self._v_meta[layer_idx])
 
         incoming_len = key_states.shape[-2]
         prev_len = layer.keys.shape[-2]
@@ -332,6 +387,7 @@ class HeavyHitterCache(DynamicCache):
         layer.keys = keys
         layer.values = values
         layer._hh_orig_idx = orig_idx
+        keys, values = self._maybe_quantize(layer, layer_idx, keys, values, incoming_len)
         return keys, values
 
     def to(self, device):

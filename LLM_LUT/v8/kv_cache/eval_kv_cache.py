@@ -80,6 +80,8 @@ def main():
             recent_tokens=args.recent_tokens,
             obs_window=args.obs_window,
             merge_evicted=args.merge_evicted,
+            k_bits=args.k_bits,
+            v_bits=args.v_bits,
         )
     else:
         patch = patch_cls()

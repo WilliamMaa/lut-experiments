@@ -168,22 +168,30 @@ class HeavyHitterAttnScorePatch(HeavyHitterCachePatch):
 
     def __init__(self, max_cache_len: int = 512, sink_tokens: int = 4,
                  recent_tokens: int = 128, obs_window: int = 64,
-                 merge_evicted: bool = False):
+                 merge_evicted: bool = False, k_bits: int = 16, v_bits: int = 16):
         super().__init__(max_cache_len, sink_tokens, recent_tokens)
         self._bank = AttentionScoreBank()
         self.obs_window = obs_window
         self.merge_evicted = merge_evicted
+        self.k_bits = k_bits
+        self.v_bits = v_bits
 
     def name(self) -> str:
         base = (f"heavy_hitter_attn_l{self.max_cache_len}_s{self.sink_tokens}"
                 f"_r{self.recent_tokens}_w{self.obs_window}")
-        return f"{base}_m" if self.merge_evicted else base
+        if self.merge_evicted:
+            base = f"{base}_m"
+        if self.k_bits < 16 or self.v_bits < 16:
+            base = f"{base}_k{self.k_bits}v{self.v_bits}"
+        return base
 
     def config(self) -> Dict[str, Any]:
         cfg = super().config()
         cfg["importance"] = "prefill_attn_score"
         cfg["obs_window"] = self.obs_window
         cfg["merge_evicted"] = self.merge_evicted
+        cfg["k_bits"] = self.k_bits
+        cfg["v_bits"] = self.v_bits
         return cfg
 
     def get_cache(self, device, config=None):
@@ -198,7 +206,34 @@ class HeavyHitterAttnScorePatch(HeavyHitterCachePatch):
             score_bank=self._bank,
             obs_window=self.obs_window,
             merge_evicted=self.merge_evicted,
+            k_bits=self.k_bits,
+            v_bits=self.v_bits,
         ).to(device)
+
+    def storage_stats(self) -> Dict[str, Any]:
+        kv_heads = 2
+        head_dim = 256
+        full_attn_layers = 10
+        bf16_bytes_per_token = kv_heads * head_dim * 4
+        if self.k_bits < 16 or self.v_bits < 16:
+            k_bytes = kv_heads * head_dim * (self.k_bits / 8) if self.k_bits < 16 else kv_heads * head_dim * 2
+            v_bytes = kv_heads * head_dim * (self.v_bits / 8) if self.v_bits < 16 else kv_heads * head_dim * 2
+            bytes_per_token = k_bytes + v_bytes
+        else:
+            bytes_per_token = bf16_bytes_per_token
+        effective_bytes_per_token = bytes_per_token * (self.max_cache_len / 128000)
+        return {
+            "max_cache_len": self.max_cache_len,
+            "sink_tokens": self.sink_tokens,
+            "recent_tokens": self.recent_tokens,
+            "k_bits": self.k_bits,
+            "v_bits": self.v_bits,
+            "bf16_bytes_per_token": bf16_bytes_per_token,
+            "effective_bytes_per_token_128k": effective_bytes_per_token,
+            "compression_ratio": bf16_bytes_per_token / effective_bytes_per_token,
+            "estimated_128k_context_bytes": self.max_cache_len * bytes_per_token * full_attn_layers,
+            "estimated_128k_context_bf16_bytes": bf16_bytes_per_token * 128000 * full_attn_layers,
+        }
 
     def install(self, model):
         set_observation_window(self.obs_window)

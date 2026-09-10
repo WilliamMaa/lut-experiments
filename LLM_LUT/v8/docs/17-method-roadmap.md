@@ -27,13 +27,17 @@ PPL 门槛不受影响（folding 只发生在首次 decode 压缩时，prefill �
 - **v1（2026-09-10，加法，权重 min(1, p_i/p_t)）：负收益**。每槽平均折入 ~8 个 value，
   保留 value 幅度膨胀 2-9 倍，repetition +5.7pp，decode KL 0.56→0.61，doc1 T1
   从答对变重复循环，哨兵题仍错（错法变了）。幅度膨胀是主因。
-- **v2（凸组合，待跑）**：V_t' = (p_t·V_t + Σ p_i·V_i)/(p_t + Σ p_i)，质量加权
-  平均、幅度有界。若仍退化则 folding 判死，转 M2。
+- **v2（2026-09-10，凸组合）：验证通过，成为默认配置**。EOS 0.849 反超 baseline
+  0.811，repetition 仅 +1.9pp，零退化轮，doc1 T1 / doc0 T5 / doc4 T0 均正确。
+  哨兵题 doc0 T4 仍错——确认是寻址问题（信息折入但无 query 照到邻居），归 M3。
+  已折叠 run 档案：results/heavy_hitter_attn_l128_s4_r32_w64_m2_multiturn_v3set.json
 
-### M2 KV value INT8 量化 — 与 M1 正交，2x 有效容量
-value 占存储大头（head_dim 256 × 2B）。value 降 INT8（per-head per-channel scale），
-同样字节数下 budget 翻倍：l128 的 60 个 hh 相当于 120 个。工程为主、收益确定，
-在 M1 结论出来后叠加。
+### M2 KV value INT8 量化 — 已实现，待跑（与 M1 正交，叠加使用）
+value 占存储大头（head_dim 256 × 2B）。复用 kivi_cache 的量化工具：K per-channel
+INT8、V per-token INT8（KIVI 式），存 INT8、attention 用反量化值。量化只作用于
+decode 阶段的存储态，prefill 保持 bf16——压缩目标是 decode 时的 cache。
+同样字节数下有效容量翻倍：l128 k8v8 = 标称 2000x，hh 92 相当于 184 个 bf16 槽。
+CLI：`--k_bits 8 --v_bits 8`，patch 名加 `_k8v8` 后缀。
 
 ### M3 跨层共享选择（union index）
 10 个 full-attn 层各自独立选 hh，同一 token 在不同层的重要性高度相关。

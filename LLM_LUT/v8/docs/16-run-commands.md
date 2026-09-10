@@ -179,3 +179,36 @@ CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/eval_kv_cache.py \
   --output_json results/heavy_hitter_attn_l128_s4_r32_w64_m2_multiturn_v3set.json \
   > heavy_hitter_attn_l128_r32_w64_m2_v3set.log 2>&1 &
 ```
+
+## 7. M2 INT8 KV 量化叠加（l128/s4/r32/w64 + merge + k8v8，标称 2000x）
+
+M1 v2 凸组合折叠已在 1000x 验证（EOS 0.849 > baseline，零退化轮）。M2 把存储的
+K/V 量化（K per-channel INT8、V per-token INT8，KIVI 式），同样字节数下有效容量
+翻倍：l128 的 hh 92 相当于 184 个 bf16 槽。量化只作用于 decode 阶段的存储态，
+prefill 仍 bf16，PPL 门槛逻辑不变。与 folding 正交，两者叠加。
+若 2000x 仍可用，说明"选择 × 补偿 × 量化"三件套成立。
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/eval_kv_cache.py \
+  --patch heavy_hitter_attn \
+  --max_cache_len 128 \
+  --sink_tokens 4 \
+  --recent_tokens 32 \
+  --obs_window 64 \
+  --merge_evicted \
+  --k_bits 8 \
+  --v_bits 8 \
+  --model /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --eval_file v8_eval_texts.jsonl \
+  --prompt_file candidate_prompts.jsonl \
+  --multi_turn \
+  --multi_turn_file data/multi_turn_prompts_v3.jsonl \
+  --max_eval_samples 8 \
+  --max_new_tokens 128 \
+  --max_length 4096 \
+  --device_map balanced_low_0 \
+  --torch_dtype bfloat16 \
+  --logit_metrics \
+  --output_json results/heavy_hitter_attn_l128_s4_r32_w64_m_k8v8_multiturn_v3set.json \
+  > heavy_hitter_attn_l128_m_k8v8_v3set.log 2>&1 &
+```
