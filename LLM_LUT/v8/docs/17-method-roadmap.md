@@ -17,13 +17,18 @@
 
 ## 方法推进（按优先级）
 
-### M1 补偿式淘汰（compensation eviction）— 已实现，待跑
+### M1 补偿式淘汰（compensation eviction）— v1 负收益，v2 凸组合待跑
 硬淘汰的信息损失是失败根源：top-k 选不中 = 信息永久丢失。M1 把被淘汰 token 的
-value 按 per-head attention mass 加权折叠进最近的保留后继（权重上限 1，单 token
-无法支配目标）。选择不再需要完美——被淘汰事实活在邻居的 value 里。
+value 按 per-head attention mass 加权折叠进最近的保留后继。
 改动：attention_scores.py（bank 存 per-head 分数 [H_kv, K]）、
 heavy_hitter_cache.py（`_fold_evicted_values`）、CLI `--merge_evicted`。
 PPL 门槛不受影响（folding 只发生在首次 decode 压缩时，prefill 无改动）。
+
+- **v1（2026-09-10，加法，权重 min(1, p_i/p_t)）：负收益**。每槽平均折入 ~8 个 value，
+  保留 value 幅度膨胀 2-9 倍，repetition +5.7pp，decode KL 0.56→0.61，doc1 T1
+  从答对变重复循环，哨兵题仍错（错法变了）。幅度膨胀是主因。
+- **v2（凸组合，待跑）**：V_t' = (p_t·V_t + Σ p_i·V_i)/(p_t + Σ p_i)，质量加权
+  平均、幅度有界。若仍退化则 folding 判死，转 M2。
 
 ### M2 KV value INT8 量化 — 与 M1 正交，2x 有效容量
 value 占存储大头（head_dim 256 × 2B）。value 降 INT8（per-head per-channel scale），

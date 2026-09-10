@@ -113,10 +113,19 @@ class HeavyHitterCache(DynamicCache):
                              topk, middle_orig):
         """Fold evicted middle tokens' values into their nearest kept successor.
 
-        Each evicted token i folds into the first kept token at a later
-        original position (fallback: the last kept token). Per-head weight is
-        min(1, mass_i / mass_target): an evicted token contributes at most one
-        full copy of itself, so a single hot token cannot dominate its target.
+        Convex (mass-weighted) folding, NOT additive: for each kept slot t,
+
+            V_t' = (p_t * V_t + sum_i p_i * V_i) / (p_t + sum_i p_i)
+
+        where i ranges over the evicted tokens folded into t. V_t' is a
+        weighted average, so magnitudes stay bounded — an earlier additive
+        variant (min(1, p_i/p_t) per token, up to ~8 tokens folded per slot)
+        inflated kept values 2-9x and caused repetition loops + flipped
+        correct turns into loops (measured 2026-09-10).
+
+        Each evicted token folds into the first kept token at a later
+        original position (fallback: the last kept token); causally later
+        queries look backward.
 
         hh_values: [B, H, hh, D] gathered heavy-hitter values (fresh tensor,
         safe to modify in place). topk: [B, hh] middle-relative kept indices,
@@ -144,15 +153,25 @@ class HeavyHitterCache(DynamicCache):
         tgt_slot = torch.searchsorted(kept, ev_pos, right=True).clamp(max=hh - 1).long()
         ev_orig = middle_orig[ev_pos].clamp(max=ph.shape[-1] - 1).long()           # [E]
         tgt_orig = middle_orig[kept[tgt_slot]].clamp(max=ph.shape[-1] - 1).long()  # [E]
-        w = (ph[:, ev_orig] / (ph[:, tgt_orig] + 1e-8)).clamp(max=1.0)  # [H, E]
-        w = w.to(hh_values.dtype)
-        contrib = w.unsqueeze(0).unsqueeze(-1) * middle_values[:, :, ev_pos, :]
-        hh_values.index_add_(2, tgt_slot, contrib)
+        own_orig = middle_orig[kept].clamp(max=ph.shape[-1] - 1).long()            # [hh]
+
+        # All folding in fp32; result cast back to the cache dtype.
+        p_ev = ph[:, ev_orig].float()    # [H, E]
+        p_own = ph[:, own_orig].float()  # [H, hh]
+
+        num = hh_values.float() * p_own.unsqueeze(0).unsqueeze(-1)  # [B, H, hh, D]
+        num.index_add_(
+            2, tgt_slot,
+            p_ev.unsqueeze(0).unsqueeze(-1) * middle_values[:, :, ev_pos, :].float(),
+        )
+        den = p_own.clone()  # [H, hh]
+        den.index_add_(1, tgt_slot, p_ev)
+        folded = num / den.clamp(min=1e-8).unsqueeze(0).unsqueeze(-1)
         if not getattr(layer, "_hh_merge_logged", False):
             layer._hh_merge_logged = True
-            print(f"[heavy_hitter] layer {layer_idx}: folded {ev_pos.numel()} "
+            print(f"[heavy_hitter] layer {layer_idx}: convex-folded {ev_pos.numel()} "
                   f"evicted values into {hh} kept slots")
-        return hh_values
+        return folded.to(hh_values.dtype)
 
     def update(self, key_states, value_states, layer_idx, *args, **kwargs):
         if self.layer_class_to_replicate is not None:

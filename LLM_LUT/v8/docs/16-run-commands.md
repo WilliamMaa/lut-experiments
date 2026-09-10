@@ -149,3 +149,33 @@ CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/eval_kv_cache.py \
   --output_json results/heavy_hitter_attn_l128_s4_r32_w64_m_multiturn_v3set.json \
   > heavy_hitter_attn_l128_r32_w64_m_v3set.log 2>&1 &
 ```
+
+## 6. M1 v2 凸组合折叠（1000x，同 l128/s4/r32/w64 配置）
+
+2026-09-10：M1 v1（加法折叠，权重上限 1）是负收益——保留 value 幅度膨胀 2-9 倍，
+repetition +5.7pp，doc1 T1 从答对变成循环，哨兵题仍错。v2 改为质量加权凸组合
+V_t' = (p_t·V_t + Σ p_i·V_i)/(p_t + Σ p_i)，幅度有界。若 v2 仍退化，folding 判死，
+转 M2（INT8 value 量化）。日志关键字变为 "convex-folded"。
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/eval_kv_cache.py \
+  --patch heavy_hitter_attn \
+  --max_cache_len 128 \
+  --sink_tokens 4 \
+  --recent_tokens 32 \
+  --obs_window 64 \
+  --merge_evicted \
+  --model /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --eval_file v8_eval_texts.jsonl \
+  --prompt_file candidate_prompts.jsonl \
+  --multi_turn \
+  --multi_turn_file data/multi_turn_prompts_v3.jsonl \
+  --max_eval_samples 8 \
+  --max_new_tokens 128 \
+  --max_length 4096 \
+  --device_map balanced_low_0 \
+  --torch_dtype bfloat16 \
+  --logit_metrics \
+  --output_json results/heavy_hitter_attn_l128_s4_r32_w64_m2_multiturn_v3set.json \
+  > heavy_hitter_attn_l128_r32_w64_m2_v3set.log 2>&1 &
+```
