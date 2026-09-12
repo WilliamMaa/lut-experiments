@@ -47,7 +47,7 @@ class HeavyHitterCache(DynamicCache):
 
     def __init__(self, max_cache_len=512, sink_tokens=4, recent_tokens=128, config=None,
                  importance_mode="key_norm", score_bank=None, obs_window=0,
-                 merge_evicted=False, k_bits=16, v_bits=16):
+                 merge_evicted=False, k_bits=16, v_bits=16, shared_selection=False):
         super().__init__(config=config)
         self.retention_max_cache_len = max_cache_len
         self.sink_tokens = sink_tokens
@@ -61,6 +61,11 @@ class HeavyHitterCache(DynamicCache):
         # has to be perfect — a fact living in an evicted token survives in
         # the value of a token that stays.
         self.merge_evicted = merge_evicted
+        # Cross-layer shared selection: importance = mean attention mass over
+        # all full-attn layers, so a token important in ANY layer survives
+        # everywhere; the selected index is shared across layers (one index
+        # instead of per-layer, ~10x index storage saving on device).
+        self.shared_selection = shared_selection
         self.k_bits = k_bits
         self.v_bits = v_bits
         self._k_meta = {}  # layer_idx -> (scale, min) for quantized stored K
@@ -128,6 +133,36 @@ class HeavyHitterCache(DynamicCache):
         # *mean* attention mass. +inf here would let them flush every prefill
         # heavy hitter out of the middle region within one generation.
         vals = torch.where(valid, prefill[safe_idx], prefill.mean())
+        return vals
+
+    def _shared_position_scores(self, layer, layer_idx, orig_idx, device):
+        """Cross-layer aggregated attention mass for each cached position.
+
+        Mean of per-layer column-mass scores over all full-attn layers that
+        share the current prefill length. Column sums are directly comparable
+        across layers (each obs-window query row sums to 1), so the mean is a
+        valid "important somewhere" vote. Stored on the layer as
+        ``_hh_prefill_scores`` so obs-window exclusion and logging keep
+        working unchanged.
+        """
+        if self.importance_mode != "attn_score" or self.score_bank is None:
+            return None
+        agg = getattr(layer, "_hh_shared_scores", None)
+        if agg is None:
+            per_layer = list(self.score_bank.scores.values())
+            if not per_layer:
+                return None
+            plen = per_layer[0].shape[-1]
+            aligned = [s for s in per_layer if s.shape[-1] == plen]
+            if not aligned:
+                return None
+            agg = torch.stack([s.to(device) for s in aligned]).mean(dim=0)
+            layer._hh_shared_scores = agg
+            layer._hh_prefill_scores = agg  # obs-window exclusion + logs
+        plen = agg.shape[-1]
+        valid = orig_idx < plen
+        safe_idx = orig_idx.clamp(max=plen - 1)
+        vals = torch.where(valid, agg[safe_idx], agg.mean())
         return vals
 
     def _per_head_scores(self, layer, layer_idx, device, n_heads):
@@ -311,9 +346,14 @@ class HeavyHitterCache(DynamicCache):
 
             if hh_budget > 0 and middle_len > hh_budget:
                 B, H, M, D = middle_keys.shape
-                pos_scores = self._position_scores(
-                    layer, layer_idx, orig_idx, keys.device,
-                )
+                if self.shared_selection:
+                    pos_scores = self._shared_position_scores(
+                        layer, layer_idx, orig_idx, keys.device,
+                    )
+                else:
+                    pos_scores = self._position_scores(
+                        layer, layer_idx, orig_idx, keys.device,
+                    )
                 if pos_scores is not None:
                     scores = pos_scores[sink_n:sink_n + middle_len]
                     if self.obs_window > 0:

@@ -33,6 +33,8 @@ def main():
                         help="Observation window (last W query rows) for heavy_hitter_attn importance")
     parser.add_argument("--merge_evicted", action="store_true",
                         help="Fold evicted tokens' values into kept neighbors (compensation eviction)")
+    parser.add_argument("--shared_selection", action="store_true",
+                        help="Cross-layer shared heavy-hitter selection (mean attention mass over layers)")
     parser.add_argument("--model_path", required=True)
     parser.add_argument("--eval_file", required=True)
     parser.add_argument("--prompt_file", required=True)
@@ -82,6 +84,7 @@ def main():
             merge_evicted=args.merge_evicted,
             k_bits=args.k_bits,
             v_bits=args.v_bits,
+            shared_selection=args.shared_selection,
         )
     else:
         patch = patch_cls()

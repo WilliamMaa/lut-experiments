@@ -168,17 +168,21 @@ class HeavyHitterAttnScorePatch(HeavyHitterCachePatch):
 
     def __init__(self, max_cache_len: int = 512, sink_tokens: int = 4,
                  recent_tokens: int = 128, obs_window: int = 64,
-                 merge_evicted: bool = False, k_bits: int = 16, v_bits: int = 16):
+                 merge_evicted: bool = False, k_bits: int = 16, v_bits: int = 16,
+                 shared_selection: bool = False):
         super().__init__(max_cache_len, sink_tokens, recent_tokens)
         self._bank = AttentionScoreBank()
         self.obs_window = obs_window
         self.merge_evicted = merge_evicted
         self.k_bits = k_bits
         self.v_bits = v_bits
+        self.shared_selection = shared_selection
 
     def name(self) -> str:
         base = (f"heavy_hitter_attn_l{self.max_cache_len}_s{self.sink_tokens}"
                 f"_r{self.recent_tokens}_w{self.obs_window}")
+        if self.shared_selection:
+            base = f"{base}_sh"
         if self.merge_evicted:
             base = f"{base}_m"
         if self.k_bits < 16 or self.v_bits < 16:
@@ -192,6 +196,7 @@ class HeavyHitterAttnScorePatch(HeavyHitterCachePatch):
         cfg["merge_evicted"] = self.merge_evicted
         cfg["k_bits"] = self.k_bits
         cfg["v_bits"] = self.v_bits
+        cfg["shared_selection"] = self.shared_selection
         return cfg
 
     def get_cache(self, device, config=None):
@@ -208,6 +213,7 @@ class HeavyHitterAttnScorePatch(HeavyHitterCachePatch):
             merge_evicted=self.merge_evicted,
             k_bits=self.k_bits,
             v_bits=self.v_bits,
+            shared_selection=self.shared_selection,
         ).to(device)
 
     def storage_stats(self) -> Dict[str, Any]:

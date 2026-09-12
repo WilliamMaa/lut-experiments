@@ -32,12 +32,19 @@ PPL 门槛不受影响（folding 只发生在首次 decode 压缩时，prefill �
   哨兵题 doc0 T4 仍错——确认是寻址问题（信息折入但无 query 照到邻居），归 M3。
   已折叠 run 档案：results/heavy_hitter_attn_l128_s4_r32_w64_m2_multiturn_v3set.json
 
-### M2 KV value INT8 量化 — 已实现，待跑（与 M1 正交，叠加使用）
-value 占存储大头（head_dim 256 × 2B）。复用 kivi_cache 的量化工具：K per-channel
-INT8、V per-token INT8（KIVI 式），存 INT8、attention 用反量化值。量化只作用于
-decode 阶段的存储态，prefill 保持 bf16——压缩目标是 decode 时的 cache。
-同样字节数下有效容量翻倍：l128 k8v8 = 标称 2000x，hh 92 相当于 184 个 bf16 槽。
-CLI：`--k_bits 8 --v_bits 8`，patch 名加 `_k8v8` 后缀。
+### M3 跨层共享选择（union index）— 已实现，待跑
+10 个 full-attn 层各自独立选 hh，同一 token 在不同层的重要性高度相关。
+M3 把 eviction 分数改为 10 层注意力质量（列和，天然跨层可比）的均值：某 token
+在任一层重要就不被淘汰；10 层共用一份选择索引，索引存储省 ~10x（CIM 相关）。
+folding 权重仍用 per-layer per-head 质量（折叠是逐层的）。CLI `--shared_selection`，
+patch 名 `_sh` 后缀。攻哨兵题（doc0 T4 寻址问题）。
+2026-09-10 状态：代码完成，语法通过，待远程数值验证。
+
+### M2 结果（2026-09-10）：成立，Pareto 移动
+k8v8@l128+merge（标称 2000x）：EOS 0.830 > baseline 0.811，无退化轮，decode KL 0.564
+≈ bf16 版 0.555。代价：repetition +3.8pp（bf16 版 +1.9pp），doc4 T0 重新出现轻度
+功能幻觉。结论：INT8 买到存储没买到质量；"选择×补偿×量化"三件套在 2000x 成立。
+档案：results/heavy_hitter_attn_l128_s4_r32_w64_m_k8v8_multiturn_v3set.json
 
 ### M3 跨层共享选择（union index）
 10 个 full-attn 层各自独立选 hh，同一 token 在不同层的重要性高度相关。

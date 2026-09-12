@@ -212,3 +212,37 @@ CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/eval_kv_cache.py \
   --output_json results/heavy_hitter_attn_l128_s4_r32_w64_m_k8v8_multiturn_v3set.json \
   > heavy_hitter_attn_l128_m_k8v8_v3set.log 2>&1 &
 ```
+
+## 8. M3 跨层共享选择（l128/s4/r32/w64 + merge + shared，bf16，隔离 M3 效应）
+
+M2 结论（2026-09-10）：k8v8 在 2000x 可用（EOS 0.830 > baseline）但质量略降于
+bf16/1000x（0.849）——INT8 买到存储没买到质量，三件套成立。哨兵题 doc0 T4 换错法
+仍错，是寻址问题。M3 把 eviction 分数改为 10 个 full-attn 层注意力质量的均值，
+并共用一份选择索引。先跑 bf16 隔离 M3 效应，重点看哨兵题是否修复。
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/eval_kv_cache.py \
+  --patch heavy_hitter_attn \
+  --max_cache_len 128 \
+  --sink_tokens 4 \
+  --recent_tokens 32 \
+  --obs_window 64 \
+  --merge_evicted \
+  --shared_selection \
+  --model /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --eval_file v8_eval_texts.jsonl \
+  --prompt_file candidate_prompts.jsonl \
+  --multi_turn \
+  --multi_turn_file data/multi_turn_prompts_v3.jsonl \
+  --max_eval_samples 8 \
+  --max_new_tokens 128 \
+  --max_length 4096 \
+  --device_map balanced_low_0 \
+  --torch_dtype bfloat16 \
+  --logit_metrics \
+  --output_json results/heavy_hitter_attn_l128_s4_r32_w64_sh_m_multiturn_v3set.json \
+  > heavy_hitter_attn_l128_sh_m_v3set.log 2>&1 &
+```
+
+若哨兵题修复且无退化，最终组合跑 `--merge_evicted --shared_selection --k_bits 8 --v_bits 8`
+（patch 名 `_sh_m_k8v8`，输出文件自行换后缀，标称 2000x）。
