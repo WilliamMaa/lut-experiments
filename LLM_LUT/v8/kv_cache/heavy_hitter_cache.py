@@ -378,7 +378,15 @@ class HeavyHitterCache(DynamicCache):
                         layer._hh_fallback_warned = True
                     scores = self._importance_scores(middle_keys)[0]
                 scores = scores.unsqueeze(0).expand(B, -1)  # [B, M]
-                topk = scores.topk(hh_budget, dim=-1).indices  # [B, hh_budget]
+                # Deterministic selection: CUDA topk is not run-to-run stable
+                # with near-tied masses (measured 2026-09-12: same config
+                # re-run flipped factual answers at 500x). A stable descending
+                # argsort breaks ties by position (lower position wins), so
+                # the selected set is reproducible.
+                sorted_idx = torch.argsort(
+                    scores, dim=-1, descending=True, stable=True,
+                )
+                topk = sorted_idx[:, :hh_budget]  # [B, hh_budget]
                 topk, _ = topk.sort(dim=-1)  # maintain temporal order
 
                 # Keep original-position index in sync with the compressed keys.

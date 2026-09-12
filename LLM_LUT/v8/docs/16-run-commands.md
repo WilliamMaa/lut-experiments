@@ -219,6 +219,9 @@ M2 结论（2026-09-10）：k8v8 在 2000x 可用（EOS 0.830 > baseline）但�
 bf16/1000x（0.849）——INT8 买到存储没买到质量，三件套成立。哨兵题 doc0 T4 换错法
 仍错，是寻址问题。M3 把 eviction 分数改为 10 个 full-attn 层注意力质量的均值，
 并共用一份选择索引。先跑 bf16 隔离 M3 效应，重点看哨兵题是否修复。
+2026-09-12 更新：同配置重跑证实 run 间方差（CUDA topk 不稳定，事实答案翻转）后，
+选择路径已改为稳定降序排序（并列取位置小者，跨 run 可复现）。本次 run 包含
+该修复 + M3 共享选择 + M1 凸组合折叠。
 
 ```bash
 CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/eval_kv_cache.py \
