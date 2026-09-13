@@ -249,3 +249,51 @@ CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/eval_kv_cache.py \
 
 若哨兵题修复且无退化，最终组合跑 `--merge_evicted --shared_selection --k_bits 8 --v_bits 8`
 （patch 名 `_sh_m_k8v8`，输出文件自行换后缀，标称 2000x）。
+
+## 9. 2026-09-13 状态与下一步
+
+已完成的关键 run（v3 评测集，53 轮，全部 merge_evicted 凸组合折叠 + 确定性 tie-break）：
+
+| run | 标称压缩 | EOS | 判定 |
+|---|---|---|---|
+| l128/s4/r32/w64/m（bf16） | 1000x | 0.849（>baseline 0.811） | 干净 |
+| l128/s4/r32/w64/m/k8v8 | 2000x | 0.830 | 基本干净 |
+| l128/s4/r32/w64/sh/m/k4v4 | 8000x | 0.774（<baseline） | 越界：循环+幻觉 |
+
+注意：k4v4 那次 run 的文件名误用了 bf16 的输出名，内容实为 k4v4，见
+results/heavy_hitter_attn_l128_s4_r32_w64_sh_m_multiturn_v3set.json（patch 名
+带 k4v4）。4 与 8 bit 之间是 bit-depth 边界。
+2026-09-13 根因修复：`--k_bits/--v_bits` 默认值原是 4（kivi 遗留），接入
+heavy_hitter_attn 后导致不显式传参的 run 静默 4bit。已改为默认 16（bf16），
+并加 [WARN] loud 打印。受影响 run 只有这一个（sh_m 实为 k4v4/8000x）；
+M1（m/m2）与 k8v8 run 均早于该 wiring 或显式传参，结论不变。
+
+**仍欠：M3 共享选择在 bf16 下的隔离 run**（第 8 节命令原样，哨兵题 doc0 T4
+是判定标准）。若修复，最终生产配置为 sh+m+k8v8（2000x）：
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/eval_kv_cache.py \
+  --patch heavy_hitter_attn \
+  --max_cache_len 128 \
+  --sink_tokens 4 \
+  --recent_tokens 32 \
+  --obs_window 64 \
+  --merge_evicted \
+  --shared_selection \
+  --model /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --eval_file v8_eval_texts.jsonl \
+  --prompt_file candidate_prompts.jsonl \
+  --multi_turn \
+  --multi_turn_file data/multi_turn_prompts_v3.jsonl \
+  --max_eval_samples 8 \
+  --max_new_tokens 128 \
+  --max_length 4096 \
+  --device_map balanced_low_0 \
+  --torch_dtype bfloat16 \
+  --logit_metrics \
+  --output_json results/heavy_hitter_attn_l128_s4_r32_w64_sh_m_bf16_multiturn_v3set.json \
+  > heavy_hitter_attn_l128_sh_m_bf16_v3set.log 2>&1 &
+```
+
+哨兵题修复后跑 `--merge_evicted --shared_selection --k_bits 8 --v_bits 8`，
+输出名带 `sh_m_k8v8` 后缀。

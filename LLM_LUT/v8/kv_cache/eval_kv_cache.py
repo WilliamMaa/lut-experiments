@@ -24,8 +24,11 @@ PATCH_REGISTRY = {
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--patch", required=True, choices=list(PATCH_REGISTRY.keys()))
-    parser.add_argument("--k_bits", type=int, default=4)
-    parser.add_argument("--v_bits", type=int, default=4)
+    parser.add_argument("--k_bits", type=int, default=16,
+                        help="K storage bits (16 = bf16). NOTE: defaults to 16 so heavy_hitter_attn "
+                             "runs stay bf16 unless quantization is explicitly requested.")
+    parser.add_argument("--v_bits", type=int, default=16,
+                        help="V storage bits (16 = bf16). Same default rationale as --k_bits.")
     parser.add_argument("--max_cache_len", type=int, default=512)
     parser.add_argument("--sink_tokens", type=int, default=4)
     parser.add_argument("--recent_tokens", type=int, default=128)
@@ -92,6 +95,11 @@ def main():
     print(f"Running patch: {patch.name()}")
     print(f"Config: {patch.config()}")
     print(f"Storage stats: {patch.storage_stats()}")
+    if getattr(patch, "k_bits", 16) < 16 or getattr(patch, "v_bits", 16) < 16:
+        print(f"[WARN] KV storage is QUANTIZED: k_bits={patch.k_bits} "
+              f"v_bits={patch.v_bits} "
+              f"(nominal {patch.storage_stats().get('compression_ratio')}x). "
+              f"Pass --k_bits 16 --v_bits 16 for bf16 storage.")
 
     evaluator = Evaluator(
         model_path=args.model_path,
