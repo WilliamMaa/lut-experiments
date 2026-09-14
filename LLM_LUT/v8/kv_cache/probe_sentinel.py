@@ -139,7 +139,9 @@ def main():
     )
     print(f"[probe] patch: {patch.name()}")
     patch.install(model)
-    cache = patch.get_cache(device)
+    # config is required: without it DynamicCache creates only Attention layer
+    # entries and transformers' hybrid GDN mask code raises in has_previous_state.
+    cache = patch.get_cache(device, config=model.config)
 
     gen_kwargs = dict(
         max_new_tokens=8, do_sample=False,
