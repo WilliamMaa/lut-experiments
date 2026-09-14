@@ -58,6 +58,7 @@ def main():
     ap.add_argument("--obs_window", type=int, default=64)
     ap.add_argument("--merge_evicted", action="store_true")
     ap.add_argument("--shared_selection", action="store_true")
+    ap.add_argument("--span_window", type=int, default=0)
     ap.add_argument("--k_bits", type=int, default=16)
     ap.add_argument("--v_bits", type=int, default=16)
     ap.add_argument("--device_map", default="balanced_low_0")
@@ -136,6 +137,7 @@ def main():
         k_bits=args.k_bits,
         v_bits=args.v_bits,
         shared_selection=args.shared_selection,
+        span_window=args.span_window,
     )
     print(f"[probe] patch: {patch.name()}")
     patch.install(model)

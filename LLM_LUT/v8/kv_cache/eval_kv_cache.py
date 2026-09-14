@@ -38,6 +38,9 @@ def main():
                         help="Fold evicted tokens' values into kept neighbors (compensation eviction)")
     parser.add_argument("--shared_selection", action="store_true",
                         help="Cross-layer shared heavy-hitter selection (mean attention mass over layers)")
+    parser.add_argument("--span_window", type=int, default=0,
+                        help="Span-aware selection: max-pool scores over +-W neighbors so multi-token "
+                             "facts are kept/dropped as a unit (0 = off)")
     parser.add_argument("--model_path", required=True)
     parser.add_argument("--eval_file", required=True)
     parser.add_argument("--prompt_file", required=True)
@@ -88,6 +91,7 @@ def main():
             k_bits=args.k_bits,
             v_bits=args.v_bits,
             shared_selection=args.shared_selection,
+            span_window=args.span_window,
         )
     else:
         patch = patch_cls()

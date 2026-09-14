@@ -47,7 +47,8 @@ class HeavyHitterCache(DynamicCache):
 
     def __init__(self, max_cache_len=512, sink_tokens=4, recent_tokens=128, config=None,
                  importance_mode="key_norm", score_bank=None, obs_window=0,
-                 merge_evicted=False, k_bits=16, v_bits=16, shared_selection=False):
+                 merge_evicted=False, k_bits=16, v_bits=16, shared_selection=False,
+                 span_window=0):
         super().__init__(config=config)
         self.retention_max_cache_len = max_cache_len
         self.sink_tokens = sink_tokens
@@ -66,6 +67,10 @@ class HeavyHitterCache(DynamicCache):
         # everywhere; the selected index is shared across layers (one index
         # instead of per-layer, ~10x index storage saving on device).
         self.shared_selection = shared_selection
+        # Span-aware selection: max-pool scores over +-span_window before
+        # top-k, so multi-token facts (digits of a number) are kept/dropped
+        # as a unit. 0 = off.
+        self.span_window = span_window
         self.k_bits = k_bits
         self.v_bits = v_bits
         self._k_meta = {}  # layer_idx -> (scale, min) for quantized stored K
@@ -377,6 +382,21 @@ class HeavyHitterCache(DynamicCache):
                               f"attention scores available, falling back to key-norm")
                         layer._hh_fallback_warned = True
                     scores = self._importance_scores(middle_keys)[0]
+                if self.span_window > 0:
+                    # Span-aware selection: a token inherits the max score in
+                    # its +-span_window neighborhood. Tokenizers split numbers
+                    # into single digits ('178' -> '1','7','8'), so per-token
+                    # scoring keeps or drops multi-token facts piecemeal and
+                    # assembled facts become unreadable (probe_sentinel.py,
+                    # 2026-09-14: the sentinel span survived in 3/10 layers
+                    # with ranks 9-53, but its digit neighbors ranked out).
+                    # Max-pool makes a fact survive or perish as a unit.
+                    pooled = torch.nn.functional.max_pool1d(
+                        scores.view(1, 1, -1),
+                        kernel_size=2 * self.span_window + 1,
+                        stride=1, padding=self.span_window,
+                    )
+                    scores = pooled.view(-1)
                 scores = scores.unsqueeze(0).expand(B, -1)  # [B, M]
                 # Deterministic selection: CUDA topk is not run-to-run stable
                 # with near-tied masses (measured 2026-09-12: same config

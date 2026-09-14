@@ -318,3 +318,39 @@ python kv_cache/probe_sentinel.py \
 
 解读：span 全部 kept= N -> 选择问题（分数不认为它重要）；kept=Y 但答案错 ->
 寻址问题（obs_window 里的 query 行没照到它，或照到了但后续层丢了）。
+
+## 11. M4 span 感知选择（探针验证 + 全量 eval）
+
+探针诊断（2026-09-14）：哨兵 span（9 token）在 layer 3/39 全灭、中间层碎片化保留
+（rank 9-53 的 token 被孤立保留、数字邻居被淘汰）；模型生成"178亿元至178"——
+部分检索发生但 span 碎了。tokenizer 把数字拆成单字 token，逐 token 打分把
+多 token 事实拆散。M4 = 打分后 ±W 窗口 max-pool（--span_window 4），事实
+成组保留/淘汰。
+
+第一步，探针验证（同一命令加 --span_window 4，期望多数层 kept=Y）：
+
+```bash
+python kv_cache/probe_sentinel.py \
+  --model_path /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --multi_turn_file data/multi_turn_prompts_v3.jsonl \
+  --doc_index 0 --turn 4 --answer_text "178亿元至182亿元" \
+  --max_cache_len 128 --sink_tokens 4 --recent_tokens 32 --obs_window 64 \
+  --merge_evicted --span_window 4 \
+  --device_map balanced_low_0 --torch_dtype bfloat16
+```
+
+第二步，全量 eval（1000x bf16，与 m2 run 对比）：
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/eval_kv_cache.py \
+  --patch heavy_hitter_attn \
+  --max_cache_len 128 --sink_tokens 4 --recent_tokens 32 --obs_window 64 \
+  --merge_evicted --span_window 4 \
+  --model /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --eval_file v8_eval_texts.jsonl --prompt_file candidate_prompts.jsonl \
+  --multi_turn --multi_turn_file data/multi_turn_prompts_v3.jsonl \
+  --max_eval_samples 8 --max_new_tokens 128 --max_length 4096 \
+  --device_map balanced_low_0 --torch_dtype bfloat16 --logit_metrics \
+  --output_json results/heavy_hitter_attn_l128_s4_r32_w64_m_sp4_multiturn_v3set.json \
+  > heavy_hitter_attn_l128_m_sp4_v3set.log 2>&1 &
+```
