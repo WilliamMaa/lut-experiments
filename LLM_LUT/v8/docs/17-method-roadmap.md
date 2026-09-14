@@ -32,13 +32,11 @@ PPL 门槛不受影响（folding 只发生在首次 decode 压缩时，prefill �
   哨兵题 doc0 T4 仍错——确认是寻址问题（信息折入但无 query 照到邻居），归 M3。
   已折叠 run 档案：results/heavy_hitter_attn_l128_s4_r32_w64_m2_multiturn_v3set.json
 
-### M3 跨层共享选择（union index）— 已实现，待跑
-10 个 full-attn 层各自独立选 hh，同一 token 在不同层的重要性高度相关。
-M3 把 eviction 分数改为 10 层注意力质量（列和，天然跨层可比）的均值：某 token
-在任一层重要就不被淘汰；10 层共用一份选择索引，索引存储省 ~10x（CIM 相关）。
-folding 权重仍用 per-layer per-head 质量（折叠是逐层的）。CLI `--shared_selection`，
-patch 名 `_sh` 后缀。攻哨兵题（doc0 T4 寻址问题）。
-2026-09-10 状态：代码完成，语法通过，待远程数值验证。
+### M3 跨层共享选择（union index）— 判死（2026-09-14）
+bf16 隔离 run（l128/s4/r32/w64/sh/m）：EOS 0.792 < per-layer 0.849，哨兵题仍错。
+跨层均值稀释单层锐利信号，整体更差。唯一保留的遗产：索引共享思路（未验证收益）。
+哨兵题进入诊断阶段：kv_cache/probe_sentinel.py 判定"被淘汰（选择问题）"还是
+"保留但无 query 照到（寻址问题）"，两条路修复方向相反。
 
 ### M2 结果（2026-09-10）：成立，Pareto 移动
 k8v8@l128+merge（标称 2000x）：EOS 0.830 > baseline 0.811，无退化轮，decode KL 0.564

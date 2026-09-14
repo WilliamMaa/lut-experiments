@@ -297,3 +297,24 @@ CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/eval_kv_cache.py \
 
 哨兵题修复后跑 `--merge_evicted --shared_selection --k_bits 8 --v_bits 8`，
 输出名带 `sh_m_k8v8` 后缀。
+
+## 10. 哨兵题诊断探针（选择失败 vs 寻址失败）
+
+M3 判定不成立（2026-09-14，bf16 隔离 run）：shared 选择 EOS 0.792 < per-layer
+0.849，哨兵题 doc0 T4 仍错（170-180亿）。跨层均值稀释了单层锐利信号，M3 路线作废。
+下一步不是盲试变体，而是先回答：哨兵 token 是被淘汰了（选择问题），还是留着但
+没有 query 照到它（寻址问题）。探针逐层打印答案 span 的原始位置、是否在保留集、
+注意力质量排名、是否在 obs_window 排除区：
+
+```bash
+python kv_cache/probe_sentinel.py \
+  --model_path /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --multi_turn_file data/multi_turn_prompts_v3.jsonl \
+  --doc_index 0 --turn 4 --answer_text "178亿元至182亿元" \
+  --max_cache_len 128 --sink_tokens 4 --recent_tokens 32 --obs_window 64 \
+  --merge_evicted \
+  --device_map balanced_low_0 --torch_dtype bfloat16
+```
+
+解读：span 全部 kept= N -> 选择问题（分数不认为它重要）；kept=Y 但答案错 ->
+寻址问题（obs_window 里的 query 行没照到它，或照到了但后续层丢了）。
