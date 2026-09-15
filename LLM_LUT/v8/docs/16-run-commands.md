@@ -354,3 +354,44 @@ CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/eval_kv_cache.py \
   --output_json results/heavy_hitter_attn_l128_s4_r32_w64_m_sp4_multiturn_v3set.json \
   > heavy_hitter_attn_l128_m_sp4_v3set.log 2>&1 &
 ```
+
+## 12. M4 验证与最终配置（2026-09-15）
+
+M4（span_window 4，l128/s4/r32/w64/m/sp4，1000x bf16）结果：哨兵题 doc0 T4
+首次答对（178-182亿），doc0 T5（9.7亿）和 doc3 T4（平台名称）同时修复，
+EOS 0.811 = baseline，decode KL 0.519 历史最低。代价：repetition +3.8pp，
+doc2 T0 多一个 no-EOS。探针的碎片化选择诊断被直接验证。
+
+### 12a. 确定性复验（同配置重跑，输出加 _rerun）
+
+stable tie-break 已生效，两次 run 应逐位一致。不一致 = 仍有方差源，先别定型。
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/eval_kv_cache.py \
+  --patch heavy_hitter_attn \
+  --max_cache_len 128 --sink_tokens 4 --recent_tokens 32 --obs_window 64 \
+  --merge_evicted --span_window 4 \
+  --model /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --eval_file v8_eval_texts.jsonl --prompt_file candidate_prompts.jsonl \
+  --multi_turn --multi_turn_file data/multi_turn_prompts_v3.jsonl \
+  --max_eval_samples 8 --max_new_tokens 128 --max_length 4096 \
+  --device_map balanced_low_0 --torch_dtype bfloat16 --logit_metrics \
+  --output_json results/heavy_hitter_attn_l128_s4_r32_w64_m_sp4_multiturn_v3set_rerun.json \
+  > heavy_hitter_attn_l128_m_sp4_v3set_rerun.log 2>&1 &
+```
+
+### 12b. 最终配置候选（+ k8v8，标称 2000x）
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/eval_kv_cache.py \
+  --patch heavy_hitter_attn \
+  --max_cache_len 128 --sink_tokens 4 --recent_tokens 32 --obs_window 64 \
+  --merge_evicted --span_window 4 --k_bits 8 --v_bits 8 \
+  --model /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --eval_file v8_eval_texts.jsonl --prompt_file candidate_prompts.jsonl \
+  --multi_turn --multi_turn_file data/multi_turn_prompts_v3.jsonl \
+  --max_eval_samples 8 --max_new_tokens 128 --max_length 4096 \
+  --device_map balanced_low_0 --torch_dtype bfloat16 --logit_metrics \
+  --output_json results/heavy_hitter_attn_l128_s4_r32_w64_m_sp4_k8v8_multiturn_v3set.json \
+  > heavy_hitter_attn_l128_m_sp4_k8v8_v3set.log 2>&1 &
+```
