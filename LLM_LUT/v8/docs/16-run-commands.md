@@ -395,3 +395,51 @@ CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/eval_kv_cache.py \
   --output_json results/heavy_hitter_attn_l128_s4_r32_w64_m_sp4_k8v8_multiturn_v3set.json \
   > heavy_hitter_attn_l128_m_sp4_k8v8_v3set.log 2>&1 &
 ```
+
+### 12a 结果（2026-09-15）：未过逐位一致，方差源已定位并修复
+
+两次 run 聚合指标逐位相同（EOS 0.8113207547、rep 0.0566037736、
+decode KL 0.5187070159869756，全部 53 轮 PPL 相同），但 **2/53 轮自由生成
+文本中途分叉**（doc0 T6 第 30 字符处、doc6 T4 第 261 字符处；两轮都是
+no-EOS 的开放式长输出，非哨兵题，指标不受影响）。
+
+根因：`_fold_evicted_values` 的 CUDA `index_add_`（两处）走原子加，
+累加顺序不确定 → fp32 末位差 → cast bf16 后翻转近并列 token。
+baseline 路径零分叉证明前向本身确定，stable sort 选择也已确定。
+
+修复（heavy_hitter_cache.py）：折叠归约改为 one-hot matmul einsum
+（`eh,bhed->bhd`），数学等价、GEMM 逐 run 位稳定。已 py_compile 通过。
+
+### 12b 结果（2026-09-15）：2000x 成立，span 保护盖过 INT8 噪声
+
+文件：results/heavy_hitter_attn_l128_s4_r32_w64_m_sp4_k8v8_multiturn_v3set.json
+配置核验：k8v8，compression_ratio 2000.0，与文件名相符。PPL delta = 0。
+
+- EOS 0.792 vs baseline 0.811：恰好丢 1 轮（doc1 T2，该轮在 bf16 sp4 下
+  本就是重复堆砌的临界轮，INT8 噪声把它推过 no-EOS）
+- **哨兵题全保**：doc0 T4（178-182亿）、doc0 T5（9.7亿）、doc3 T4（平台名）
+  三轮全部答对且 EOS
+- repetition 0.057 与 bf16 sp4 持平；decode KL 0.512（轨迹级指标不敏感，仅参考）
+
+结论：1000x→2000x，事实保真不破，代价是 1 个临界轮翻 no-EOS。
+12b 跑在旧折叠代码上；折叠改动是数学等价的末位级修正，数据点继续有效。
+
+### 12c. 确定性折叠复验（修复后跑一次即可）
+
+判定标准（不是逐位比对旧文件——折叠归约数序合法变化，与旧 run 末位
+不同是预期）：聚合指标与 m_sp4 一致（EOS 0.811、rep 0.057、
+KL ≈ 0.519），哨兵题三轮全对。通过后方法栈定型。
+
+```bash
+CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/eval_kv_cache.py \
+  --patch heavy_hitter_attn \
+  --max_cache_len 128 --sink_tokens 4 --recent_tokens 32 --obs_window 64 \
+  --merge_evicted --span_window 4 \
+  --model /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --eval_file v8_eval_texts.jsonl --prompt_file candidate_prompts.jsonl \
+  --multi_turn --multi_turn_file data/multi_turn_prompts_v3.jsonl \
+  --max_eval_samples 8 --max_new_tokens 128 --max_length 4096 \
+  --device_map balanced_low_0 --torch_dtype bfloat16 --logit_metrics \
+  --output_json results/heavy_hitter_attn_l128_s4_r32_w64_m_sp4_det_multiturn_v3set.json \
+  > heavy_hitter_attn_l128_m_sp4_det_v3set.log 2>&1 &
+```

@@ -243,13 +243,19 @@ class HeavyHitterCache(DynamicCache):
         p_ev = ph[:, ev_orig].float()    # [H, E]
         p_own = ph[:, own_orig].float()  # [H, hh]
 
+        # Deterministic reduction: CUDA index_add_ uses atomics with
+        # nondeterministic ordering, whose last-bit differences can flip
+        # near-tie decode tokens across identical runs (measured 2026-09-15:
+        # m_sp4 rerun diverged in 2/53 free-generation turns, aggregate
+        # metrics identical to 1e-10). A one-hot matmul sums the same
+        # contributions through run-to-run stable GEMM.
+        E = ev_pos.numel()
+        onehot = torch.zeros(E, hh, dtype=torch.float32, device=middle_values.device)
+        onehot[torch.arange(E, device=middle_values.device), tgt_slot] = 1.0
+        contrib = p_ev.unsqueeze(0).unsqueeze(-1) * middle_values[:, :, ev_pos, :].float()  # [B, H, E, D]
         num = hh_values.float() * p_own.unsqueeze(0).unsqueeze(-1)  # [B, H, hh, D]
-        num.index_add_(
-            2, tgt_slot,
-            p_ev.unsqueeze(0).unsqueeze(-1) * middle_values[:, :, ev_pos, :].float(),
-        )
-        den = p_own.clone()  # [H, hh]
-        den.index_add_(1, tgt_slot, p_ev)
+        num = num + torch.einsum("eh,bhed->bhd", onehot, contrib)
+        den = p_own + torch.einsum("eh,he->h", onehot, p_ev)  # [H, hh]
         folded = num / den.clamp(min=1e-8).unsqueeze(0).unsqueeze(-1)
         if not getattr(layer, "_hh_merge_logged", False):
             layer._hh_merge_logged = True

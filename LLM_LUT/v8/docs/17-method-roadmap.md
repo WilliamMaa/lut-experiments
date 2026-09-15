@@ -58,8 +58,22 @@ M1-M3 做完后的分配细化，最后做。
 跨 run 不稳定。处置：选择路径改用稳定降序排序（并列取位置小者），选集跨 run 可复现。
 教训：质量边缘的单 run 比较不可信，关键结论需双 run 确认；结果文件不要覆盖。
 
+### M4 结果（2026-09-15）：成立
+l128/s4/r32/w64/m/sp4（1000x bf16）：EOS 0.811 = baseline，decode KL 0.519
+历史最低，哨兵题 doc0 T4 首次答对，doc0 T5 / doc3 T4 同时修复；代价
+repetition +3.8pp。探针的碎片化选择诊断被直接验证。
+档案：results/heavy_hitter/heavy_hitter_attn_l128_s4_r32_w64_m_sp4_multiturn_v3set.json
+
+叠加 k8v8（标称 2000x）：哨兵题全保，EOS 0.792 仅丢 1 个临界轮
+（doc1 T2，bf16 下本就是重复堆砌边缘轮）。span 保护盖过 INT8 噪声。
+档案：results/heavy_hitter_attn_l128_s4_r32_w64_m_sp4_k8v8_multiturn_v3set.json
+
+遗留：12a 复验发现折叠 index_add_ 原子加是末位方差源（2/53 自由生成轮
+分叉，指标无损），已改确定性 one-hot matmul，待 12c 复验后定型。
+
 ## 已放弃的方向（不要再回头的）
 
 - 自定义 eager attention kernel（数值 drift 必死，sdpa wrapper 是唯一干净路径）
 - key-norm 重要性（全面劣于 attn-score）
 - 调参式扫描（obs_window 等）：w256 那个 run 跑完当参考，不再系统性扫
+- 跨层共享选择 M3（稀释单层锐利信号，EOS 反降）
