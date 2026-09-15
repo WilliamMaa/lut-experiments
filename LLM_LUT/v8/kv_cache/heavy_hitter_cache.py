@@ -254,8 +254,8 @@ class HeavyHitterCache(DynamicCache):
         onehot[torch.arange(E, device=middle_values.device), tgt_slot] = 1.0
         contrib = p_ev.unsqueeze(0).unsqueeze(-1) * middle_values[:, :, ev_pos, :].float()  # [B, H, E, D]
         num = hh_values.float() * p_own.unsqueeze(0).unsqueeze(-1)  # [B, H, hh, D]
-        num = num + torch.einsum("eh,bhed->bhd", onehot, contrib)
-        den = p_own + torch.einsum("eh,he->h", onehot, p_ev)  # [H, hh]
+        num = num + torch.einsum("es,bhed->bhsd", onehot, contrib)
+        den = p_own + torch.einsum("es,he->hs", onehot, p_ev)  # [H, hh]
         folded = num / den.clamp(min=1e-8).unsqueeze(0).unsqueeze(-1)
         if not getattr(layer, "_hh_merge_logged", False):
             layer._hh_merge_logged = True
