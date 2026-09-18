@@ -150,6 +150,13 @@ def install_eager_score_stash(model, bank):
             f"score stash wrapper assumes the model uses 'sdpa' (got '{impl}'). "
             "Extend _sdpa_stash to wrap the active implementation instead."
         )
+    if _InstallState.installed:
+        # Idempotent re-install: just re-point the bank. Re-wrapping would
+        # make prev_sdpa the wrapper itself and recurse infinitely (hit when
+        # two HeavyHitterAttnScorePatch instances install in one process,
+        # e.g. icn_proto's per-representation factories).
+        _StashState.bank = bank
+        return
     _InstallState.prev_sdpa = orig
     target["sdpa"] = _sdpa_stash
     _StashState.bank = bank
