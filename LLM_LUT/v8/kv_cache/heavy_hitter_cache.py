@@ -83,17 +83,7 @@ class HeavyHitterCache(DynamicCache):
         Prefill growth (incoming_len > 1) stays bf16: storage is transient
         there and the compression target is the decode-time cache.
         """
-        if self.k_bits >= 16 and self.v_bits >= 16:
-            return keys, values
-        if incoming_len > 1:
-            # Prefill growth: the stored state is bf16 from here on. Drop
-            # the stale quantization metas — they describe the pre-concat
-            # slot count and would mismatch at the next update's entry
-            # dequantization (measured: k8v8 cross-turn continuation crashed
-            # with 139 stored slots vs 128-entry scales). The next decode
-            # step re-quantizes after eviction and refreshes the metas.
-            self._k_meta.pop(layer_idx, None)
-            self._v_meta.pop(layer_idx, None)
+        if (self.k_bits >= 16 and self.v_bits >= 16) or incoming_len > 1:
             return keys, values
         qk, qv = keys, values
         if self.k_bits < 16:
@@ -326,6 +316,17 @@ class HeavyHitterCache(DynamicCache):
         prev_len = layer.keys.shape[-2]
         keys = torch.cat([layer.keys, key_states], dim=-2)
         values = torch.cat([layer.values, value_states], dim=-2)
+        if incoming_len > 1:
+            # Prefill growth: the stored state is bf16 from here on. Drop the
+            # stale quantization metas — they describe the pre-concat slot
+            # count and would mismatch at the next update's entry
+            # dequantization (measured: k8v8 cross-turn continuation crashed
+            # with 139 stored slots vs 128-entry scales). The attn_score
+            # prefill branch below returns before _maybe_quantize, so this
+            # has to live here, not there. The next decode step re-quantizes
+            # after eviction and refreshes the metas.
+            self._k_meta.pop(layer_idx, None)
+            self._v_meta.pop(layer_idx, None)
 
         # Track original prefill positions of cached keys. After eviction the
         # current positions no longer match prefill positions, so importance
