@@ -38,7 +38,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__)))))
 
 from icn_proto.kvname import KVName, Repr
-from icn_proto.kvcodec import extract_object, inject_object, dumps, loads
+from icn_proto.kvcodec import extract_object, inject_object, dumps, loads, place_cache
 from icn_proto.presets import cache_factory
 
 TRACE = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
@@ -78,7 +78,8 @@ def forward_turn(model, cache, new_tokens, device):
 def run_session(model, repr_name, config, device, t1, t2, mode):
     """mode: "continuous" (never move) | "inject" (direct) | "wire" (bytes)."""
     make_cache = get_factory(repr_name, config, device, model)
-    cache = make_cache().to(device)
+    cache = make_cache()
+    place_cache(cache, model)
     name = KVName("accept", turn=1, span_start=0, span_end=t1.shape[1],
                   repr=Repr(repr_name))
 
@@ -93,7 +94,8 @@ def run_session(model, repr_name, config, device, t1, t2, mode):
             obj = loads(dumps(obj))
         fresh = make_cache()
         inject_object(fresh, obj)
-        cache = fresh.to(device)
+        place_cache(fresh, model)
+        cache = fresh
 
     logits["turn2_prefill"], cache = forward_turn(model, cache, t2, device)
     d2 = torch.zeros((1, 1), dtype=torch.long, device=device)

@@ -114,6 +114,40 @@ def inject_object(cache, obj: KVObject) -> None:
                     metas.pop(idx, None)
 
 
+def place_cache(cache, model) -> None:
+    """Move each layer's state to the device the model runs that layer on.
+
+    Needed after inject_object (payloads arrive on CPU) and required for
+    sharded models (balanced_low_0): layer i's KV must sit on the same card
+    as layer i. Devices are read from model.hf_device_map; falls back to the
+    model's first-parameter device for single-device loads. A no-op for
+    layers with no state yet.
+    """
+    dev_map = getattr(model, "hf_device_map", None)
+
+    def layer_device(idx):
+        if dev_map:
+            for name, dev in dev_map.items():
+                if name.endswith(f"layers.{idx}"):
+                    return torch.device(dev)
+        return next(model.parameters()).device
+
+    tensor_attrs = ("keys", "values", "_hh_orig_idx", "_hh_prefill_scores",
+                    "_hh_prefill_scores_per_head", "_hh_shared_scores")
+    for idx, layer in enumerate(cache.layers):
+        dev = layer_device(idx)
+        for attr in tensor_attrs:
+            t = getattr(layer, attr, None)
+            if torch.is_tensor(t) and t.device != dev:
+                setattr(layer, attr, t.to(dev))
+    for name in ("_k_meta", "_v_meta"):
+        metas = getattr(cache, name, None)
+        if metas:
+            for k, tup in list(metas.items()):
+                metas[k] = tuple(t.to(layer_device(k)) if torch.is_tensor(t) else t
+                                 for t in tup)
+
+
 def dumps(obj: KVObject) -> bytes:
     """Serialize to wire bytes: header + torch payload + crc32."""
     header = json.dumps({
