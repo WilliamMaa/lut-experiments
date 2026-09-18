@@ -95,6 +95,14 @@ def run_session(model, repr_name, config, device, t1, t2, mode):
         fresh = make_cache()
         inject_object(fresh, obj)
         place_cache(fresh, model)
+        if os.environ.get("ICN_DEBUG_INJECT"):
+            print(f"[inject-dump] cache={type(fresh).__name__} layers={len(fresh.layers)}")
+            for i, l in enumerate(fresh.layers):
+                k = getattr(l, "keys", None)
+                if k is not None:
+                    print(f"  layer {i:2d} {type(l).__name__} "
+                          f"keys={tuple(k.shape) if torch.is_tensor(k) else type(k).__name__} "
+                          f"dev={k.device if torch.is_tensor(k) else '-'}")
         cache = fresh
 
     logits["turn2_prefill"], cache = forward_turn(model, cache, t2, device)

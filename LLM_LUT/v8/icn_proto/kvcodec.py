@@ -87,13 +87,17 @@ def inject_object(cache, obj: KVObject) -> None:
     as the cache the object was extracted from).
 
     Assumes the cache was constructed with config= so its layer list is
-    pre-allocated. Device alignment is deferred to cache.to(device) at the
+    pre-allocated. Device alignment is deferred to place_cache() at the
     receiving worker.
     """
     for idx, payload in obj.layers.items():
         if idx >= len(cache.layers):
             raise RuntimeError(
                 f"object has layer {idx} but target cache has {len(cache.layers)}")
+        if not (torch.is_tensor(payload.keys) and torch.is_tensor(payload.values)):
+            raise RuntimeError(
+                f"object layer {idx} ({payload.kind}) holds non-tensor state: "
+                f"keys={type(payload.keys).__name__} values={type(payload.values).__name__}")
         layer = cache.layers[idx]
         layer.keys = payload.keys.clone()
         layer.values = payload.values.clone()
