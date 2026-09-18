@@ -23,7 +23,7 @@ from typing import Dict
 
 import torch
 
-from kvname import KVObject, KVName, LayerPayload, Geometry
+from .kvname import KVObject, KVName, LayerPayload, Geometry
 
 _MAGIC = b"ICNKVO1\n"
 
