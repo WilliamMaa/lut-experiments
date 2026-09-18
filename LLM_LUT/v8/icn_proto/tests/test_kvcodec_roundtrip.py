@@ -135,9 +135,9 @@ def main():
               "turn1_tokens": t1.shape[1], "representations": {}}
     failed = False
     for repr_name in ("bf16", "m_sp4", "k8v8"):
-        cont = run_session(model, repr_name, config, args.device, t1, t2, "continuous")
-        inj = run_session(model, repr_name, config, args.device, t1, t2, "inject")
-        wire = run_session(model, repr_name, config, args.device, t1, t2, "wire")
+        cont = run_session(model, repr_name, config, device, t1, t2, "continuous")
+        inj = run_session(model, repr_name, config, device, t1, t2, "inject")
+        wire = run_session(model, repr_name, config, device, t1, t2, "wire")
 
         codec_diff = {k: (inj[k].float() - wire[k].float()).abs().max().item()
                       for k in inj}
