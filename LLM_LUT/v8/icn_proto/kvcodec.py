@@ -35,10 +35,12 @@ def _is_attn_layer(layer) -> bool:
             and layer.values is not None and layer.values.dim() == 4)
 
 
-_LINEAR_FLAG_ATTRS = (
+_LINEAR_DICT_ATTRS = (
     "is_conv_states_initialized",
     "is_recurrent_states_initialized",
     "has_previous_state",
+    "conv_kernel_size",  # ints set by lazy_initialization; None here crashes
+                         # the model's update_conv_state on the next turn
 )
 
 
@@ -68,7 +70,7 @@ def extract_object(cache, name: KVName) -> KVObject:
         rec = getattr(layer, "recurrent_states", None)
         if conv is not None or rec is not None:
             flags = {}
-            for attr in _LINEAR_FLAG_ATTRS:
+            for attr in _LINEAR_DICT_ATTRS:
                 d = getattr(layer, attr, None)
                 if d is not None:
                     flags[attr] = dict(d)

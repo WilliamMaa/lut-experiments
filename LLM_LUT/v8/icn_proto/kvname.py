@@ -126,7 +126,7 @@ class LayerPayload:
     v_meta: Optional[Tuple] = None              # attn: (scale, min) per-token V
     conv_states: Optional[Dict[int, object]] = None       # linear
     recurrent_states: Optional[Dict[int, object]] = None  # linear
-    state_flags: Optional[Dict[str, Dict[int, bool]]] = None  # linear flags
+    state_flags: Optional[Dict[str, Dict[int, object]]] = None  # linear flags + conv_kernel_size
 
     def nbytes(self) -> int:
         total = 0
