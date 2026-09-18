@@ -109,15 +109,17 @@ def main():
     args = ap.parse_args()
 
     from common.utils import load_model_and_tokenizer
+    torch_dtype = {"bf16": "bfloat16", "fp16": "float16",
+                   "fp32": "float32"}[args.dtype]
     if args.device.startswith("cuda:"):
         model, tok, device = load_model_and_tokenizer(
-            args.model_path, torch_dtype=args.dtype, device=args.device)
+            args.model_path, torch_dtype=torch_dtype, device=args.device)
     else:
         # e.g. "balanced_low_0": fixed multi-card placement (red-line guard
         # against "auto" lives in the helper). Restrict cards beforehand via
         # CUDA_VISIBLE_DEVICES.
         model, tok, device = load_model_and_tokenizer(
-            args.model_path, torch_dtype=args.dtype, device_map=args.device)
+            args.model_path, torch_dtype=torch_dtype, device_map=args.device)
     device = str(device)
     config = model.config
 
