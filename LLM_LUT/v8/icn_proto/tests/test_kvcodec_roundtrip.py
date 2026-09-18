@@ -99,10 +99,14 @@ def run_session(model, repr_name, config, device, t1, t2, mode):
             print(f"[inject-dump] cache={type(fresh).__name__} layers={len(fresh.layers)}")
             for i, l in enumerate(fresh.layers):
                 k = getattr(l, "keys", None)
-                if k is not None:
-                    print(f"  layer {i:2d} {type(l).__name__} "
-                          f"keys={tuple(k.shape) if torch.is_tensor(k) else type(k).__name__} "
-                          f"dev={k.device if torch.is_tensor(k) else '-'}")
+                rec = getattr(l, "recurrent_states", None)
+                has_rec = isinstance(rec, dict) and any(
+                    torch.is_tensor(t) for t in rec.values())
+                if k is None and not has_rec:
+                    continue
+                desc = (f"keys={tuple(k.shape)} dev={k.device}" if torch.is_tensor(k)
+                        else f"recurrent_states={[tuple(t.shape) if torch.is_tensor(t) else None for t in rec.values()]}")
+                print(f"  layer {i:2d} {type(l).__name__} {desc}")
         cache = fresh
 
     logits["turn2_prefill"], cache = forward_turn(model, cache, t2, device)

@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Optional, Tuple
 
+import torch
+
 
 class Repr(Enum):
     BF16 = "bf16"
@@ -108,25 +110,37 @@ class LayerPayload:
 
     kind == "attn": standard 4-D KV (optionally the post-eviction compact
     state with original-position bookkeeping and quantization metadata).
-    kind == "aux": non-standard layer state (e.g. GDN recurrent state) —
-    copied raw so a session migration loses nothing.
+    kind == "linear": linear-attention (GDN) layer — transformers 5.x stores
+    its state in conv_states/recurrent_states dicts plus flag dicts, NOT in
+    keys/values; restored verbatim so a migrated session loses nothing.
+
+    Score snapshots (_hh_prefill_scores et al.) are deliberately excluded:
+    session-local, recomputable state (see kvcodec module docstring).
     """
 
-    kind: str                                   # "attn" | "aux"
-    keys: object                                # torch.Tensor
-    values: object                              # torch.Tensor
-    orig_idx: Optional[object] = None           # attn only: _hh_orig_idx
-    k_meta: Optional[Tuple] = None              # attn only: (scale, min) per-channel K
-    v_meta: Optional[Tuple] = None              # attn only: (scale, min) per-token V
+    kind: str                                   # "attn" | "linear"
+    keys: object = None                         # attn: [B, H, S, D]
+    values: object = None
+    orig_idx: Optional[object] = None           # attn: _hh_orig_idx
+    k_meta: Optional[Tuple] = None              # attn: (scale, min) per-channel K
+    v_meta: Optional[Tuple] = None              # attn: (scale, min) per-token V
+    conv_states: Optional[Dict[int, object]] = None       # linear
+    recurrent_states: Optional[Dict[int, object]] = None  # linear
+    state_flags: Optional[Dict[str, Dict[int, bool]]] = None  # linear flags
 
     def nbytes(self) -> int:
-        total = self.keys.numel() * self.keys.element_size()
-        total += self.values.numel() * self.values.element_size()
-        if self.orig_idx is not None:
-            total += self.orig_idx.numel() * self.orig_idx.element_size()
+        total = 0
+        for t in (self.keys, self.values, self.orig_idx):
+            if torch.is_tensor(t):
+                total += t.numel() * t.element_size()
         for meta in (self.k_meta, self.v_meta):
             if meta is not None:
-                total += sum(t.numel() * t.element_size() for t in meta)
+                total += sum(t.numel() * t.element_size() for t in meta
+                             if torch.is_tensor(t))
+        for d in (self.conv_states, self.recurrent_states):
+            if d:
+                total += sum(t.numel() * t.element_size()
+                             for t in d.values() if torch.is_tensor(t))
         return total
 
 

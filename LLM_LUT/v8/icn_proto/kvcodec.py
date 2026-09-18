@@ -35,6 +35,13 @@ def _is_attn_layer(layer) -> bool:
             and layer.values is not None and layer.values.dim() == 4)
 
 
+_LINEAR_FLAG_ATTRS = (
+    "is_conv_states_initialized",
+    "is_recurrent_states_initialized",
+    "has_previous_state",
+)
+
+
 def probe_geometry(cache) -> Geometry:
     """Read (n_full_attn_layers, kv_heads, head_dim) from a cache that has
     completed at least one forward. Raises if no 4-D KV layer is found."""
@@ -49,30 +56,49 @@ def probe_geometry(cache) -> Geometry:
 def extract_object(cache, name: KVName) -> KVObject:
     """Snapshot the cache's full state as a named, location-independent object.
 
-    All tensors are detached and moved to CPU so the object can cross worker
-    boundaries. The source cache is not modified.
+    Handles both layer flavors created by DynamicCache(config) on hybrid
+    models: 4-D KV attention layers and linear-attention (GDN) layers whose
+    state lives in conv_states/recurrent_states dicts. All tensors are
+    detached and moved to CPU so the object can cross worker boundaries.
+    The source cache is not modified.
     """
     obj = KVObject(name=name)
     for idx, layer in enumerate(cache.layers):
-        keys = getattr(layer, "keys", None)
-        values = getattr(layer, "values", None)
-        if keys is None or values is None:
-            continue  # layer never touched (e.g. not yet forwarded)
-        keys, values = keys.detach().to("cpu"), values.detach().to("cpu")
-        if _is_attn_layer(layer):
-            orig_idx = getattr(layer, "_hh_orig_idx", None)
-            payload = LayerPayload(
-                kind="attn",
-                keys=keys,
-                values=values,
-                orig_idx=(orig_idx.detach().to("cpu")
-                          if torch.is_tensor(orig_idx) else None),
-                k_meta=_cpu_meta(getattr(cache, "_k_meta", {}).get(idx)),
-                v_meta=_cpu_meta(getattr(cache, "_v_meta", {}).get(idx)),
+        conv = getattr(layer, "conv_states", None)
+        rec = getattr(layer, "recurrent_states", None)
+        if conv is not None or rec is not None:
+            flags = {}
+            for attr in _LINEAR_FLAG_ATTRS:
+                d = getattr(layer, attr, None)
+                if d is not None:
+                    flags[attr] = dict(d)
+
+            def _cpu_dict(d):
+                if not d:
+                    return None
+                out = {i: t.detach().to("cpu") for i, t in d.items()
+                       if torch.is_tensor(t)}
+                return out or None
+
+            obj.layers[idx] = LayerPayload(
+                kind="linear",
+                conv_states=_cpu_dict(conv),
+                recurrent_states=_cpu_dict(rec),
+                state_flags=flags or None,
             )
-        else:
-            payload = LayerPayload(kind="aux", keys=keys, values=values)
-        obj.layers[idx] = payload
+            continue
+        if not _is_attn_layer(layer):
+            continue  # layer never touched (e.g. not yet forwarded)
+        orig_idx = getattr(layer, "_hh_orig_idx", None)
+        obj.layers[idx] = LayerPayload(
+            kind="attn",
+            keys=layer.keys.detach().to("cpu"),
+            values=layer.values.detach().to("cpu"),
+            orig_idx=(orig_idx.detach().to("cpu")
+                      if torch.is_tensor(orig_idx) else None),
+            k_meta=_cpu_meta(getattr(cache, "_k_meta", {}).get(idx)),
+            v_meta=_cpu_meta(getattr(cache, "_v_meta", {}).get(idx)),
+        )
     return obj
 
 
@@ -94,13 +120,34 @@ def inject_object(cache, obj: KVObject) -> None:
         if idx >= len(cache.layers):
             raise RuntimeError(
                 f"object has layer {idx} but target cache has {len(cache.layers)}")
+        layer = cache.layers[idx]
+        if payload.kind == "linear":
+            for attr in ("conv_states", "recurrent_states"):
+                src = getattr(payload, attr)
+                if not src:
+                    continue
+                dst = getattr(layer, attr, None)
+                if dst is None:
+                    raise RuntimeError(
+                        f"target cache layer {idx} has no {attr} to inject into")
+                for i, t in src.items():
+                    dst[i] = t.clone()
+            if payload.state_flags:
+                for attr, flags in payload.state_flags.items():
+                    dst = getattr(layer, attr, None)
+                    if isinstance(dst, dict):
+                        dst.update(flags)
+            continue
         if not (torch.is_tensor(payload.keys) and torch.is_tensor(payload.values)):
             raise RuntimeError(
                 f"object layer {idx} ({payload.kind}) holds non-tensor state: "
                 f"keys={type(payload.keys).__name__} values={type(payload.values).__name__}")
-        layer = cache.layers[idx]
         layer.keys = payload.keys.clone()
         layer.values = payload.values.clone()
+        # Without this the next update() treats the layer as fresh and
+        # lazy_initialization CLOBBERS the injected state (measured on the
+        # 35B hybrid: injected session silently recomputed from scratch).
+        layer.is_initialized = True
         if payload.kind == "attn":
             if payload.orig_idx is not None:
                 layer._hh_orig_idx = payload.orig_idx.clone()
@@ -144,6 +191,12 @@ def place_cache(cache, model) -> None:
             t = getattr(layer, attr, None)
             if torch.is_tensor(t) and t.device != dev:
                 setattr(layer, attr, t.to(dev))
+        for attr in ("conv_states", "recurrent_states"):
+            d = getattr(layer, attr, None)
+            if isinstance(d, dict):
+                for k, t in d.items():
+                    if torch.is_tensor(t) and t.device != dev:
+                        d[k] = t.to(dev)
     for name in ("_k_meta", "_v_meta"):
         metas = getattr(cache, name, None)
         if metas:
