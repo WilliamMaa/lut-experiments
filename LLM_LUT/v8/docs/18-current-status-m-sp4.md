@@ -1,9 +1,8 @@
 # v8 KV 压缩：当前状态与最终配置验证（2026-09-15）
 
-一句话状态（2026-09-15 更新）：**12a/12b 均已跑完。12b（k8v8 2000x）成立——
-哨兵题全保，仅丢 1 个临界轮。12a 未过逐位一致：2/53 自由生成轮中途分叉，
-方差源定位为折叠的 CUDA index_add_ 原子加，已改为确定性 one-hot matmul。
-只差 12c（修复后跑一次，命令在 docs/16-run-commands.md 第 12 节）。**
+一句话状态（2026-09-16 更新）：**12c 通过判定标准（EOS 逐位一致、KL ≈ 0.519、
+哨兵题三轮逐字一致、repetition 反降），方法栈正式定型。最终总结见
+docs/19-final-summary.md。**
 
 评测条件：Qwen3.6-35B-A3B，device_map=balanced_low_0，bf16，
 v3 多轮评测集（53 轮，8 个文档多轮对话），baseline EOS 0.811，repetition 0.019。

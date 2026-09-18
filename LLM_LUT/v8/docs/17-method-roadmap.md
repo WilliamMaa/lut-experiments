@@ -69,7 +69,13 @@ repetition +3.8pp。探针的碎片化选择诊断被直接验证。
 档案：results/heavy_hitter_attn_l128_s4_r32_w64_m_sp4_k8v8_multiturn_v3set.json
 
 遗留：12a 复验发现折叠 index_add_ 原子加是末位方差源（2/53 自由生成轮
-分叉，指标无损），已改确定性 one-hot matmul，待 12c 复验后定型。
+分叉，指标无损），已改确定性 one-hot matmul。
+
+### 12c 结果（2026-09-16）：通过，方法栈定型
+det run vs 旧 m_sp4：EOS 逐位一致、decode KL 0.51873≈0.51871、哨兵题三轮
+逐字一致、repetition 反降至 0.038；6/53 分叉全为开放式长输出，无事实错误。
+档案：results/heavy_hitter_attn_l128_s4_r32_w64_m_sp4_det_multiturn_v3set.json
+最终总结：docs/19-final-summary.md
 
 ## 已放弃的方向（不要再回头的）
 

@@ -430,6 +430,10 @@ baseline 路径零分叉证明前向本身确定，stable sort 选择也已确�
 不同是预期）：聚合指标与 m_sp4 一致（EOS 0.811、rep 0.057、
 KL ≈ 0.519），哨兵题三轮全对。通过后方法栈定型。
 
+结果（2026-09-16）：通过。EOS 逐位一致，KL 0.51873≈0.51871，哨兵题三轮
+逐字一致，rep 反降至 0.038。6/53 分叉全为开放式长输出，无事实错误。
+方法栈定型，最终总结见 docs/19-final-summary.md。
+
 ```bash
 CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/eval_kv_cache.py \
   --patch heavy_hitter_attn \
