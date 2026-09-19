@@ -77,11 +77,11 @@ def main():
     if loc:
         print(f"resumed prefill_s   : {avg([r.get('prefill_s', 0) for r in loc])} (avg)")
     if fr:
-        toks = sum(r["cum_tokens"] for r in fr)
+        toks = sum(r.get("cum_tokens", 0) for r in fr)
         sec = sum(r.get("prefill_s", 0) for r in fr)
         print(f"fresh prefill_s     : {[r.get('prefill_s') for r in fr]}")
-        print(f"fresh cum_tokens    : {[r['cum_tokens'] for r in fr]}")
-        if sec > 0:
+        print(f"fresh cum_tokens    : {[r.get('cum_tokens') for r in fr]}")
+        if sec > 0 and toks > 0:
             print(f"implied prefill rate: {toks / sec:,.0f} tok/s")
 
     print("summary:", {k: d[k] for k in
