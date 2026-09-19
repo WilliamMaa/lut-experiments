@@ -138,9 +138,9 @@ move vs recompute 的选择边界与标定 cost model 一致：迁移胜出 ⟺ 
 状态：机制已就绪（worker 上报 decode tokens），待 E2 后跑。
 
 **E5 压缩改变 allocation 自由度（经济学对比，本方向的核心卖点）**
-同一逻辑 KV，m_sp4（~66MB 定长，doc-turn object 实测 140.6MB，差异原因待查）vs bf16（20KiB×L）：使"KV follows compute"从不可行变为可行的上下文区间移动约 10 倍（L* 之比）。
-判据：E3 的 L* 实测值对比即结论；辅以 transfer_bytes 曲线（m_sp4 平坦 vs bf16 线性增长）。
-状态：✅ 物理量已实测（诚实带宽下 140.6MB/1.405s ≈ 100MB/s）；按诚实系数重算 L*：m_sp4 1.6-3K vs bf16 17K，差一个 E3 的正式边界扫描出最终对比数字。
+同一逻辑 KV，m_sp4 vs bf16（20KiB×L）：使"KV follows compute"从不可行变为可行的上下文区间移动倍数（L* 之比）。
+判据：E3 的 L* 实测值对比即结论；辅以 transfer_bytes / object 体积曲线。
+状态：构成已实测（2026-09-19 复验 run）：m_sp4 object = **65MB 固定（30 层 GDN recurrent state，与 L 无关）+ attn 部分 ~15.2KB/token（obs window 未咬合，随 L 增长）**——"66MB 定长 object"的旧假设作废，L* 是否饱和取决于长 L 处 eviction 的形状；bf16 = 20KiB×L 全程线性。最终对比数字待 E3 边界扫描。
 
 ### 5.2 明确不评估
 
