@@ -96,11 +96,13 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--out", default=OUT)
     args = ap.parse_args()
+    args.scales = [int(x) for x in str(args.scales).split(",") if x.strip()]
+    args.policies = [p for p in args.policies.split(",") if p.strip()]
 
     cmds = build_cmds(args)
     print(f"[matrix] {len(cmds)} runs: "
-          f"{len(args.scales.split(','))} scales x "
-          f"{len(args.policies.split(','))} policies x {args.seeds} seeds")
+          f"{len(args.scales)} scales x "
+          f"{len(args.policies)} policies x {args.seeds} seeds")
     for tag, _, cmd in cmds:
         print(f"[matrix] {tag}: {' '.join(cmd[2:])}")
     if args.dry_run:
