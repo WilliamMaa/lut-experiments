@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
 """Scheduler: trace replay, name-aware placement, metrics aggregation.
 
-Step 2 scope: policies P0 (least-loaded, no locality) and P1 (cache-affinity
-with cross-worker object transfer). P2 (ICN cost model + representation
-selection) lands in Step 3.
-
-Workload: the first `--sessions` documents of data/multi_turn_prompts_v3.jsonl,
-`--turns-per-session` questions each. Turn t of a session continues turn t-1;
-a turn is assignable once its predecessor completed (the KV object must
-exist). Per-session object chain:
-/session/<doc>/turn/<t>/span/0-<cum>/repr/<r>.
-
-A request's resume_from names the session's previous object; the assigned
-worker must hold it (resident or after a scheduler-mediated fetch->deliver),
-else the worker recomputes from scratch (recompute_tokens = cum_tokens).
+Object identity is content-addressed (docs/icn-defined-addressing/03
+§4.2): a turn's KV object is named H(model, encoding, prefix token ids),
+so identical prefixes share objects across sessions through the NRS
+(scheduler-side resident index + reuse_count). Every turn — including each
+session's synthetic doc-turn (turn == -1, the shared document prefix) —
+does the NRS lookup and picks one of: resume local / fetch->deliver /
+recompute. Policies differ only in how they choose.
 
 Run (spawned by run_cluster.py, which also starts the workers):
-    python -m icn_proto.run_cluster --policy p1 ...
+    python -m icn_proto.run_cluster --policy p2 ...
 """
 
 import json
@@ -31,6 +25,7 @@ import zmq
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from icn_proto import msg
+from icn_proto.kvname import KVName, Repr
 
 TRACE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                      "data", "multi_turn_prompts_v3.jsonl")
@@ -38,15 +33,43 @@ TRACE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 @dataclass
 class Turn:
+    """One dispatchable unit of a session's chain.
+
+    turn == -1 is the synthetic doc-turn: it prefills the shared document
+    prefix and publishes it as its own content-addressed object (decode 0).
+    Question turns t >= 0 prefill only their question tokens onto the
+    predecessor's object.
+
+    prefill_ids: tokens the worker prefills when RESUMING (q tokens, or []
+    for a doc-turn reuse hit). When RECOMPUTING, the worker prefills
+    prefix_ids instead (see send_assign).
+    prefix_ids: the full token prefix through this turn — the hash input
+    for this turn's content-addressed name."""
+
     session: str
     turn: int
-    new_token_ids: list
-    cum_tokens: int
-    t_ready: float = 0.0      # when the turn became dispatchable
+    prefill_ids: list
+    prefix_ids: list
+    t_ready: float = 0.0
+    _name_cache: dict = field(default_factory=dict, repr=False,
+                              compare=False)
 
-    def name(self, repr_name: str) -> str:
-        return (f"/session/{self.session}/turn/{self.turn}"
-                f"/span/0-{self.cum_tokens}/repr/{repr_name}")
+    @property
+    def cum_tokens(self) -> int:
+        return len(self.prefix_ids)
+
+    def name(self, repr_name: str, model_tag: str = "qwen35b") -> str:
+        if repr_name not in self._name_cache:
+            import hashlib
+            from array import array
+            h = hashlib.sha256()
+            h.update(model_tag.encode())
+            h.update(b"|" + repr_name.encode() + b"|")
+            h.update(array("q", self.prefix_ids).tobytes())
+            self._name_cache[repr_name] = str(
+                KVName(h.hexdigest()[:16], len(self.prefix_ids),
+                       Repr(repr_name)))
+        return self._name_cache[repr_name]
 
 
 @dataclass
@@ -81,6 +104,7 @@ class Scheduler:
         self._xfer = {}            # request_id -> transfer state
         self.prefill_rate = self.PREFILL_RATE0
         self.xfer_rate = self.XFER_RATE0
+        self.nrs_reuse = {}        # content name -> cross-session reuse count
 
     # ---- workload -------------------------------------------------------
 
@@ -94,15 +118,16 @@ class Scheduler:
                    else (self.args.doc_repeat_alt
                          if self.args.doc_repeat_alt is not None
                          else self.args.doc_repeat))
-            doc = (sample["document"] * rep)[: self.args.doc_chars]
-            prompt = doc
-            turns = []
+            doc_text = (sample["document"] * rep)[: self.args.doc_chars]
+            doc_ids = tokenizer(doc_text,
+                                return_tensors="pt").input_ids[0].tolist()
+            turns = [Turn(session, -1, list(doc_ids), list(doc_ids))]
+            prefix = list(doc_ids)
             for t, q in enumerate(sample["questions"][: self.args.turns_per_session]):
-                new_text = "\n\n" + q
-                ids = tokenizer(new_text, return_tensors="pt").input_ids[0].tolist()
-                prompt = prompt + new_text
-                cum = len(tokenizer(prompt, return_tensors="pt").input_ids[0])
-                turns.append(Turn(session, t, ids, cum))
+                q_ids = tokenizer("\n\n" + q,
+                                  return_tensors="pt").input_ids[0].tolist()
+                prefix = prefix + q_ids
+                turns.append(Turn(session, t, list(q_ids), list(prefix)))
             self.turns_of[session] = turns
             self.pending_next[session] = 0
             turns[0].t_ready = time.time()
@@ -139,89 +164,141 @@ class Scheduler:
 
     # ---- placement policies ----------------------------------------------
 
-    def choose(self, turn):
-        """Returns (ident, resume_from|None, fetch_from|None) or None.
+    def chain_prev(self, turn):
+        """Predecessor turn in the session chain (None for the doc-turn)."""
+        if turn.turn == -1:
+            return None
+        return self.turns_of[turn.session][turn.turn].name(
+            self.repr_of[turn.session])
 
-        P0: any idle worker, never resume (full recompute by construction).
-        P1: idle worker already holding the previous object -> resume there;
-            else an idle worker plus fetch of the object from its holder;
-            else any idle worker, no resume (first turn / holder gone).
-        rotate (diagnostic): session s turn t goes to worker (s+t) % W, so
-            every non-first turn is a cross-worker transfer under full load.
-            Used to measure xfer_s, not a real placement policy.
+    def choose(self, turn):
+        """NRS lookup + policy choice.
+
+        Returns (ident, resume_from|None, fetch_from|None, decision|None)
+        or None when no worker is available.
+
+        Lookup order (03-icn-kv-principle §3):
+          1. reuse   — doc-turn whose own content-addressed name is already
+                       resident (another session produced the identical doc
+                       prefix): zero-prefill resume, the ICN sharing case.
+          2. resume  — predecessor object resident somewhere: local, or
+                       fetch->deliver from its holder.
+          3. recompute — nothing to resume from.
+
+        P0 always recomputes; P1 takes the first option found (idle worker,
+        transferring when the holder is busy); P2 argmins the calibrated
+        cost model; rotate pins turns to workers for coefficient probing.
         """
-        prev = None
-        if turn.turn > 0:
-            prev = self.turns_of[turn.session][turn.turn - 1].name(
-                self.repr_of[turn.session])
+        repr_name = self.repr_of[turn.session]
+        prev = self.chain_prev(turn)
+        own = turn.name(repr_name)
+        reuse_holders = ([w for w in self.workers.values()
+                          if own in w.resident]
+                         if turn.turn == -1 else [])
         if self.args.policy == "rotate":
             idx = int("".join(c for c in turn.session if c.isdigit()))
+            k = 0 if turn.turn == -1 else turn.turn + 1
             target = list(self.workers.values())[
-                (idx + turn.turn) % len(self.workers)]
+                (idx + k) % len(self.workers)]
             if target.busy:
                 return None
+            if reuse_holders:
+                h = reuse_holders[0]
+                return (target.ident, own,
+                        None if h is target else h.ident, None)
             if not prev or prev in target.resident:
-                return target.ident, prev, None
+                return target.ident, prev, None, None
             holders = [w for w in self.workers.values()
                        if prev in w.resident]
             if holders:
-                return target.ident, prev, holders[0].ident
-            return target.ident, None, None
+                return target.ident, prev, holders[0].ident, None
+            return target.ident, None, None, None
         idle = [w for w in self.workers.values() if not w.busy]
         if not idle:
             return None
         if self.args.policy == "p2":
-            return self.choose_p2(turn, prev, idle)
-        if self.args.policy == "p0" or not prev:
-            return idle[0].ident, None, None
+            return self.choose_p2(turn, prev, own, reuse_holders, idle)
+        if self.args.policy == "p0":
+            return idle[0].ident, None, None, None
+        # P1: reuse hit (route to holder or fetch), else local resume,
+        # else fetch, else recompute.
+        if reuse_holders:
+            h = reuse_holders[0]
+            for w in idle:
+                if w is h:
+                    self.nrs_reuse[own] = self.nrs_reuse.get(own, 0) + 1
+                    return w.ident, own, None, None
+            self.nrs_reuse[own] = self.nrs_reuse.get(own, 0) + 1
+            return idle[0].ident, own, h.ident, None
+        if not prev:
+            return idle[0].ident, None, None, None
         for w in idle:
             if prev in w.resident:
-                return w.ident, prev, None
+                return w.ident, prev, None, None
         holders = [w for w in self.workers.values() if prev in w.resident]
         if holders:
-            return idle[0].ident, prev, holders[0].ident
-        return idle[0].ident, None, None
+            return idle[0].ident, prev, holders[0].ident, None
+        return idle[0].ident, None, None, None
 
-    def choose_p2(self, turn, prev, idle):
-        """ICN cost model: pick the idle worker minimizing predicted
-        execution time of this turn.
+    def choose_p2(self, turn, prev, own, reuse_holders, idle):
+        """ICN cost model over the three honest options:
 
-          local    : new_tokens / prefill_rate
-          transfer : prev_obj_bytes / xfer_rate + new_tokens / prefill_rate
-          recompute: cum_tokens / prefill_rate
+          reuse    : 0-prefill resume of own name (doc-turn sharing);
+                     on another worker it costs obj_bytes / xfer_rate
+          local    : len(prefill_ids) / prefill_rate
+          transfer : obj_bytes / xfer_rate + len(prefill_ids) / prefill_rate
+          recompute: len(prefix_ids) / prefill_rate   (the FULL prefix,
+                     doc included — this is what makes recompute honest)
 
-        The quality penalty (EOS_DELTA[repr]) is identical across workers
-        for a chain-homogeneous session, so it shapes repr assignment at
-        admission time, not per-turn placement. Ties break toward local
-        resume (no transfer bytes on the wire)."""
-        new_tokens = max(1, len(turn.new_token_ids))
+        The quality penalty (EOS_DELTA[repr]) is constant across workers
+        for a chain-homogeneous session; it shaped repr assignment at
+        admission, not per-turn placement. Ties break reuse < local <
+        transfer < recompute."""
+        prefill_n = max(1, len(turn.prefill_ids))
         best = None
+        costs = {}
         for w in idle:
-            if prev is not None and prev in w.resident:
-                cost, resume_from, fetch_from = (
-                    new_tokens / self.prefill_rate, prev, None)
+            if turn.turn == -1 and any(h is w for h in reuse_holders):
+                cost, resume_from, fetch_from, mode = 0.0, own, None, "reuse"
+            elif turn.turn == -1 and reuse_holders:
+                nbytes = self.obj_bytes.get(own, self.estimate_obj_bytes(own))
+                cost, resume_from = nbytes / self.xfer_rate, own
+                fetch_from, mode = reuse_holders[0].ident, "xfer_reuse"
+            elif prev is not None and prev in w.resident:
+                cost, resume_from, fetch_from, mode = (
+                    prefill_n / self.prefill_rate, prev, None, "local")
             else:
                 holders = [x for x in self.workers.values()
                            if prev in x.resident] if prev else []
                 if holders:
                     nbytes = self.obj_bytes.get(
                         prev, self.estimate_obj_bytes(prev))
-                    cost = nbytes / self.xfer_rate + new_tokens / self.prefill_rate
+                    cost = nbytes / self.xfer_rate + prefill_n / self.prefill_rate
                     resume_from, fetch_from = prev, holders[0].ident
+                    mode = "xfer"
                 else:
-                    cost = turn.cum_tokens / self.prefill_rate
+                    cost = len(turn.prefix_ids) / self.prefill_rate
                     resume_from, fetch_from = None, None
-            # epsilon preference: local < transfer < recompute on ties
-            cost += {"l": 0.0, "x": 1e-6, "r": 2e-6}[
-                "l" if fetch_from is None and resume_from else
-                "x" if fetch_from else "r"]
+                    mode = "recompute"
+            costs[w.ident.decode()] = {"mode": mode,
+                                       "cost_s": round(cost, 4)}
+            cost += {"u": -1e-7, "l": 0.0, "x": 1e-6, "r": 2e-6}[
+                "u" if mode == "reuse" else
+                "l" if mode == "local" else
+                "x" if mode in ("xfer", "xfer_reuse") else "r"]
             if best is None or cost < best[0]:
-                best = (cost, w.ident, resume_from, fetch_from)
-        return best[1], best[2], best[3]
+                best = (cost, w.ident, resume_from, fetch_from, mode,
+                        round(costs[w.ident.decode()]["cost_s"], 4))
+        if best[4] in ("reuse", "xfer_reuse"):
+            self.nrs_reuse[own] = self.nrs_reuse.get(own, 0) + 1
+        decision = {"chosen": best[4], "chosen_cost_s": best[5],
+                    "prefill_rate": round(self.prefill_rate, 1),
+                    "xfer_rate": round(self.xfer_rate, 1),
+                    "options": costs}
+        return best[1], best[2], best[3], decision
 
     def estimate_obj_bytes(self, name):
         """Scheduler-side size estimate before the object has been reported."""
-        from icn_proto.kvname import KVName
         n = KVName.parse(name)
         if n.repr.value == "bf16":
             return n.span_end * self.args.kv_bytes_per_token
@@ -271,7 +348,7 @@ class Scheduler:
             chosen = self.choose(turn)
             if chosen is None:
                 break  # no idle worker; retry when a result arrives
-            ident, resume_from, fetch_from = chosen
+            ident, resume_from, fetch_from, decision = chosen
             rid = f"{turn.session}:{turn.turn}"
             w = self.workers[ident]
             if fetch_from is not None:
@@ -283,31 +360,43 @@ class Scheduler:
                 w.busy = True   # reserve the target during the transfer
                 self.ready.remove(turn)
                 continue
-            self.send_assign(sock, ident, turn, resume_from)
+            self.send_assign(sock, ident, turn, resume_from,
+                             decision=decision)
             self.ready.remove(turn)
 
     def send_assign(self, sock, ident, turn, resume_from, xfer_bytes=0,
-                    xfer_s=0.0):
+                    xfer_s=0.0, decision=None):
         rid = f"{turn.session}:{turn.turn}"
         w = self.workers[ident]
         w.busy = True
         w.current = rid
         self._xfer.pop(rid, None)
+        repr_name = self.repr_of[turn.session]
+        is_reuse = resume_from == turn.name(repr_name)
         msg.send(sock, {
             "type": "assign", "request_id": rid,
             "session": turn.session, "turn": turn.turn,
-            "new_token_ids": turn.new_token_ids,
+            # resume path prefills the turn's own tokens; recompute path
+            # prefills the FULL prefix (doc included — honest recompute);
+            # reuse path (doc-turn hit) prefills nothing: the injected
+            # object already covers the whole span.
+            "prefill_ids": ([] if is_reuse
+                            else turn.prefill_ids if resume_from
+                            else turn.prefix_ids),
             "cum_tokens": turn.cum_tokens,
+            "name": turn.name(repr_name),
             "resume_from": resume_from,
-            "repr": self.repr_of[turn.session],
-            "decode_steps": self.args.decode_steps,
+            "repr": repr_name,
+            "decode_steps": (0 if turn.turn == -1
+                             else self.args.decode_steps),
         }, ident=ident)
         self.records.append({"request_id": rid, "worker": w.ident.decode(),
                              "t_assigned": time.time(),
                              "queue_s": round(time.time() - turn.t_ready, 4),
                              "resume_from": resume_from,
                              "transfer_bytes": xfer_bytes,
-                             "xfer_s": round(xfer_s, 4)})
+                             "xfer_s": round(xfer_s, 4),
+                             "decision": decision})
 
     def on_message(self, sock, ident, hdr, payload):
         w = self.workers.get(ident)
@@ -326,21 +415,25 @@ class Scheduler:
                 rec.update({k: hdr.get(k) for k in
                             ("ok", "resumed", "prefill_s", "decode_s",
                              "prefill_tokens", "cum_tokens", "error",
-                             "obj_bytes", "resident_bytes", "repr")})
+                             "obj_bytes", "resident_bytes", "repr",
+                             "decoded_ids")})
                 rec["latency_s"] = round(time.time() - rec.pop("t_assigned"), 4)
             w.busy = False
             w.current = None
             if hdr.get("ok"):
-                name = self.turns_of[rid.split(":")[0]][int(rid.split(":")[1])] \
-                    .name(self.repr_of[rid.split(":")[0]])
+                session, t = rid.split(":")
+                chain_idx = 0 if t == "-1" else int(t) + 1
+                name = self.turns_of[session][chain_idx] \
+                    .name(self.repr_of[session])
                 w.resident.add(name)
                 if hdr.get("obj_bytes"):
                     self.obj_bytes[name] = hdr["obj_bytes"]
-                # online calibration of the recompute coefficient from fresh
-                # (full-prefill) turns only: resumed prefill_s measures the
-                # new-question tokens, not the prefix.
+                # online calibration of the recompute coefficient from
+                # non-resumed turns only; doc-turns are pure prefix
+                # prefill (cum == prefill length), question-turn
+                # recomputes carry the full prefix in prefill_tokens.
                 if not rec.get("resumed") and hdr.get("prefill_s"):
-                    rate = hdr["cum_tokens"] / hdr["prefill_s"]
+                    rate = hdr["prefill_tokens"] / hdr["prefill_s"]
                     self.prefill_rate = 0.7 * self.prefill_rate + 0.3 * rate
             # advance even on failure: the next turn finds no resident
             # predecessor and degrades to full recompute (designed fallback),
@@ -385,7 +478,9 @@ class Scheduler:
 
     def advance(self, request_id):
         session, t = request_id.split(":")
-        nxt = int(t) + 1
+        # chain index: 0 = doc-turn, k = question turn k-1
+        idx = 0 if t == "-1" else int(t) + 1
+        nxt = idx + 1
         self.pending_next[session] = nxt
         turns = self.turns_of[session]
         if nxt < len(turns):
@@ -411,6 +506,7 @@ class Scheduler:
             "config": {k: v for k, v in vars(self.args).items()},
             "policy": self.args.policy,
             "repr_of": self.repr_of,
+            "nrs_reuse": self.nrs_reuse,
             "prefill_rate": round(self.prefill_rate, 1),
             "xfer_rate": round(self.xfer_rate, 1),
             "wall_s": round(wall, 2),

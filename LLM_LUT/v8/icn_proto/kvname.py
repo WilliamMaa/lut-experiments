@@ -78,30 +78,35 @@ def repr_bytes_per_token(repr: Repr, geometry: Geometry,
 
 @dataclass(frozen=True)
 class KVName:
-    session: str
-    turn: int
-    span_start: int          # token offset of this span's first token
-    span_end: int            # exclusive
+    """Content-addressed identity (docs/icn-defined-addressing/03 §4.2 修正 1).
+
+    The name answers WHAT the content is, not WHO asked: the prefix_hash is
+    a hash of (model tag, encoding, prefix token ids). Two requests whose
+    token prefixes are identical — across sessions, across users — resolve
+    to the same name and share the object through the NRS. The worker id /
+    GPU is only a locator tracked by the index, never part of identity."""
+
+    prefix_hash: str
+    span_end: int                # number of prefix tokens covered (exclusive)
     repr: Repr = Repr.BF16
 
     def __str__(self) -> str:
-        return (f"/session/{self.session}/turn/{self.turn}"
-                f"/span/{self.span_start}-{self.span_end}/repr/{self.repr.value}")
+        return (f"/prefix/{self.prefix_hash}/span/0-{self.span_end}"
+                f"/repr/{self.repr.value}")
 
     @classmethod
     def parse(cls, s: str) -> "KVName":
         parts = [p for p in s.split("/") if p]
-        if (len(parts) != 8 or parts[0] != "session" or parts[2] != "turn"
-                or parts[4] != "span" or parts[6] != "repr"):
+        if (len(parts) != 6 or parts[0] != "prefix" or parts[2] != "span"
+                or parts[4] != "repr"):
             raise ValueError(f"not a KVName: {s!r}")
-        start, end = parts[5].split("-")
-        return cls(session=parts[1], turn=int(parts[3]),
-                   span_start=int(start), span_end=int(end),
-                   repr=Repr(parts[7]))
+        start, end = parts[3].split("-")
+        return cls(prefix_hash=parts[1], span_end=int(end),
+                   repr=Repr(parts[5]))
 
     @property
     def span_tokens(self) -> int:
-        return self.span_end - self.span_start
+        return self.span_end
 
 
 @dataclass

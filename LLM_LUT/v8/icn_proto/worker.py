@@ -2,7 +2,8 @@
 """Worker process: one model replica, serves scheduler commands.
 
 Lifecycle of one assigned turn:
-  1. scheduler sends `assign` {session, turn, new_token_ids, resume_from}.
+  1. scheduler sends `assign` {session, turn, prefill_ids, name,
+     resume_from, repr, decode_steps}.
   2. if resume_from is set, worker injects its resident object for that name
      (cache continuity); otherwise it starts a fresh cache = full recompute.
   3. worker prefills the new tokens, runs `decode_steps` decode steps, then
@@ -74,8 +75,8 @@ class Worker:
     # ---- turn execution -------------------------------------------------
 
     @torch.inference_mode()
-    def run_turn(self, session, turn, new_ids, resume_from, decode_steps,
-                 hdr_cum_tokens=None, repr_name=None):
+    def run_turn(self, session, turn, prefill_ids, resume_from, name,
+                 decode_steps, repr_name=None):
         repr_name = repr_name or self.args.repr
         t0 = time.time()
         cache = self._make_cache(repr_name)
@@ -84,38 +85,44 @@ class Worker:
             inject_object(cache, self.resident[resume_from])
             place_cache(cache, self.model)
             resumed = True
-        ids = torch.tensor([new_ids], dtype=torch.long)
-        t1 = time.time()
-        out = self.model(input_ids=ids.to(self.device),
-                         past_key_values=cache, use_cache=True)
-        cache = out.past_key_values
-        prefill_s = time.time() - t1
+        out = None
+        prefill_s = 0.0
+        if prefill_ids:
+            ids = torch.tensor([prefill_ids], dtype=torch.long)
+            t1 = time.time()
+            out = self.model(input_ids=ids.to(self.device),
+                             past_key_values=cache, use_cache=True)
+            cache = out.past_key_values
+            prefill_s = time.time() - t1
+        elif decode_steps:
+            # zero-prefill turns are only legal without decode (doc-reuse);
+            # question turns must always prefill something to seed logits.
+            raise RuntimeError("zero prefill with decode_steps > 0")
         t2 = time.time()
+        decoded = []
         for _ in range(decode_steps):
             nxt = out.logits[:, -1, :].argmax(dim=-1, keepdim=True)
+            decoded.append(int(nxt))
             out = self.model(input_ids=nxt.to(self.device),
                              past_key_values=cache, use_cache=True)
             cache = out.past_key_values
         decode_s = time.time() - t2
-        cum = int(hdr_cum_tokens if hdr_cum_tokens else ids.shape[1])
-        name = KVName(session, turn, 0, cum, Repr(repr_name))
-        obj = extract_object(cache, name)
-        # Only the latest object of a session is ever resume-able; older
-        # same-session objects are dead weight (ICN eviction: keep latest).
-        for k in [k for k in self.resident
-                  if k != str(name) and KVName.parse(k).session == session]:
-            del self.resident[k]
-        self.resident[str(name)] = obj
+        obj = extract_object(cache, KVName.parse(name))
+        # eviction: v1 keeps every resident object (allocation-scale
+        # footprints fit HBM; eviction policy is a v2 question tied to
+        # the memory-pressure cost term, see 03-icn-kv-principle §4.2).
+        self.resident[str(obj.name)] = obj
         return {
             "resumed": resumed,
             "repr": repr_name,
-            "prefill_tokens": int(ids.shape[1]),
-            "cum_tokens": cum,
+            "prefill_tokens": len(prefill_ids),
+            "cum_tokens": KVName.parse(name).span_end,
             "prefill_s": round(prefill_s, 4),
             "decode_s": round(decode_s, 4),
-            "queue_s": round(t1 - t0, 4),
+            "queue_s": round(time.time() - t0, 4),
             "obj_bytes": obj.nbytes(),
             "resident_bytes": sum(o.nbytes() for o in self.resident.values()),
+            "decoded_ids": decoded,
         }
 
     # ---- command loop ---------------------------------------------------
@@ -133,9 +140,9 @@ class Worker:
                 self.busy = True
                 try:
                     metrics = self.run_turn(
-                        hdr["session"], hdr["turn"], hdr["new_token_ids"],
-                        hdr.get("resume_from"), hdr.get("decode_steps", 1),
-                        hdr.get("cum_tokens"), hdr.get("repr"))
+                        hdr["session"], hdr["turn"], hdr["prefill_ids"],
+                        hdr.get("resume_from"), hdr["name"],
+                        hdr.get("decode_steps", 0), hdr.get("repr"))
                     metrics["type"] = "result"
                     metrics["request_id"] = hdr["request_id"]
                     metrics["ok"] = True

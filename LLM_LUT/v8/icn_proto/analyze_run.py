@@ -51,6 +51,14 @@ def main():
     if tr:
         mb = sum(r["transfer_bytes"] for r in tr) / len(tr) / 1e6
         print(f"avg transfer size   : {mb:.1f} MB  total {sum(r['transfer_bytes'] for r in tr) / 1e9:.2f} GB")
+    dec = [r["decision"]["chosen"] for r in recs
+           if r.get("decision") and r["decision"].get("chosen")]
+    if dec:
+        import collections
+        print("p2 decision modes   :", dict(collections.Counter(dec)))
+    if d.get("nrs_reuse"):
+        print(f"nrs reuse names     : {len(d['nrs_reuse'])} names, "
+              f"total {sum(d['nrs_reuse'].values())} cross-session reuses")
     if loc:
         print(f"resumed prefill_s   : {avg([r.get('prefill_s', 0) for r in loc])} (avg)")
     if fr:
