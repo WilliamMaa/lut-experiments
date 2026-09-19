@@ -61,6 +61,9 @@ def main():
                     help="comma-separated free GPU ids, dealt round-robin")
     ap.add_argument("--gpus-per-worker", type=int, default=2)
     ap.add_argument("--port", type=int, default=5570)
+    ap.add_argument("--device", default="balanced_low_0",
+                    help="worker-side model device map (fixed split, never 'auto')")
+    ap.add_argument("--dtype", default="bfloat16")
     sched_mod.add_args(ap)
     args = ap.parse_args()
 
