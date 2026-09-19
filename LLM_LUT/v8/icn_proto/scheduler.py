@@ -79,7 +79,7 @@ class Scheduler:
                        if i < self.args.sessions]
         for doc_id, sample in enumerate(samples):
             session = f"doc{doc_id}"
-            doc = sample["document"][: self.args.doc_chars]
+            doc = (sample["document"] * self.args.doc_repeat)[: self.args.doc_chars]
             prompt = doc
             turns = []
             for t, q in enumerate(sample["questions"][: self.args.turns_per_session]):
@@ -320,6 +320,10 @@ def add_args(ap):
     ap.add_argument("--sessions", type=int, default=4)
     ap.add_argument("--turns-per-session", type=int, default=4)
     ap.add_argument("--doc-chars", type=int, default=4000)
+    ap.add_argument("--doc-repeat", type=int, default=1,
+                    help="tile the document N times before truncation, to "
+                         "synthesize long-context traces (systems replay only; "
+                         "generation quality is not measured)")
     ap.add_argument("--decode-steps", type=int, default=4)
     ap.add_argument("--out", default=os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
