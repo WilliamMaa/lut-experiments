@@ -164,6 +164,9 @@ class Scheduler:
         costs = {}
         for w in idle:
             e_loc = self.match_local(turn, w, chain, tip_bound)
+            print(f"[match] {turn.session}:{turn.turn} w={w.ident.decode()} "
+                  f"tips={len(w.tips)} resident={len(w.resident)} "
+                  f"e_loc={e_loc}", flush=True)
             # candidate extension targets: tip positions above e_loc,
             # whose intermediate blocks all exist somewhere, single-holder.
             fetch = None
