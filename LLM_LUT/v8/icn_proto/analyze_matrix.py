@@ -67,7 +67,7 @@ def main():
     print(f"{'cell':<30} {'decisions':<38} {'xfr':>4} "
           f"{'obj(doc)':>22} {'obj(q)':>22}")
     for c in d.get("cells", []):
-        chosen = (c.get("p2_decisions") or {}).get("chosen") or {}
+        chosen = (c.get("p2_decisions") or {}).get("mode") or {}
         dec = ",".join(f"{k}:{v}" for k, v in sorted(chosen.items())) or "-"
         stats = cell_object_stats(c.get("summary")) or {}
         doc = stats.get("doc")

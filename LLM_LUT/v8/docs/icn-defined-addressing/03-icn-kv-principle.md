@@ -3,6 +3,7 @@
 > 本文档是 `docs/icn-defined-addressing/` 系列重新定义后的基准文档。
 > 定位：回答五个问题——**思想到底是什么、ICN 哪些东西能用、我们该怎么做、切入点是什么、怎么评估**。
 > 与已有文档的关系：`00-ideas.md` 是方向原始陈述（保留，作为出处）；`01` 是已取代的模拟方案（数字锚点仍引用）；`02` 是实现计划（其中的实验设计以本文档 §5 为准，凡与本文冲突处本文优先）。
+> **架构更新（2026-09-19）**：`04-reflection.md` 立起两平面 architecture（fast scheduler + placement controller + KV directory），`05-request-lifecycle.md` 定义 block-chain 对象模型与 B0..B3/Ours baseline 阶梯——**实现规格以 04/05 为准，本文 §5 的预言体系已被 05 §4 的 baseline ladder 取代**。
 
 ## 1. 思想到底是什么
 
@@ -112,6 +113,8 @@ NDN 报文格式、内容签名安全、PIT/FIB 数据面、off-path caching 路
 
 评估对象是**ICN 假设本身的一组可证伪预言**，不是"哪个策略赢 wall time"。共享机计时噪声大，wall time 只作辅助证据；每个预言给出行为级判据。（此前把实验组织成 P0/P1/P2 赛马是错误的框架，已废止。）
 
+**headline benchmark（唯一系统级数字）**：同一请求流下，关闭跨 session 共享（`--no-share`，每个 session 重算自己的文档）与开启 content-addressed 共享，**总 prefill token 数之比**（`new_tokens_processed` 之差 = ICN 省下的 GPU 算力）。accuracy、wall time、recompute 计数都不是 benchmark——prefill token 总算力记账才是。驱动：`python -m icn_proto.run_sharing`。E1/E2 是跑这个 benchmark 前的机制前提。
+
 ### 5.1 五条预言
 
 **E1 identity/location 解耦成立（机制）**
@@ -135,12 +138,11 @@ move vs recompute 的选择边界与标定 cost model 一致：迁移胜出 ⟺ 
 显存预算紧张时 allocator 把长链分配到 m_sp4/k8v8、短链保 bf16，输出质量退化在 encoding 本身的质量锚点内。
 质量锚点：v8 评测 EOS delta——m_sp4 ≈ 0、k8v8 ≈ 0.019（`docs/19-final-summary.md`，不重测）。
 判据：cluster 内跨 policy 的 decode token 一致率——同 encoding 链 P0-vs-P2 ≈ 1；k8v8 链发散率与 EOS delta 0.019 相容。
-状态：机制已就绪（worker 上报 decode tokens），待 E2 后跑。
+状态：**冻结（2026-09-19 决定）**：编码维度整体退出本阶段，ICN 实验只用单一 encoding。quality 唯一保留的 sanity 是 E1 的迁移一致性。
 
 **E5 压缩改变 allocation 自由度（经济学对比，本方向的核心卖点）**
-同一逻辑 KV，m_sp4 vs bf16（20KiB×L）：使"KV follows compute"从不可行变为可行的上下文区间移动倍数（L* 之比）。
-判据：E3 的 L* 实测值对比即结论；辅以 transfer_bytes / object 体积曲线。
-状态：构成已实测（2026-09-19 复验 run）：m_sp4 object = **65MB 固定（30 层 GDN recurrent state，与 L 无关）+ attn 部分 ~15.2KB/token（obs window 未咬合，随 L 增长）**——"66MB 定长 object"的旧假设作废，L* 是否饱和取决于长 L 处 eviction 的形状；bf16 = 20KiB×L 全程线性。最终对比数字待 E3 边界扫描。
+同一逻辑 KV，压缩 encoding vs bf16：使"KV follows compute"从不可行变为可行的上下文区间移动倍数（L* 之比）。
+状态：**冻结（2026-09-19 决定）**，与 E4 一同退出；若未来重启，需先解决"压缩在 cluster 路径实际生效"的前提（当前提取的 object 为未压缩原始 KV，见 E3 实验记录）。
 
 ### 5.2 明确不评估
 

@@ -64,6 +64,11 @@ def main():
     ap.add_argument("--device", default="balanced_low_0",
                     help="worker-side model device map (fixed split, never 'auto')")
     ap.add_argument("--dtype", default="bfloat16")
+    ap.add_argument("--no-share", action="store_true",
+                    help="baseline mode: disable cross-session content sharing "
+                         "(doc-turn NRS reuse off); every session prefills its "
+                         "own document. Paired with the default (sharing on) "
+                         "it isolates the ICN system-level compute saving.")
     sched_mod.add_args(ap)
     args = ap.parse_args()
 

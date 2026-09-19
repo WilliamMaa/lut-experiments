@@ -5,16 +5,17 @@ This script IS the experiment definition. Hypotheses, encoded as suites:
 
   boundary  E3: the allocator's move-vs-recompute choice flips where the
                 calibrated cost model says it should:
-                  transfer wins  ⟺  L > L* = S(encoding)·R_prefill/R_xfer
+                  transfer wins  ⟺  L > L* = S(L)·R_prefill/R_xfer
                 Honest coefficients (2026-09-19, workload-fixed): R_prefill
-                ≈ 2.5K tok/s, R_xfer ≈ 100MB/s, m_sp4 object ≈ 140MB
-                → L*_m_sp4 ≈ 3.5K tokens; bf16 object = 20KiB×L grows in
-                step with recompute cost → L*_bf16 = ∞ (never transfer).
-                Primary evidence: records[].decision (chosen mode + option
-                costs per turn), aggregated per cell as p2_decisions.
-                Cells: 6 lengths × {bf16, m_sp4} × p2 = 12 runs. Predictions:
-                m_sp4 transfers appear and grow past ~3.5K tokens; bf16
-                cells log zero transfer decisions at every length.
+                ≈ 2.5K tok/s, R_xfer ≈ 100MB/s; object = 65MB fixed linear
+                state + ~20KB/token attn → predicted flip at L ≈ 3.3K
+                tokens. Primary evidence: records[].decision (chosen mode +
+                option costs per turn incl. alt_cost_s of the losing
+                option), aggregated per cell as p2_decisions.
+                Cells: 6 lengths × p2 (m_sp4 cache; the encoding dimension
+                is out of scope per 2026-09-19 decision — E4/E5 frozen).
+                Prediction: recompute-dominated below ~3.3K, transfer
+                growing above it.
   mixed     E4 (quality leg): same workload under p2 with three reprs;
                 decoded-token agreement of m_sp4/k8v8 chains vs the bf16
                 reference. Same-repr cross-run agreement doubles as the
@@ -62,16 +63,15 @@ def suite_cells(suite):
     cells = []
     if suite in ("boundary", "all"):
         for lname, lchars in LENGTHS:
-            for repr_name in ("bf16", "m_sp4"):
-                cells.append({
-                    "name": f"boundary-{lname}-{repr_name}-p2",
-                    "tag": f"{lname}-{repr_name}-p2",
-                    "kwargs": dict(policy="p2", repr=repr_name,
-                                   sessions=16,
-                                   turns_per_session=4,
-                                   doc_repeat=200, doc_repeat_alt=200,
-                                   doc_chars=lchars,
-                                   mem_budget_gb=8.0)})
+            cells.append({
+                "name": f"boundary-{lname}-p2",
+                "tag": f"{lname}-p2",
+                "kwargs": dict(policy="p2", repr="bf16",
+                               sessions=16,
+                               turns_per_session=4,
+                               doc_repeat=200, doc_repeat_alt=200,
+                               doc_chars=lchars,
+                               mem_budget_gb=8.0)})
     if suite in ("mixed", "all"):
         for repr_name in ("bf16", "m_sp4", "k8v8"):
             cells.append({
@@ -112,26 +112,37 @@ def new_summary(before):
     return max(fresh, key=after.get)
 
 
+def same_workload(a, b):
+    ka, kb = a.get("kwargs"), b.get("kwargs")
+    if not ka or not kb:
+        return False
+    return all(ka.get(k) == kb.get(k) for k in
+               ("sessions", "turns_per_session", "doc_chars",
+                "doc_repeat", "doc_repeat_alt"))
+
+
 def token_agreement(cells):
-    """Quality leg: for pairs of cells, per (session,turn) decoded-id
-    agreement. Only pairs whose workloads share session/turn ids (same
-    suite) are compared; cross-repr divergence is the measurable effect,
-    cross-policy same-repr agreement is the resume-correctness check."""
+    """Quality leg: for pairs of cells on the SAME workload, per
+    (session,turn) decoded-id agreement. Cross-length pairs compare
+    different documents and are meaningless — excluded."""
     loaded = {}
     for c in cells:
         p = c.get("summary")
         if not p:
             continue
         with open(p) as f:
-            loaded[c["name"]] = json.load(f)
+            loaded[c["name"]] = (c, json.load(f))
     report = {}
     names = list(loaded)
     for i, a in enumerate(names):
         for b in names[i + 1:]:
+            if not same_workload(loaded[a][0], loaded[b][0]):
+                continue
+            ra, rb = loaded[a][1], loaded[b][1]
             da = {r["request_id"]: r.get("decoded_ids") for r in
-                  loaded[a]["records"] if r.get("decoded_ids")}
+                  ra["records"] if r.get("decoded_ids")}
             db = {r["request_id"]: r.get("decoded_ids") for r in
-                  loaded[b]["records"] if r.get("decoded_ids")}
+                  rb["records"] if r.get("decoded_ids")}
             common = [k for k in da if k in db]
             if not common:
                 continue
@@ -198,8 +209,8 @@ def main():
                 dec = [r["decision"] for r in s["records"] if r.get("decision")]
                 cell["p2_decisions"] = {
                     "n": len(dec),
-                    "chosen": dict(collections.Counter(
-                        d["chosen"] for d in dec))} if dec else None
+                    "mode": dict(collections.Counter(
+                        d["mode"] for d in dec))} if dec else None
         else:
             cell["error"] = "no summary produced"
         cells[i].update(cell)

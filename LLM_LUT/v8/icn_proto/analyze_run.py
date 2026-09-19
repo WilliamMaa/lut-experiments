@@ -51,8 +51,8 @@ def main():
     if tr:
         mb = sum(r["transfer_bytes"] for r in tr) / len(tr) / 1e6
         print(f"avg transfer size   : {mb:.1f} MB  total {sum(r['transfer_bytes'] for r in tr) / 1e9:.2f} GB")
-    dec = [r["decision"]["chosen"] for r in recs
-           if r.get("decision") and r["decision"].get("chosen")]
+    dec = [r["decision"]["mode"] for r in recs
+           if r.get("decision") and r["decision"].get("mode")]
     if dec:
         import collections
         print("p2 decision modes   :", dict(collections.Counter(dec)))
