@@ -61,11 +61,44 @@ class Turn:
 
     def chain(self, repr_name: str, block_tokens: int,
               model_tag: str = "qwen35b") -> list:
-        key = (repr_name, block_tokens)
+        key = ("chain", repr_name, block_tokens)
         if key not in self._chain_cache:
-            self._chain_cache[key] = derive_chain(
-                self.prefix_ids, repr_name, block_tokens, model_tag)
+            # COMPLETE blocks only: the trailing partial block [kB, n) is
+            # not yet a publishable unit — its name would change once more
+            # tokens arrive (the same positions become a full block with
+            # different contents). It becomes a block when the prefix
+            # grows past the next multiple of b.
+            self._chain_cache[key] = [
+                b for b in derive_chain(self.prefix_ids, repr_name,
+                                        block_tokens, model_tag)
+                if b.span_tokens == block_tokens]
         return self._chain_cache[key]
+
+    def tip_name_at(self, n_tokens: int, repr_name: str, block_tokens: int,
+                    model_tag: str = "qwen35b") -> str:
+        """Block name of the chain tip at exactly n_tokens (the partial
+        block [floor, n) if n is not block-aligned, else the last complete
+        block). This is where the GDN checkpoint for a prefix of length
+        n_tokens lives."""
+        key = ("tipat", n_tokens, repr_name, block_tokens)
+        if key not in self._chain_cache:
+            sub = derive_chain(self.prefix_ids[:n_tokens], repr_name,
+                               block_tokens, model_tag)
+            self._chain_cache[key] = str(sub[-1])
+        return self._chain_cache[key]
+
+    def publish_names(self, repr_name: str, block_tokens: int,
+                      model_tag: str = "qwen35b") -> list:
+        """All blocks this turn produces: complete blocks + the tip block
+        (partial unless the turn end is block-aligned). The tip carries
+        the GDN checkpoint and is always last."""
+        names = [str(b) for b in self.chain(repr_name, block_tokens,
+                                            model_tag)]
+        tip = self.tip_name_at(self.cum_tokens, repr_name,
+                               block_tokens, model_tag)
+        if tip not in names:
+            names.append(tip)
+        return names
 
 
 @dataclass
@@ -130,26 +163,44 @@ class Scheduler:
 
     # ---- Match + Schedule (05 v3 §2) -------------------------------------
 
-    def match_local(self, turn, w, chain, prev_len):
-        """Longest resume boundary on worker w: a tip position E <= prev_len
-        whose entire block chain [0, E) is resident on w."""
+    def resume_names(self, turn, t_pos):
+        """Block names needed to resume at exactly t_pos: all complete
+        blocks below floor(t_pos) plus the tip block at t_pos (which
+        carries the GDN checkpoint captured at that position)."""
+        if t_pos <= 0:
+            return []
+        bt = self.args.block_tokens
+        floor_t = t_pos - (t_pos % bt)
+        names = [str(b) for b in chain_through(
+            turn.chain("bf16", bt), floor_t)]
+        tip = turn.tip_name_at(t_pos, "bf16", bt)
+        if tip not in names:
+            names.append(tip)
+        return names
+
+    def match_local(self, turn, w, tip_bound):
+        """Longest resume position T on worker w: a tip position whose
+        full resume-name set (complete blocks + tip block) is resident."""
+        bt = self.args.block_tokens
         best = 0
-        pos = sorted(b.span_end for b in chain
-                     if str(b) in w.tips and b.span_end <= prev_len)
-        for e in pos:
-            if all(str(b) in w.resident
-                   for b in chain_through(chain, e)):
-                best = e          # sorted ascending: keep the largest valid
+        for tip_name in w.tips:
+            t_pos = self._tip_end(tip_name)
+            if t_pos == 0 or t_pos > tip_bound:
+                continue
+            if turn.tip_name_at(t_pos, "bf16", bt) != tip_name:
+                continue                      # not a tip of THIS turn's chain
+            if not all(n in w.resident
+                       for n in self.resume_names(turn, t_pos)):
+                continue
+            best = max(best, t_pos)
         return best
 
     def choose(self, turn):
         """Returns (ident, E, fetch, decision) or None.
 
-        E: resume boundary (tokens). fetch: None or (holder_ident,
-        [block names]) — a contiguous single-holder extension of the
-        local chain. decision: cost log for records."""
-        repr_name = "bf16"
-        chain = turn.chain(repr_name, self.args.block_tokens)
+        E: resume position (tokens, may be non-block-aligned — it is a
+        tip position). fetch: None or (holder_ident, [block names]) — the
+        missing blocks for a single-holder extension. decision: cost log."""
         # Match bound = this turn's chain tip, NOT the session's previous
         # tip: cross-session sharing means blocks beyond this session's
         # own history can still exist (published by an earlier identical
@@ -163,26 +214,25 @@ class Scheduler:
         best = None
         costs = {}
         for w in idle:
-            e_loc = self.match_local(turn, w, chain, tip_bound)
+            e_loc = self.match_local(turn, w, tip_bound)
             print(f"[match] {turn.session}:{turn.turn} w={w.ident.decode()} "
                   f"tips={len(w.tips)} resident={len(w.resident)} "
                   f"e_loc={e_loc}", flush=True)
-            # candidate extension targets: tip positions above e_loc,
-            # whose intermediate blocks all exist somewhere, single-holder.
+            # candidate extension targets: tip positions above e_loc whose
+            # missing blocks are all on ONE other worker.
             fetch = None
             e_max = e_loc
-            cand = sorted(b.span_end for b in chain
-                          if str(b) in tips_global
-                          and e_loc < b.span_end <= tip_bound)
-            for e in reversed(cand):
-                ext = [b for b in chain_through(chain, e)
-                       if b.span_end > e_loc]
+            cand = sorted(self._tip_end(tn) for tn in tips_global
+                          if e_loc < self._tip_end(tn) <= tip_bound)
+            for t_pos in reversed(cand):
+                need = [n for n in self.resume_names(turn, t_pos)
+                        if n not in w.resident]
                 holders = [x for x in self.workers.values()
-                           if x is not w and all(
-                               str(b) in x.resident for b in ext)]
+                           if x is not w and all(n in x.resident
+                                                 for n in need)]
                 if holders:
-                    fetch = (holders[0].ident, [str(b) for b in ext])
-                    e_max = e
+                    fetch = (holders[0].ident, need)
+                    e_max = t_pos
                     break
             fresh = turn.cum_tokens - e_max
             fetch_bytes = sum(self.obj_bytes.get(bn, 0)
@@ -199,15 +249,13 @@ class Scheduler:
             rank = (round(cost, 6), 0 if mode == "local" else 1, -e_max)
             if best is None or rank < best[0]:
                 best = (rank, w.ident, e_max, fetch,
-                        {"mode": mode, "E": e_max, "cost_s": round(cost, 4),
+                        {"mode": mode, "E": e_max, "E_loc": e_loc,
+                         "cost_s": round(cost, 4),
                          "fresh": fresh, "fetch_bytes": fetch_bytes,
                          "options": costs})
         if best is None:
             return None
         _, ident, e, fetch, decision = best
-        if fetch is not None:
-            # the extension's tip becomes the resume boundary
-            e = self._tip_end(fetch[1][-1])
         return ident, e, fetch, decision
 
     # ---- event loop -------------------------------------------------------
@@ -260,7 +308,7 @@ class Scheduler:
             if fetch is not None:
                 holder_ident, names = fetch
                 self._xfer[rid] = {"stage": "fetch", "target": ident,
-                                   "names": names, "E_loc": decision["E"],
+                                   "names": names, "E_loc": decision["E_loc"],
                                    "turn": turn, "decision": decision,
                                    "t_fetch": time.time()}
                 msg.send(sock, {"type": "fetch", "names": names},
@@ -278,9 +326,8 @@ class Scheduler:
         w.busy = True
         w.current = rid
         self._xfer.pop(rid, None)
-        chain = turn.chain("bf16", self.args.block_tokens)
-        resume_names = [str(b) for b in chain_through(chain, e_resume)]
-        new_names = [str(b) for b in chain if b.span_start >= e_resume]
+        resume_names = self.resume_names(turn, e_resume)
+        new_names = turn.publish_names("bf16", self.args.block_tokens)
         msg.send(sock, {
             "type": "assign", "request_id": rid,
             "session": turn.session, "turn": turn.turn,
@@ -324,19 +371,17 @@ class Scheduler:
             if hdr.get("ok"):
                 session, t = rid.split(":")
                 chain_idx = 0 if t == "-1" else int(t) + 1
-                chain = self.turns_of[session][chain_idx].chain(
-                    "bf16", self.args.block_tokens)
                 if hdr.get("published"):
                     for p in hdr["published"]:
                         w.resident.add(p["name"])
                         self.obj_bytes[p["name"]] = p["bytes"]
-                    # the last new block of the batch carries the GDN
-                    # checkpoint (worker.extract_blocks contract)
-                    new_names = [str(b) for b in chain
-                                 if b.span_start >= rec.get("E", 0)]
-                    if new_names:
-                        w.tips.add(new_names[-1])
-                        self.tips.add(new_names[-1])
+                    # this turn's chain tip (last of publish_names) carries
+                    # the GDN checkpoint (worker.extract_blocks contract)
+                    turn_done = self.turns_of[session][chain_idx]
+                    tip = turn_done.publish_names("bf16",
+                                                  self.args.block_tokens)[-1]
+                    w.tips.add(tip)
+                    self.tips.add(tip)
                 if not rec.get("resumed") and hdr.get("prefill_s"):
                     rate = hdr["prefill_tokens"] / hdr["prefill_s"]
                     self.prefill_rate = 0.7 * self.prefill_rate + 0.3 * rate

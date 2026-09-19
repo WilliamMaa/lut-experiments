@@ -116,10 +116,13 @@ class Worker:
                              past_key_values=cache, use_cache=True)
             cache = out.past_key_values
         decode_s = time.time() - t2
-        # publish: extract the chain blocks this worker does not yet hold.
-        # (delivered extension blocks are already resident and skipped.)
-        publish = [BlockName.parse(n) for n in new_block_names
-                   if n not in self.resident]
+        # publish: extract the chain blocks this worker does not yet hold,
+        # ALWAYS ending with the chain tip (last of new_block_names): the
+        # tip carries this turn's GDN checkpoint (extract_blocks attaches
+        # it to objs[-1]), so it is re-extracted even when already resident
+        # — e.g. delivered earlier as a fetch extension.
+        names = list(dict.fromkeys(new_block_names))  # dedupe, order kept
+        publish = [BlockName.parse(n) for n in names]
         objs = extract_blocks(cache, publish)
         for obj in objs:
             self.resident[str(obj.name)] = obj
