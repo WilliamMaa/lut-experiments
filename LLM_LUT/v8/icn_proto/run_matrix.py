@@ -1,30 +1,30 @@
 #!/usr/bin/env python3
-"""Step 4 decision-boundary experiment driver
-(docs/icn-defined-addressing/02-real-prototype-plan.md §Step 4).
+"""E3/E4 experiment driver (docs/icn-defined-addressing/03-icn-kv-principle §5).
 
 This script IS the experiment definition. Hypotheses, encoded as suites:
 
-  boundary  H1: for m_sp4 chains P1 beats P0 iff context L > L* ~= 22-45K
-                tokens (S_obj * R_prefill / R_xfer, coefficients measured
-                in Step 2.5); for bf16 chains P0 wins through L = 96K
-                (L*_bf16 ~= 233K, unreachable here). Maps two crossing
-                curves over L in {8K, 32K, 96K} tokens.
-            Cells: 3 lengths x {bf16, m_sp4} x {p0, p1} = 12 runs.
-  mixed     H2: with long+short sessions in one workload, no single extreme
-                is globally right, so P2 (per-turn argmin of the calibrated
-                cost model) should match max(P0, P1) pointwise and beat
-                both in wall time. H3: P2's logged per-turn decisions
-                (records[].decision) follow the predicted boundary.
-            Cells: mixed workload x {p0, p1, p2(m_sp4), p2(k8v8)} = 4 runs.
-            The k8v8 cell doubles as the quality leg: token agreement of
-            compressed chains vs the p0 reference is the cluster-level
-            quality measurement (EOS deltas are the v8-eval anchor).
+  boundary  E3: the allocator's move-vs-recompute choice flips where the
+                calibrated cost model says it should:
+                  transfer wins  ⟺  L > L* = S(encoding)·R_prefill/R_xfer
+                Honest coefficients (2026-09-19, workload-fixed): R_prefill
+                ≈ 2.5K tok/s, R_xfer ≈ 100MB/s, m_sp4 object ≈ 140MB
+                → L*_m_sp4 ≈ 3.5K tokens; bf16 object = 20KiB×L grows in
+                step with recompute cost → L*_bf16 = ∞ (never transfer).
+                Primary evidence: records[].decision (chosen mode + option
+                costs per turn), aggregated per cell as p2_decisions.
+                Cells: 6 lengths × {bf16, m_sp4} × p2 = 12 runs. Predictions:
+                m_sp4 transfers appear and grow past ~3.5K tokens; bf16
+                cells log zero transfer decisions at every length.
+  mixed     E4 (quality leg): same workload under p2 with three reprs;
+                decoded-token agreement of m_sp4/k8v8 chains vs the bf16
+                reference. Same-repr cross-run agreement doubles as the
+                resume-correctness check (E1 at cluster level).
+                Cells: mixed workload × {p2 bf16, p2 m_sp4, p2 k8v8} = 3 runs.
 
 Every cell is one run_cluster invocation (own worker spawn/teardown);
 cells run sequentially and each is snapshotted, so partial results are
-inspectable while running. Timing varies on the shared box, so wall-time
-conclusions use the per-turn decision logs (H3) as primary evidence and
-wall as secondary.
+inspectable while running. Timing varies on the shared box; the decision
+logs are the primary evidence, wall time is not read.
 
 Usage (from v8 root, on the GPU box):
     python -m icn_proto.run_matrix --suite boundary --dry-run
@@ -51,7 +51,10 @@ KEYS = ("wall_s", "throughput_rps", "hit_rate", "resumed",
 # context lengths in ~tokens and the doc_chars that produce them
 # (Chinese trace: tokens ~= doc_chars * 0.6, tiled docs truncated at
 # doc_chars; doc_repeat is set large enough that truncation always bites).
-LENGTHS = [("8K", 14000), ("32K", 55000), ("96K", 160000)]
+# The grid brackets L*_m_sp4 ≈ 3.5K tokens; the 0.5K/1K cells should be
+# recompute-dominated, 8K/32K transfer-dominated (E3 prediction).
+LENGTHS = [("0.5K", 900), ("1K", 1700), ("2K", 3400),
+           ("4K", 6700), ("8K", 14000), ("32K", 55000)]
 
 
 def suite_cells(suite):
@@ -60,31 +63,21 @@ def suite_cells(suite):
     if suite in ("boundary", "all"):
         for lname, lchars in LENGTHS:
             for repr_name in ("bf16", "m_sp4"):
-                for policy in ("p0", "p1"):
-                    cells.append({
-                        "name": f"boundary-{lname}-{repr_name}-{policy}",
-                        "tag": f"{lname}-{repr_name}-{policy}",
-                        "kwargs": dict(policy=policy, repr=repr_name,
-                                       sessions=24,
-                                       turns_per_session=6,
-                                       doc_repeat=200, doc_repeat_alt=200,
-                                       doc_chars=lchars,
-                                       mem_budget_gb=8.0)})
-        # bf16 @ 96K: object ~= 2 GB; shrink the workload so resident KV
-        # (12 sessions' latest objects / 2 workers ~= 12 GB) + 35 GB
-        # weights stay under the free HBM.
-        for i, c in enumerate(cells):
-            if c["tag"].startswith("96K-bf16"):
-                c["kwargs"]["sessions"] = 12
-                c["name"] += "-s12"
-                c["tag"] += "-s12"
+                cells.append({
+                    "name": f"boundary-{lname}-{repr_name}-p2",
+                    "tag": f"{lname}-{repr_name}-p2",
+                    "kwargs": dict(policy="p2", repr=repr_name,
+                                   sessions=16,
+                                   turns_per_session=4,
+                                   doc_repeat=200, doc_repeat_alt=200,
+                                   doc_chars=lchars,
+                                   mem_budget_gb=8.0)})
     if suite in ("mixed", "all"):
-        for policy, repr_name in (("p0", "m_sp4"), ("p1", "m_sp4"),
-                                  ("p2", "m_sp4"), ("p2", "k8v8")):
+        for repr_name in ("bf16", "m_sp4", "k8v8"):
             cells.append({
-                "name": f"mixed-{repr_name}-{policy}",
-                "tag": f"mixed-{repr_name}-{policy}",
-                "kwargs": dict(policy=policy, repr=repr_name,
+                "name": f"mixed-{repr_name}-p2",
+                "tag": f"mixed-{repr_name}-p2",
+                "kwargs": dict(policy="p2", repr=repr_name,
                                sessions=24, turns_per_session=6,
                                doc_repeat=48, doc_repeat_alt=6,
                                doc_chars=60000, mem_budget_gb=8.0)})

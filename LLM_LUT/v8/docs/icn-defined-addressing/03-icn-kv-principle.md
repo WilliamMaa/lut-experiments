@@ -92,9 +92,10 @@ NDN 报文格式、内容签名安全、PIT/FIB 数据面、off-path caching 路
 
 | # | 偏差 | 后果 | 修正 |
 |---|---|---|---|
-| 1 | name 是 session-scoped（`/session/doc3/turn/2/...`），不是 content-addressed | 内容相同的 prefix 跨 session 无法共享——**ICN 最核心的自动共享行为结构上不可能发生**，系统退化为 per-session cache（LMCache 式） | name 改为 `H(model, encoding, prefix token ids)`；scheduler 持有全部 token ids，可自行计算 |
-| 2 | turn 0 不做 NRS lookup（prev=None 直接重算） | 即使名字改对，入口也不查表，共享链条断在起点 | 每个 turn（含首 turn）都走 §3 的 lookup→三选一 |
-| 3 | NRS 不记录 reuse_count | 第二阶段 replication（§8）无驱动信号 | 索引结构顺带记录 |
+| 0 | **workload 里文档从未被 prefill**：question turn 的 input 只有问题本身（15-80 token），8000-char 文档只存在于 cum_tokens 标签里 | **比命名偏差更严重**：之前所有"长上下文"实验的计算是假的——Step 2.5 标定的 "prefill 30-62K tok/s" 全部作废，"L=35K 骑在 crossover 上"是幻影；诚实 prefill 速率实测仅 ≈2.4-2.7K tok/s（见 E3） | 每个 session 增加合成 doc-turn（turn=-1，prefill 完整文档、decode_steps=0、以 `H(doc_ids)` 发布 object）；question turn 只 prefill q_ids |
+| 1 | name 是 session-scoped（`/session/doc3/turn/2/...`），不是 content-addressed | 内容相同的 prefix 跨 session 无法共享——**ICN 最核心的自动共享行为结构上不可能发生**，系统退化为 per-session cache（LMCache 式） | name 改为 `H(model, encoding, prefix token ids)`（prefix_hash/span_end/repr 三字段，sha256）；scheduler 持有全部 token ids，可自行计算 |
+| 2 | turn 0 不做 NRS lookup（prev=None 直接重算） | 即使名字改对，入口也不查表，共享链条断在起点 | 每个 turn（含首 turn、含 doc-turn）都走 §3 的 lookup→三选一（reuse/resume/recompute） |
+| 3 | NRS 不记录 reuse_count | 第二阶段 replication（§8）无驱动信号 | 索引结构顺带记录（`nrs_reuse` 计数器已埋点） |
 
 已确认可接受的第二版事项（明确不在第一版）：多 replica、memory tier（CPU/NVMe）、PIT 聚合、object 生成后的 transcode（换编码）。
 
@@ -120,15 +121,15 @@ NDN 报文格式、内容签名安全、PIT/FIB 数据面、off-path caching 路
 
 **E2 自动共享发生（行为）**
 内容相同的 prefix 跨 session 自动 collapse：第 k 个拥有相同内容的 session，其整链应为已有 object 的命中，零重算。
-实验：content-addressed 改造后，24+ session 由 8 篇文档循环生成（session i 与 i+8 内容全同）。
-判据：后到的同内容 session recompute_tokens = 0；NRS 中同 name 被多 session 引用。
-状态：❌ 待做（§4.2 修正 1+2 之后的第一个实验）。
+实验：content-addressed 改造后，16 session 由 8 篇文档循环生成（session i 与 i+8 内容全同）。
+判据：后到的同内容 session 的 doc-turn 以 NRS reuse 命中，零文档重算；NRS 中同 name 被多 session 引用。
+状态：✅ 已验证（2026-09-19，`results/icn_proto/cluster_p2_m_sp4_s16t4_20260919_184451.json`）：`nrs reuse names: 8 names, total 8 cross-session reuses`——16 session 中后 8 个的 doc-turn 全部命中先到者的 content-addressed object，文档零重算；hit_rate 0.9 = 72/80 恰为理论上限（8 个 fresh doc-turn 是必要首算）。
 
 **E3 locality 成为 cost term（决策经济学）**
 move vs recompute 的选择边界与标定 cost model 一致：迁移胜出 ⟺ `L > L* = S(encoding)·R_prefill/R_xfer`。
-已知标定（2026-09-19 实测）：R_prefill 30-62K tok/s、R_xfer ≈ 90-100MB/s → **m_sp4 L* ≈ 22-45K token；bf16 L* ≈ 233K（实验范围不可达）**。
-判据：allocator 决策日志（每 turn 记录三选项预测成本与选择）在 L 扫描下于 L* 附近翻转；bf16 链全程不迁移。
-状态：部分（系数已实测、P2 决策日志已埋点；E2 修正后需重跑验证）。
+已知标定（2026-09-19 晚，修正 §4.2#0 后的诚实值）：R_prefill ≈ 2.4-2.7K tok/s（heavy-hitter 路径，有 eviction 开销）、R_xfer ≈ 100MB/s → **m_sp4（S≈66-141MB）L* ≈ 1.6-3K token；bf16 L* ≈ 17K token**。此前 "R_prefill 30-62K、L* 22-45K" 是假 workload 幻影，作废。
+判据：allocator 决策日志（每 turn 记录三选项预测成本与选择）在 L 扫描下于 L* 附近翻转；L ≪ L* 时应以 recompute 为主，L ≫ L* 时应以 transfer 为主。
+状态：系数已实测（E2 实验顺带）；E2 之后跑 L 扫描验证翻转点。（次要缺口：transfer 类决策尚未写入 per-turn records，待补。）
 
 **E4 encoding-aware allocation 可行且质量可控（质量腿）**
 显存预算紧张时 allocator 把长链分配到 m_sp4/k8v8、短链保 bf16，输出质量退化在 encoding 本身的质量锚点内。
@@ -137,9 +138,9 @@ move vs recompute 的选择边界与标定 cost model 一致：迁移胜出 ⟺ 
 状态：机制已就绪（worker 上报 decode tokens），待 E2 后跑。
 
 **E5 压缩改变 allocation 自由度（经济学对比，本方向的核心卖点）**
-同一逻辑 KV，m_sp4（66MB 定长）vs bf16（20KiB×L）：使"KV follows compute"从不可行变为可行的上下文区间移动约 10 倍（L* 之比）。
+同一逻辑 KV，m_sp4（~66MB 定长，doc-turn object 实测 140.6MB，差异原因待查）vs bf16（20KiB×L）：使"KV follows compute"从不可行变为可行的上下文区间移动约 10 倍（L* 之比）。
 判据：E3 的 L* 实测值对比即结论；辅以 transfer_bytes 曲线（m_sp4 平坦 vs bf16 线性增长）。
-状态：✅ 物理量已实测（66MB/0.67s vs 700MB@35K），差一个 E3 的正式边界扫描。
+状态：✅ 物理量已实测（诚实带宽下 140.6MB/1.405s ≈ 100MB/s）；按诚实系数重算 L*：m_sp4 1.6-3K vs bf16 17K，差一个 E3 的正式边界扫描出最终对比数字。
 
 ### 5.2 明确不评估
 

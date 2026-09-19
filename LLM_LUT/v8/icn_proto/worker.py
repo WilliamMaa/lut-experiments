@@ -11,7 +11,8 @@ Lifecycle of one assigned turn:
   4. scheduler may `fetch` an object (bytes) for cross-worker transfer, or
      `deliver` one to this worker.
 
-Resident objects are the per-session latest cache state; workers report
+Resident objects are full extracted cache states, kept unbounded in v1
+(eviction is a v2 question, see 03-icn-kv-principle §4.2); workers report
 their resident name sets so the scheduler can make placement decisions.
 
 Run (cards are fixed by the launcher via CUDA_VISIBLE_DEVICES):
@@ -121,6 +122,10 @@ class Worker:
             "decode_s": round(decode_s, 4),
             "queue_s": round(time.time() - t0, 4),
             "obj_bytes": obj.nbytes(),
+            "obj_attn_bytes": sum(p.nbytes() for p in obj.layers.values()
+                                  if p.kind == "attn"),
+            "obj_linear_bytes": sum(p.nbytes() for p in obj.layers.values()
+                                    if p.kind == "linear"),
             "resident_bytes": sum(o.nbytes() for o in self.resident.values()),
             "decoded_ids": decoded,
         }

@@ -81,11 +81,17 @@ class WorkerState:
 
 
 class Scheduler:
-    # online-calibrated cost-model coefficients (Step 2.5 rotate/P0 runs:
-    # prefill 55-62k tok/s, m_sp4 object xfer 65.9MB @ ~98MB/s effective).
-    PREFILL_RATE0 = 50_000.0        # tokens/s, EWMA-seeded
+    # online-calibrated cost-model coefficients. Seeds are the honest
+    # values measured 2026-09-19 after the workload fix (docs §4.2#0):
+    # doc/question prefill through the heavy-hitter path runs at
+    # ~2.4-2.7K tok/s (NOT the 30-62K the broken trace suggested);
+    # m_sp4 object xfer ~100MB/s. EWMA refines both online.
+    PREFILL_RATE0 = 2_500.0         # tokens/s, EWMA-seeded
     XFER_RATE0 = 100e6              # bytes/s, EWMA-seeded
-    COMPRESSED_OBJ_BYTES = 66 * 2**20   # m_sp4/k8v8 latest-per-session object
+    # m_sp4 object size observed: ~66MB question-chain object, ~140MB
+    # doc-turn object (difference under investigation); used only as the
+    # pre-measurement estimate in choose_p2.
+    COMPRESSED_OBJ_BYTES = 100 * 2**20
 
     def __init__(self, args, worker_ids):
         self.args = args
@@ -354,6 +360,7 @@ class Scheduler:
             if fetch_from is not None:
                 self._xfer[rid] = {"stage": "fetch", "target": ident,
                                    "turn": turn, "resume_from": resume_from,
+                                   "decision": decision,
                                    "t_fetch": time.time()}
                 msg.send(sock, {"type": "fetch", "name": resume_from},
                          ident=fetch_from)
@@ -415,7 +422,9 @@ class Scheduler:
                 rec.update({k: hdr.get(k) for k in
                             ("ok", "resumed", "prefill_s", "decode_s",
                              "prefill_tokens", "cum_tokens", "error",
-                             "obj_bytes", "resident_bytes", "repr",
+                             "obj_bytes", "obj_attn_bytes",
+                             "obj_linear_bytes",
+                             "resident_bytes", "repr",
                              "decoded_ids")})
                 rec["latency_s"] = round(time.time() - rec.pop("t_assigned"), 4)
             w.busy = False
@@ -473,7 +482,8 @@ class Scheduler:
                 self.send_assign(sock, xfer["target"], xfer["turn"],
                                  xfer["resume_from"],
                                  xfer_bytes=xfer.get("bytes", 0),
-                                 xfer_s=xfer_s)
+                                 xfer_s=xfer_s,
+                                 decision=xfer.get("decision"))
             return
 
     def advance(self, request_id):

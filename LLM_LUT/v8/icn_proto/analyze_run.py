@@ -59,6 +59,19 @@ def main():
     if d.get("nrs_reuse"):
         print(f"nrs reuse names     : {len(d['nrs_reuse'])} names, "
               f"total {sum(d['nrs_reuse'].values())} cross-session reuses")
+    by_kind = [(r.get("turn"), r.get("obj_bytes", 0), r.get("obj_attn_bytes", 0),
+                r.get("obj_linear_bytes", 0)) for r in recs]
+    if any(b for _, b, _, _ in by_kind):
+        doc = [x for x in by_kind if x[0] == -1]
+        q = [x for x in by_kind if x[0] != -1]
+        for label, rows in (("doc-turn objects", doc),
+                            ("question-turn objects", q)):
+            if not rows:
+                continue
+            tot = avg([b / 1e6 for _, b, _, _ in rows])
+            at = avg([a / 1e6 for _, _, a, _ in rows])
+            ln = avg([l / 1e6 for _, _, _, l in rows])
+            print(f"{label:22s}: obj {tot} MB  (attn {at} + linear {ln})")
     if loc:
         print(f"resumed prefill_s   : {avg([r.get('prefill_s', 0) for r in loc])} (avg)")
     if fr:
