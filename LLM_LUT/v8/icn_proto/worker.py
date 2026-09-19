@@ -49,19 +49,36 @@ class Worker:
         )
         self.device = str(dev)
         self.config = self.model.config
-        self.make_cache, self.install, _ = cache_factory(
-            args.repr, config=self.config, device=self.device)
-        self.install(self.model)
-        self.resident = {}  # name_str -> KVObject (this worker's HBM cache)
+        self._factories = {}          # repr_name -> make_cache
+        self._install_done = False
+        self._make_cache(args.repr)   # eager: validates the default path
+        self.resident = {}            # name_str -> KVObject (latest per session)
         self.busy = False
+
+    def _make_cache(self, repr_name):
+        """Per-representation cache factory, built lazily.
+
+        Only one heavy-hitter patch is ever installed per process (the
+        worker's --repr): the stash wrapper is install-idempotent but swaps
+        banks on reinstall, so m_sp4 and k8v8 never mix inside one worker.
+        bf16 mixes freely (its install is a no-op)."""
+        if repr_name not in self._factories:
+            make, install, _ = cache_factory(
+                repr_name, config=self.config, device=self.device)
+            if not self._install_done and repr_name != "bf16":
+                install(self.model)
+                self._install_done = True
+            self._factories[repr_name] = make
+        return self._factories[repr_name]()
 
     # ---- turn execution -------------------------------------------------
 
     @torch.inference_mode()
     def run_turn(self, session, turn, new_ids, resume_from, decode_steps,
-                 hdr_cum_tokens=None):
+                 hdr_cum_tokens=None, repr_name=None):
+        repr_name = repr_name or self.args.repr
         t0 = time.time()
-        cache = self.make_cache()
+        cache = self._make_cache(repr_name)
         resumed = False
         if resume_from and resume_from in self.resident:
             inject_object(cache, self.resident[resume_from])
@@ -81,16 +98,24 @@ class Worker:
             cache = out.past_key_values
         decode_s = time.time() - t2
         cum = int(hdr_cum_tokens if hdr_cum_tokens else ids.shape[1])
-        name = KVName(session, turn, 0, cum, Repr(self.args.repr))
+        name = KVName(session, turn, 0, cum, Repr(repr_name))
         obj = extract_object(cache, name)
+        # Only the latest object of a session is ever resume-able; older
+        # same-session objects are dead weight (ICN eviction: keep latest).
+        for k in [k for k in self.resident
+                  if k != str(name) and KVName.parse(k).session == session]:
+            del self.resident[k]
         self.resident[str(name)] = obj
         return {
             "resumed": resumed,
+            "repr": repr_name,
             "prefill_tokens": int(ids.shape[1]),
             "cum_tokens": cum,
             "prefill_s": round(prefill_s, 4),
             "decode_s": round(decode_s, 4),
             "queue_s": round(t1 - t0, 4),
+            "obj_bytes": obj.nbytes(),
+            "resident_bytes": sum(o.nbytes() for o in self.resident.values()),
         }
 
     # ---- command loop ---------------------------------------------------
@@ -110,7 +135,7 @@ class Worker:
                     metrics = self.run_turn(
                         hdr["session"], hdr["turn"], hdr["new_token_ids"],
                         hdr.get("resume_from"), hdr.get("decode_steps", 1),
-                        hdr.get("cum_tokens"))
+                        hdr.get("cum_tokens"), hdr.get("repr"))
                     metrics["type"] = "result"
                     metrics["request_id"] = hdr["request_id"]
                     metrics["ok"] = True
