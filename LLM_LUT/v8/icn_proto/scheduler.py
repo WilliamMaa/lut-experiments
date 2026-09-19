@@ -103,14 +103,30 @@ class Scheduler:
         P1: idle worker already holding the previous object -> resume there;
             else an idle worker plus fetch of the object from its holder;
             else any idle worker, no resume (first turn / holder gone).
+        rotate (diagnostic): session s turn t goes to worker (s+t) % W, so
+            every non-first turn is a cross-worker transfer under full load.
+            Used to measure xfer_s, not a real placement policy.
         """
-        idle = [w for w in self.workers.values() if not w.busy]
-        if not idle:
-            return None
         prev = None
         if turn.turn > 0:
             prev = self.turns_of[turn.session][turn.turn - 1].name(
                 self.args.repr)
+        if self.args.policy == "rotate":
+            idx = int("".join(c for c in turn.session if c.isdigit()))
+            target = list(self.workers.values())[
+                (idx + turn.turn) % len(self.workers)]
+            if target.busy:
+                return None
+            if not prev or prev in target.resident:
+                return target.ident, prev, None
+            holders = [w for w in self.workers.values()
+                       if prev in w.resident]
+            if holders:
+                return target.ident, prev, holders[0].ident
+            return target.ident, None, None
+        idle = [w for w in self.workers.values() if not w.busy]
+        if not idle:
+            return None
         if self.args.policy == "p0" or not prev:
             return idle[0].ident, None, None
         for w in idle:
@@ -324,7 +340,7 @@ class Scheduler:
 def add_args(ap):
     ap.add_argument("--bind", default="tcp://127.0.0.1:5570")
     ap.add_argument("--model-path", required=True)
-    ap.add_argument("--policy", default="p1", choices=["p0", "p1"])
+    ap.add_argument("--policy", default="p1", choices=["p0", "p1", "rotate"])
     ap.add_argument("--repr", default="m_sp4", choices=["bf16", "m_sp4", "k8v8"])
     ap.add_argument("--sessions", type=int, default=4)
     ap.add_argument("--turns-per-session", type=int, default=4)
