@@ -177,12 +177,12 @@ class Scheduler:
             self.send_assign(sock, ident, turn, resume_from)
             self.ready.remove(turn)
 
-    def send_assign(self, sock, ident, turn, resume_from):
+    def send_assign(self, sock, ident, turn, resume_from, xfer_bytes=0):
         rid = f"{turn.session}:{turn.turn}"
         w = self.workers[ident]
         w.busy = True
         w.current = rid
-        xfer = self._xfer.pop(rid, {})
+        self._xfer.pop(rid, None)
         msg.send(sock, {
             "type": "assign", "request_id": rid,
             "session": turn.session, "turn": turn.turn,
@@ -194,7 +194,7 @@ class Scheduler:
         self.records.append({"request_id": rid, "worker": w.ident.decode(),
                              "t_assigned": time.time(),
                              "resume_from": resume_from,
-                             "transfer_bytes": xfer.get("bytes", 0)})
+                             "transfer_bytes": xfer_bytes})
 
     def on_message(self, sock, ident, hdr, payload):
         w = self.workers.get(ident)
@@ -252,7 +252,8 @@ class Scheduler:
                 self.transfer_bytes += xfer["bytes"]
                 self.transfers += 1
                 self.send_assign(sock, xfer["target"], xfer["turn"],
-                                 xfer["resume_from"])
+                                 xfer["resume_from"],
+                                 xfer_bytes=xfer.get("bytes", 0))
             return
 
     def advance(self, request_id):
