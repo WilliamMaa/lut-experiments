@@ -23,10 +23,12 @@ def pick(path):
         return path
     here = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "results", "icn_proto")
-    files = sorted(glob.glob(os.path.join(here, "cluster_*.json")),
-                   key=os.path.getmtime)
+    files = sorted(
+        glob.glob(os.path.join(here, "cluster_*.json"))
+        + glob.glob(os.path.join(here, "blkcluster_*.json")),
+        key=os.path.getmtime)
     if not files:
-        sys.exit("no cluster_*.json under results/icn_proto")
+        sys.exit("no cluster/blkcluster *.json under results/icn_proto")
     return files[-1]
 
 
@@ -84,7 +86,16 @@ def main():
 
     print("summary:", {k: d[k] for k in
                        ("wall_s", "hit_rate", "recompute_tokens", "transfers",
-                        "transfer_bytes", "avg_latency_s", "failed")})
+                        "transfer_bytes", "avg_latency_s", "failed") if k in d})
+
+    # block-chain runs: per-record Match/Schedule outcome
+    if any("E" in r for r in recs):
+        print("\nper-turn (request / E / published / latency):")
+        for r in recs:
+            pub = len(r.get("published") or [])
+            print(f"  {r['request_id']:<10} E={r.get('E', '?'):>6} "
+                  f"pub={pub:>4} resumed={r.get('resumed')} "
+                  f"lat={r.get('latency_s')}")
 
 
 if __name__ == "__main__":
