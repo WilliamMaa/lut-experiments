@@ -139,8 +139,10 @@ class Worker:
     # ---- command loop ---------------------------------------------------
 
     def serve(self):
-        ctx = msg.context()
-        sock = msg.dealer(ctx, self.args.scheduler)
+        import zmq
+        ctx = zmq.Context()
+        sock = msg.dealer(ctx, self.args.scheduler,
+                          identity=self.args.worker_id)
         msg.send(sock, {"type": "hello", "worker_id": self.args.worker_id,
                         "resident": list(self.resident),
                         "tips": [n for n, o in self.resident.items()
