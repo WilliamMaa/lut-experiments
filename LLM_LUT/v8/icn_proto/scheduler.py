@@ -42,6 +42,7 @@ class Turn:
     turn: int
     new_token_ids: list
     cum_tokens: int
+    t_ready: float = 0.0      # when the turn became dispatchable
 
     def name(self, repr_name: str) -> str:
         return (f"/session/{self.session}/turn/{self.turn}"
@@ -90,6 +91,7 @@ class Scheduler:
                 turns.append(Turn(session, t, ids, cum))
             self.turns_of[session] = turns
             self.pending_next[session] = 0
+            turns[0].t_ready = time.time()
             self.ready.append(turns[0])
 
     # ---- placement policies ----------------------------------------------
@@ -168,7 +170,8 @@ class Scheduler:
             w = self.workers[ident]
             if fetch_from is not None:
                 self._xfer[rid] = {"stage": "fetch", "target": ident,
-                                   "turn": turn, "resume_from": resume_from}
+                                   "turn": turn, "resume_from": resume_from,
+                                   "t_fetch": time.time()}
                 msg.send(sock, {"type": "fetch", "name": resume_from},
                          ident=fetch_from)
                 w.busy = True   # reserve the target during the transfer
@@ -177,7 +180,8 @@ class Scheduler:
             self.send_assign(sock, ident, turn, resume_from)
             self.ready.remove(turn)
 
-    def send_assign(self, sock, ident, turn, resume_from, xfer_bytes=0):
+    def send_assign(self, sock, ident, turn, resume_from, xfer_bytes=0,
+                    xfer_s=0.0):
         rid = f"{turn.session}:{turn.turn}"
         w = self.workers[ident]
         w.busy = True
@@ -193,8 +197,10 @@ class Scheduler:
         }, ident=ident)
         self.records.append({"request_id": rid, "worker": w.ident.decode(),
                              "t_assigned": time.time(),
+                             "queue_s": round(time.time() - turn.t_ready, 4),
                              "resume_from": resume_from,
-                             "transfer_bytes": xfer_bytes})
+                             "transfer_bytes": xfer_bytes,
+                             "xfer_s": round(xfer_s, 4)})
 
     def on_message(self, sock, ident, hdr, payload):
         w = self.workers.get(ident)
@@ -253,7 +259,8 @@ class Scheduler:
                 self.transfers += 1
                 self.send_assign(sock, xfer["target"], xfer["turn"],
                                  xfer["resume_from"],
-                                 xfer_bytes=xfer.get("bytes", 0))
+                                 xfer_bytes=xfer.get("bytes", 0),
+                                 xfer_s=time.time() - xfer["t_fetch"])
             return
 
     def advance(self, request_id):
@@ -262,6 +269,7 @@ class Scheduler:
         self.pending_next[session] = nxt
         turns = self.turns_of[session]
         if nxt < len(turns):
+            turns[nxt].t_ready = time.time()
             self.ready.append(turns[nxt])
         else:
             self.done_sessions += 1

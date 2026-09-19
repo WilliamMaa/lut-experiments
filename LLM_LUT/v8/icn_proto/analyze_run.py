@@ -44,9 +44,9 @@ def main():
     loc = [r for r in recs if r.get("transfer_bytes", 0) == 0 and r.get("resumed")]
     fr = [r for r in recs if not r.get("resumed")]
 
-    print(f"turns with transfer : {len(tr):3d}  avg latency {avg([r['latency_s'] for r in tr])}")
-    print(f"local resumed turns : {len(loc):3d}  avg latency {avg([r['latency_s'] for r in loc])}")
-    print(f"fresh turns         : {len(fr):3d}  avg latency {avg([r['latency_s'] for r in fr])}")
+    print(f"turns with transfer : {len(tr):3d}  avg latency {avg([r['latency_s'] for r in tr])}  avg queue {avg([r.get('queue_s', 0) for r in tr])}  avg xfer {avg([r.get('xfer_s', 0) for r in tr])}")
+    print(f"local resumed turns : {len(loc):3d}  avg latency {avg([r['latency_s'] for r in loc])}  avg queue {avg([r.get('queue_s', 0) for r in loc])}")
+    print(f"fresh turns         : {len(fr):3d}  avg latency {avg([r['latency_s'] for r in fr])}  avg queue {avg([r.get('queue_s', 0) for r in fr])}")
 
     if tr:
         mb = sum(r["transfer_bytes"] for r in tr) / len(tr) / 1e6
