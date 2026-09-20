@@ -292,6 +292,11 @@ class Scheduler:
                         print(f"[watchdog] {w.ident.decode()} busy on "
                               f"{w.current} for {int(now - w.t_assign)}s "
                               f"(no result)", flush=True)
+                for rid, x in self._xfer.items():
+                    if now - x["t_fetch"] > 120:
+                        print(f"[watchdog] xfer {rid} stuck in stage "
+                              f"{x['stage']} for {int(now - x['t_fetch'])}s",
+                              flush=True)
                 if sock not in evts:
                     continue
                 ident, hdr, payload = msg.recv(sock)
@@ -315,12 +320,17 @@ class Scheduler:
             if fetch is not None:
                 holder_ident, names = fetch
                 self._xfer[rid] = {"stage": "fetch", "target": ident,
+                                   "holder": holder_ident,
                                    "names": names, "E_loc": decision["E_loc"],
                                    "turn": turn, "decision": decision,
                                    "t_fetch": time.time()}
+                print(f"[xfer ] {rid} fetch {len(names)} blocks from "
+                      f"{holder_ident.decode()} -> {ident.decode()} "
+                      f"(E target {decision['E']})", flush=True)
                 msg.send(sock, {"type": "fetch", "names": names},
                          ident=holder_ident)
                 w.busy = True
+                w.t_assign = time.time()
                 self.ready.remove(turn)
                 continue
             self.send_assign(sock, ident, turn, e_resume, decision=decision)
@@ -364,9 +374,13 @@ class Scheduler:
             return
         mtype = hdr.get("type")
         if mtype == "status":
+            # NOTE: busy is NOT taken from status. The worker's status is
+            # stale by the time it arrives (it reports the moment between
+            # turns, but the scheduler may already have assigned/fetched
+            # a new turn to this worker). Scheduler-side busy lifecycle:
+            # set True on assign / fetch dispatch, cleared on result.
             w.resident = set(hdr.get("resident", []))
             w.tips = set(hdr.get("tips", []))
-            w.busy = hdr.get("busy", False)
             return
         if mtype == "result":
             rid = hdr["request_id"]
@@ -405,27 +419,42 @@ class Scheduler:
             self.advance(rid)
             return
         if mtype == "fetched":
+            # pair by holder + names: two sessions may fetch the SAME
+            # blocks to different targets concurrently
             rid, xfer = next(
                 ((r, x) for r, x in self._xfer.items()
                  if x["stage"] == "fetch"
+                 and x["holder"] == ident
                  and x["names"] == hdr.get("names")), (None, None))
             if not xfer:
+                print(f"[xfer ] WARN fetched with no matching xfer from "
+                      f"{ident.decode()}: ok={hdr.get('ok')} "
+                      f"names={len(hdr.get('names') or [])}", flush=True)
                 return
             if hdr.get("ok"):
                 xfer["stage"] = "deliver"
                 xfer["bytes"] = len(payload)
+                print(f"[xfer ] {rid} fetched {xfer['bytes']/1e6:.1f}MB "
+                      f"from {ident.decode()} in "
+                      f"{time.time() - xfer['t_fetch']:.2f}s", flush=True)
                 msg.send(sock, {"type": "deliver"}, payload=payload,
                          ident=xfer["target"])
             else:
                 # holder lost blocks: degrade to the local boundary
+                print(f"[xfer ] {rid} fetch FAILED (missing "
+                      f"{len(hdr.get('missing') or [])}), degrade to "
+                      f"E_loc={xfer['E_loc']}", flush=True)
                 turn = xfer["turn"]
                 self._xfer.pop(rid, None)
                 self.send_assign(sock, xfer["target"], turn, xfer["E_loc"])
             return
         if mtype == "delivered":
+            # pair by target worker: concurrent transfers to different
+            # workers must not cross
             rid, xfer = next(
                 ((r, x) for r, x in self._xfer.items()
-                 if x["stage"] == "deliver"), (None, None))
+                 if x["stage"] == "deliver"
+                 and x["target"] == ident), (None, None))
             if xfer:
                 self._xfer.pop(rid, None)
                 self.transfer_bytes += xfer["bytes"]
@@ -434,6 +463,9 @@ class Scheduler:
                 if xfer_s > 0:
                     self.xfer_rate = (0.7 * self.xfer_rate
                                       + 0.3 * xfer["bytes"] / xfer_s)
+                print(f"[xfer ] {rid} delivered to {ident.decode()}, "
+                      f"assign E={self._tip_end(xfer['names'][-1])}",
+                      flush=True)
                 e = self._tip_end(xfer["names"][-1])
                 self.send_assign(sock, xfer["target"], xfer["turn"], e,
                                  xfer_names=xfer["names"],

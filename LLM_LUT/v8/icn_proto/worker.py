@@ -187,6 +187,12 @@ class Worker:
                 objs = torch.load(io.BytesIO(payload), weights_only=False)
                 for obj in objs:
                     self.resident[str(obj.name)] = obj
+                print(f"[{self.args.worker_id}] delivered "
+                      f"{len(objs)} blocks "
+                      f"({sum(o.nbytes() for o in objs) / 1e6:.1f}MB)",
+                      flush=True)
+                msg.send(sock, {"type": "delivered",
+                                "names": [str(o.name) for o in objs]})
                 self.report_status(sock)
                 continue
             if mtype == "assign":
@@ -207,12 +213,14 @@ class Worker:
                 continue
 
     def report_status(self, sock):
+        # no busy field: the scheduler owns the busy flag (set on
+        # assign/fetch, cleared on result). A worker-reported busy would
+        # be stale by the time it arrives and caused double-booking.
         msg.send(sock, {
             "type": "status",
             "resident": list(self.resident),
             "tips": [n for n, o in self.resident.items()
-                     if o.linear_checkpoint],
-            "busy": False})
+                     if o.linear_checkpoint]})
 
 
 def main():
