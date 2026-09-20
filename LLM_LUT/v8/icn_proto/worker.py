@@ -28,6 +28,7 @@ Run (cards are fixed by the launcher via CUDA_VISIBLE_DEVICES):
 
 import argparse
 import io
+import json
 import os
 import sys
 import time
@@ -107,7 +108,7 @@ class Worker:
                   flush=True)
 
     def _explicit_even_map(self):
-        n = self.config.num_hidden_layers
+        n = self._layer_count()
         half = (n + 1) // 2
         m = {"model.embed_tokens": 0,
              "model.norm": 1,
@@ -115,6 +116,33 @@ class Worker:
         m.update({f"model.layers.{i}": (0 if i < half else 1)
                   for i in range(n)})
         return m
+
+    def _layer_count(self):
+        """Ground truth from the checkpoint's weight index (version-
+        independent); config attributes only as fallback — Qwen3_5MoeConfig
+        (heterogeneous layers, transformers 5.14) has no
+        num_hidden_layers."""
+        idx_path = os.path.join(self.args.model_path,
+                                "model.safetensors.index.json")
+        if os.path.exists(idx_path):
+            with open(idx_path, encoding="utf-8") as f:
+                wm = json.load(f)["weight_map"]
+            ns = {int(k.split("model.layers.")[1].split(".")[0])
+                  for k in wm if "model.layers." in k}
+            if ns:
+                return max(ns) + 1
+        cfg = self.config
+        for probe in (cfg, getattr(cfg, "text_config", None)):
+            if probe is None:
+                continue
+            n = getattr(probe, "num_hidden_layers", None)
+            if isinstance(n, int):
+                return n
+            lt = getattr(probe, "layer_types", None)
+            if lt:
+                return len(lt)
+        raise RuntimeError(
+            f"cannot determine layer count for {type(cfg).__name__}")
 
     def _make_cache(self, repr_name):
         if repr_name not in self._factories:
