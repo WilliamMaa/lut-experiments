@@ -161,7 +161,8 @@ class Worker:
         msg.send(sock, {"type": "hello", "worker_id": self.args.worker_id,
                         "resident": list(self.resident),
                         "tips": [n for n, o in self.resident.items()
-                                 if o.linear_checkpoint]})
+                                 if o.linear_checkpoint],
+                        "resident_bytes": 0})
         while True:
             _, hdr, payload = msg.recv(sock)
             mtype = hdr.get("type")
@@ -227,7 +228,8 @@ class Worker:
             "type": "status",
             "resident": list(self.resident),
             "tips": [n for n, o in self.resident.items()
-                     if o.linear_checkpoint]})
+                     if o.linear_checkpoint],
+            "resident_bytes": sum(o.nbytes() for o in self.resident.values())})
 
 
 def main():

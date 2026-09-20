@@ -117,6 +117,12 @@ class WorkerState:
     tips: set = field(default_factory=set)   # blocks carrying GDN checkpoints
     current: str | None = None
     t_assign: float = 0.0
+    cur_plan: dict | None = None    # {prefill_tokens, decode_steps} of
+                                    # the in-flight turn (scheduler knows
+                                    # the plan it assigned; no worker
+                                    # round-trip needed)
+    resident_bytes: int = 0
+    prefill_rate: float = 0.0       # per-worker EWMA, tok/s (0 = unknown)
 
 
 class Scheduler:
@@ -132,7 +138,14 @@ class Scheduler:
         self.ready = []
         self.pending_next = {}
         self.turns_of = {}
-        self.obj_bytes = {}        # block name -> nbytes (published)
+        # Directory (05 v3 §2): block name -> metadata. Identity is
+        # content-derived (blkchain), so entries are created on publish;
+        # zero-replica entries may simply be dropped — identity survives
+        # via re-derivation. lambda = EWMA of observed access rate,
+        # counted at assign time on the resume set; a tip block's lambda
+        # is the arrival rate of requests resuming at that position, i.e.
+        # the demand signal for the Step-4 placement trigger.
+        self.dir = {}
         self.tips = set()          # all known checkpoint tip blocks
         self.records = []
         self.transfer_bytes = 0
@@ -142,6 +155,28 @@ class Scheduler:
         self._xfer = {}
         self.prefill_rate = self.PREFILL_RATE0
         self.xfer_rate = self.XFER_RATE0
+
+    def dir_add(self, name, nbytes, t=None):
+        e = self.dir.get(name)
+        if e is None:
+            self.dir[name] = e = {"bytes": int(nbytes), "first": t or time.time(),
+                                  "last": 0.0, "count": 0, "lambda": 0.0}
+        else:
+            e["bytes"] = int(nbytes)
+        return e
+
+    def note_access(self, names, t=None):
+        t = t or time.time()
+        for n in names:
+            e = self.dir.get(n)
+            if e is None:
+                continue
+            if e["count"] >= 1 and e["last"] > 0:
+                inst = 1.0 / max(t - e["last"], 1e-3)
+                e["lambda"] = (inst if e["count"] == 1
+                               else 0.7 * e["lambda"] + 0.3 * inst)
+            e["last"] = t
+            e["count"] += 1
 
     # ---- workload -------------------------------------------------------
 
@@ -210,6 +245,22 @@ class Scheduler:
             best = max(best, t_pos)
         return best
 
+    DECODE_STEP0 = 0.08   # s per decode token; refined once decode timing
+                          # is EWMA-tracked (step 3 pipelining)
+
+    def eta(self, w):
+        """Expected seconds until worker w finishes its in-flight turn.
+        0 for idle workers — the queue-wait term of the scheduling cost,
+        inert today (one turn per worker) and activated by pipelining."""
+        if not w.busy or not w.cur_plan:
+            return 0.0
+        plan = w.cur_plan
+        elapsed = time.time() - w.t_assign
+        total = (plan["prefill_tokens"]
+                 / (w.prefill_rate or self.prefill_rate)
+                 + plan["decode_steps"] * self.DECODE_STEP0)
+        return max(0.0, total - elapsed)
+
     def _match_cap(self, turn):
         """Resume/fetch target ceiling. Question turns must not target
         past the PREVIOUS turn's end: this turn's new tokens are always
@@ -263,15 +314,21 @@ class Scheduler:
                     e_max = t_pos
                     break
             fresh = turn.cum_tokens - e_max
-            fetch_bytes = sum(self.obj_bytes.get(bn, 0)
+            fetch_bytes = sum(self.dir.get(bn, {}).get("bytes", 0)
                               for bn in (fetch[1] if fetch else []))
-            cost = fresh / self.prefill_rate
+            # queue wait: 0 for idle workers by construction (one in-flight
+            # turn per worker); the term lands with pipelining in step 3
+            rate = w.prefill_rate or self.prefill_rate
+            cost = fresh / rate
             if fetch:
                 cost += fetch_bytes / self.xfer_rate
+            eta = self.eta(w)   # expected finish of the in-flight turn
+            cost += eta
             mode = ("local" if e_max == e_loc and e_loc > 0
                     else "fetch" if fetch else "fresh")
             costs[w.ident.decode()] = {
                 "mode": mode, "E": e_max, "fresh": fresh,
+                "eta_s": round(eta, 4), "rate": round(rate, 1),
                 "cost_s": round(cost, 4)}
             # argmin cost; ties: prefer local resume, then larger E
             rank = (round(cost, 6), 0 if mode == "local" else 1, -e_max)
@@ -370,9 +427,14 @@ class Scheduler:
         w.busy = True
         w.current = rid
         w.t_assign = time.time()
+        decode_steps = (0 if turn.turn == -1 else self.args.decode_steps)
+        w.cur_plan = {"prefill_tokens": len(turn.prefix_ids) - e_resume,
+                      "decode_steps": decode_steps}
         self._xfer.pop(rid, None)
         resume_names = self.resume_names(turn, e_resume)
         new_names = turn.publish_names("bf16", self.args.block_tokens)
+        # demand accounting: every resumed block contributed to this turn
+        self.note_access(resume_names)
         print(f"[assign] {rid} -> {w.ident.decode()} "
               f"E={e_resume} resume_blocks={len(resume_names)} "
               f"publish_blocks={len(new_names)} "
@@ -383,8 +445,7 @@ class Scheduler:
             "resume_names": resume_names,
             "new_block_names": new_names,
             "prefill_ids": turn.prefix_ids[e_resume:],
-            "decode_steps": (0 if turn.turn == -1
-                             else self.args.decode_steps),
+            "decode_steps": decode_steps,
             "repr": "bf16",
         }, ident=ident)
         self.records.append({"request_id": rid, "worker": w.ident.decode(),
@@ -411,6 +472,7 @@ class Scheduler:
             # set True on assign / fetch dispatch, cleared on result.
             w.resident = set(hdr.get("resident", []))
             w.tips = set(hdr.get("tips", []))
+            w.resident_bytes = hdr.get("resident_bytes", w.resident_bytes)
             return
         if mtype == "result":
             rid = hdr["request_id"]
@@ -429,13 +491,24 @@ class Scheduler:
                 rec["latency_s"] = round(time.time() - rec.pop("t_assigned"), 4)
             w.busy = False
             w.current = None
+            w.cur_plan = None
+            w.resident_bytes = hdr.get("resident_bytes", w.resident_bytes)
+            # per-worker prefill-rate EWMA (resumed turns carry tiny
+            # prefills and would pollute the estimate)
+            if hdr.get("ok") and hdr.get("prefill_s") \
+                    and hdr.get("prefill_tokens", 0) > 64:
+                rate = hdr["prefill_tokens"] / hdr["prefill_s"]
+                w.prefill_rate = (rate if w.prefill_rate == 0
+                                  else 0.7 * w.prefill_rate + 0.3 * rate)
+                self.prefill_rate = (0.7 * self.prefill_rate
+                                     + 0.3 * rate)
             if hdr.get("ok"):
                 session, t = rid.split(":")
                 chain_idx = 0 if t == "-1" else int(t) + 1
                 if hdr.get("published"):
                     for p in hdr["published"]:
                         w.resident.add(p["name"])
-                        self.obj_bytes[p["name"]] = p["bytes"]
+                        self.dir_add(p["name"], p["bytes"])
                     # this turn's chain tip (last of publish_names) carries
                     # the GDN checkpoint (worker.extract_blocks contract)
                     turn_done = self.turns_of[session][chain_idx]
@@ -443,9 +516,6 @@ class Scheduler:
                                                   self.args.block_tokens)[-1]
                     w.tips.add(tip)
                     self.tips.add(tip)
-                if not rec.get("resumed") and hdr.get("prefill_s"):
-                    rate = hdr["prefill_tokens"] / hdr["prefill_s"]
-                    self.prefill_rate = 0.7 * self.prefill_rate + 0.3 * rate
             self.advance(rid)
             return
         if mtype == "fetched":
@@ -536,6 +606,14 @@ class Scheduler:
         published_blocks = sum(len(r.get("published") or []) for r in ok)
         published_bytes = sum(p["bytes"] for r in ok
                               for p in (r.get("published") or []))
+        top = sorted(self.dir.items(), key=lambda kv: kv[1]["lambda"],
+                     reverse=True)[:10]
+        workers = {w.ident.decode(): {
+            "resident_blocks": len(w.resident),
+            "tips": len(w.tips),
+            "resident_bytes": w.resident_bytes,
+            "prefill_rate": round(w.prefill_rate, 1),
+        } for w in self.workers.values()}
         out = {
             "config": {k: v for k, v in vars(self.args).items()},
             "prefill_rate": round(self.prefill_rate, 1),
@@ -553,6 +631,18 @@ class Scheduler:
             "transfer_bytes": self.transfer_bytes,
             "avg_latency_s": round(sum(r["latency_s"] for r in ok)
                                    / max(1, len(ok)), 4),
+            "workers": workers,
+            "directory": {
+                "entries": len(self.dir),
+                "total_bytes": sum(m["bytes"] for m in self.dir.values()),
+                "ever_accessed": sum(1 for m in self.dir.values()
+                                     if m["count"] > 0),
+                "top_lambda": [
+                    {"name": n[-60:], "lambda": round(m["lambda"], 4),
+                     "count": m["count"], "bytes": m["bytes"],
+                     "is_tip": n in self.tips}
+                    for n, m in top],
+            },
             "records": self.records,
         }
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -569,6 +659,14 @@ class Scheduler:
                   "transfers", "transfer_bytes",
                   "avg_latency_s", "failed", "prefill_rate", "xfer_rate"):
             print(f"  {k}: {out[k]}")
+        for wid, ws in workers.items():
+            print(f"  worker {wid}: {ws}")
+        d = out["directory"]
+        print(f"  directory: {d['entries']} entries, "
+              f"{d['total_bytes']/1e6:.1f}MB, {d['ever_accessed']} accessed")
+        for e in d["top_lambda"][:5]:
+            print(f"    lambda={e['lambda']:<8} count={e['count']:<3} "
+                  f"tip={e['is_tip']} {e['name'][-45:]}")
         return out
 
 
