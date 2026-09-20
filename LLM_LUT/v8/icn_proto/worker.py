@@ -67,6 +67,15 @@ class Worker:
         # cards are too full it silently offloads layers to CPU, which
         # broke place_cache and caused the intermittent cpu-vs-cuda cat
         # crashes. Same balancing principle, no ambient noise.
+        # report what accelerate's placement will see: free vram per
+        # visible card BEFORE loading. If a card cannot hold its half of
+        # the model (~35GB for this 35B bf16), the layout degrades
+        # (params on meta/cpu) and every resumed turn crashes.
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                free, total = torch.cuda.mem_get_info(i)
+                print(f"  card {i}: {free/1e9:.1f}GB free of "
+                      f"{total/1e9:.1f}GB", flush=True)
         if self.args.device == "explicit_even":
             device_map = self._explicit_even_map()
         else:

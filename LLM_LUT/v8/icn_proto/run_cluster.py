@@ -61,8 +61,12 @@ def main():
                     help="comma-separated free GPU ids, dealt round-robin")
     ap.add_argument("--gpus-per-worker", type=int, default=2)
     ap.add_argument("--port", type=int, default=5570)
-    ap.add_argument("--device", default="balanced_low_0",
-                    help="worker-side model device map (fixed split, never 'auto')")
+    ap.add_argument("--device", default="explicit_even",
+                    help="worker-side model placement: explicit_even "
+                         "(default) = deterministic half/half layer split "
+                         "over the worker's visible cards — the intent of "
+                         "balanced_low_0 without tenant-dependent "
+                         "reshuffling. Never 'auto' (project red line).")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--no-share", action="store_true",
                     help="baseline mode: disable cross-session content sharing "
