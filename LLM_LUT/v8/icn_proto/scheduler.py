@@ -88,14 +88,12 @@ class Turn:
         return self._chain_cache[key]
 
     def prefix_fingerprint(self, repr_name: str, block_tokens: int) -> str:
-        """Content ID of the whole prefix: the tip name at floor(cum) —
-        its block_hash chains over every complete block, so any token
-        difference changes it. Used by check_consistency to pair turns
-        that must produce identical decodes."""
-        floor_t = self.cum_tokens - (self.cum_tokens % block_tokens)
-        if floor_t == 0:
-            floor_t = self.cum_tokens
-        return self.tip_name_at(floor_t, repr_name, block_tokens)
+        """Content ID of the whole prefix: the exact tip name at cum_tokens
+        — its block_hash chains over every block INCLUDING the partial
+        tail, so any token or length difference changes it. Used by
+        check_consistency to pair turns that must produce identical
+        decodes."""
+        return self.tip_name_at(self.cum_tokens, repr_name, block_tokens)
 
     def publish_names(self, repr_name: str, block_tokens: int,
                       model_tag: str = "qwen35b") -> list:
@@ -212,18 +210,31 @@ class Scheduler:
             best = max(best, t_pos)
         return best
 
+    def _match_cap(self, turn):
+        """Resume/fetch target ceiling. Question turns must not target
+        past the PREVIOUS turn's end: this turn's new tokens are always
+        prefilled locally — a target at cum_tokens would leave zero
+        prefill while decode_steps > 0 (worker rejects that). Doc turns
+        are publish-only (decode_steps=0), so they may target cum."""
+        if turn.turn == -1:
+            return turn.cum_tokens
+        idx = turn.turn + 1
+        return self.turns_of[turn.session][idx - 1].cum_tokens
+
     def choose(self, turn):
         """Returns (ident, E, fetch, decision) or None.
 
         E: resume position (tokens, may be non-block-aligned — it is a
         tip position). fetch: None or (holder_ident, [block names]) — the
         missing blocks for a single-holder extension. decision: cost log."""
-        # Match bound = this turn's chain tip, NOT the session's previous
-        # tip: cross-session sharing means blocks beyond this session's
-        # own history can still exist (published by an earlier identical
-        # session). Blocks are named by content, so any published block
-        # anywhere is a candidate.
-        tip_bound = turn.cum_tokens
+        # Match bound = the session's previous turn end (see _match_cap),
+        # NOT this turn's own tip: cross-session sharing means blocks
+        # beyond this session's own history can still exist (published by
+        # an earlier identical session). Blocks are named by content, so
+        # any published block anywhere is a candidate. Question turns
+        # never target their own tail — those tokens are prefilled
+        # locally (zero-prefill + decode is illegal on the worker).
+        tip_bound = self._match_cap(turn)
         idle = [w for w in self.workers.values() if not w.busy]
         if not idle:
             return None
