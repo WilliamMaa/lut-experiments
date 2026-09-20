@@ -60,9 +60,20 @@ class Worker:
                                                  trust_remote_code=True)
         dtype = {"bfloat16": torch.bfloat16,
                  "float16": torch.float16}.get(self.args.dtype, torch.bfloat16)
+        # explicit_even: the INTENT of balanced_low_0 (balance layers across
+        # the visible cards, embeddings on card 0) but deterministic.
+        # balanced_low_0 shards by CURRENTLY FREE vram, so neighbour
+        # tenants reshuffle our layout on every load — and when the pool
+        # cards are too full it silently offloads layers to CPU, which
+        # broke place_cache and caused the intermittent cpu-vs-cuda cat
+        # crashes. Same balancing principle, no ambient noise.
+        if self.args.device == "explicit_even":
+            device_map = self._explicit_even_map()
+        else:
+            device_map = self.args.device
         self.model = AutoModelForCausalLM.from_pretrained(
             self.args.model_path, dtype=dtype, trust_remote_code=True,
-            device_map=self.args.device)
+            device_map=device_map)
         self.model.eval()
         first = next(self.model.parameters())
         self.device = first.device
@@ -74,6 +85,27 @@ class Worker:
                   f"sample: {list(dm.items())[:2]}", flush=True)
         else:
             print("  device_map: NONE (single-device fallback)", flush=True)
+        n_cpu = sum(1 for p in self.model.parameters()
+                    if p.device.type == "cpu")
+        n_meta = sum(1 for p in self.model.parameters()
+                     if p.device.type == "meta")
+        if n_cpu or n_meta:
+            print(f"  WARN: {n_cpu} params on cpu, {n_meta} on meta after "
+                  f"load — visible cards lack free VRAM, layout DEGRADED. "
+                  f"Pick emptier --gpu-pool cards.", flush=True)
+        else:
+            print("  layout check OK: all params on accelerator",
+                  flush=True)
+
+    def _explicit_even_map(self):
+        n = self.config.num_hidden_layers
+        half = (n + 1) // 2
+        m = {"model.embed_tokens": 0,
+             "model.norm": 1,
+             "lm_head": 1}
+        m.update({f"model.layers.{i}": (0 if i < half else 1)
+                  for i in range(n)})
+        return m
 
     def _make_cache(self, repr_name):
         if repr_name not in self._factories:
@@ -250,7 +282,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scheduler", required=True)
     ap.add_argument("--model-path", required=True)
-    ap.add_argument("--device", default="balanced_low_0")
+    ap.add_argument("--device", default="explicit_even",
+                    help="explicit_even (default): deterministic half/half "
+                         "split over visible cards — same intent as "
+                         "balanced_low_0 without tenant-dependent "
+                         "reshuffling. balanced_low_0 kept for reference.")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--repr", default="bf16")
     ap.add_argument("--worker-id", default="w0")

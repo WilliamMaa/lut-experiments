@@ -170,15 +170,24 @@ def inject_object(cache, obj: KVObject) -> None:
 def place_cache(cache, model) -> None:
     """Move each layer's state to the device the model runs that layer on.
 
-    Needed after inject_object (payloads arrive on CPU) and required for
-    sharded models (balanced_low_0): layer i's KV must sit on the same card
-    as layer i. Devices are read from model.hf_device_map; falls back to the
-    model's first-parameter device for single-device loads. A no-op for
-    layers with no state yet.
+    Needed after inject (payloads arrive on CPU). Device resolution order:
+    1. the layer submodule's OWN parameters — ground truth for where
+       accelerate actually runs the layer (offload hooks included);
+    2. model.hf_device_map entries (can be MISSING for offloaded layers
+       under uneven tenant GPUs — that gap sent layer 39's KV to CPU
+       while the layer computed on cuda:0);
+    3. the model's first parameter.
     """
     dev_map = getattr(model, "hf_device_map", None)
+    core = getattr(model, "model", model)   # ForCausalLM -> .model
+    decoder_layers = getattr(core, "layers", None)
 
     def layer_device(idx):
+        if decoder_layers is not None and idx < len(decoder_layers):
+            try:
+                return next(decoder_layers[idx].parameters()).device
+            except StopIteration:
+                pass
         if dev_map:
             for name, dev in dev_map.items():
                 if name.endswith(f"layers.{idx}"):
