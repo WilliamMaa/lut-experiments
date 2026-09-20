@@ -85,6 +85,10 @@ class Worker:
                  prefill_ids, decode_steps, repr_name=None):
         repr_name = repr_name or self.args.repr
         t0 = time.time()
+        wid = self.args.worker_id
+        print(f"[{wid}] turn {session}:{turn} start "
+              f"resume={len(resume_names)} publish={len(new_block_names)} "
+              f"prefill={len(prefill_ids)} decode={decode_steps}", flush=True)
         cache = self._make_cache(repr_name)
         if resume_names:
             blocks = []
@@ -96,6 +100,9 @@ class Worker:
             inject_blocks(cache, blocks)
             from icn_proto.kvcodec import place_cache
             place_cache(cache, self.model)
+            print(f"[{wid}] turn {session}:{turn} injected "
+                  f"{len(blocks)} blocks "
+                  f"({time.time() - t0:.2f}s)", flush=True)
         out = None
         prefill_s = 0.0
         if prefill_ids:
@@ -105,6 +112,8 @@ class Worker:
                              past_key_values=cache, use_cache=True)
             cache = out.past_key_values
             prefill_s = time.time() - t1
+            print(f"[{wid}] turn {session}:{turn} prefilled "
+                  f"{len(prefill_ids)} tok in {prefill_s:.2f}s", flush=True)
         elif decode_steps:
             raise RuntimeError("zero prefill with decode_steps > 0")
         t2 = time.time()
@@ -126,6 +135,9 @@ class Worker:
         objs = extract_blocks(cache, publish)
         for obj in objs:
             self.resident[str(obj.name)] = obj
+        print(f"[{wid}] turn {session}:{turn} published "
+              f"{len(objs)} blocks in {time.time() - t2 - decode_s:.2f}s "
+              f"(total {time.time() - t0:.2f}s)", flush=True)
         return {
             "resumed": bool(resume_names),
             "repr": repr_name,

@@ -108,6 +108,7 @@ class WorkerState:
     resident: set = field(default_factory=set)
     tips: set = field(default_factory=set)   # blocks carrying GDN checkpoints
     current: str | None = None
+    t_assign: float = 0.0
 
 
 class Scheduler:
@@ -285,6 +286,12 @@ class Scheduler:
             while not self.finished():
                 self.dispatch(sock)
                 evts = dict(poller.poll(timeout=1000))
+                now = time.time()
+                for w in self.workers.values():
+                    if w.busy and now - w.t_assign > 180:
+                        print(f"[watchdog] {w.ident.decode()} busy on "
+                              f"{w.current} for {int(now - w.t_assign)}s "
+                              f"(no result)", flush=True)
                 if sock not in evts:
                     continue
                 ident, hdr, payload = msg.recv(sock)
@@ -325,9 +332,14 @@ class Scheduler:
         w = self.workers[ident]
         w.busy = True
         w.current = rid
+        w.t_assign = time.time()
         self._xfer.pop(rid, None)
         resume_names = self.resume_names(turn, e_resume)
         new_names = turn.publish_names("bf16", self.args.block_tokens)
+        print(f"[assign] {rid} -> {w.ident.decode()} "
+              f"E={e_resume} resume_blocks={len(resume_names)} "
+              f"publish_blocks={len(new_names)} "
+              f"prefill_tokens={len(turn.prefix_ids) - e_resume}", flush=True)
         msg.send(sock, {
             "type": "assign", "request_id": rid,
             "session": turn.session, "turn": turn.turn,
@@ -358,6 +370,11 @@ class Scheduler:
             return
         if mtype == "result":
             rid = hdr["request_id"]
+            print(f"[result] {rid} from {w.ident.decode()} "
+                  f"ok={hdr.get('ok')} "
+                  f"prefill_s={hdr.get('prefill_s')} "
+                  f"published={len(hdr.get('published') or [])} "
+                  f"err={hdr.get('error')}", flush=True)
             rec = next((r for r in reversed(self.records)
                         if r["request_id"] == rid), None)
             if rec:
