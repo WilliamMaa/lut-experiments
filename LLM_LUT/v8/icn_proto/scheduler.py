@@ -87,6 +87,16 @@ class Turn:
             self._chain_cache[key] = str(sub[-1])
         return self._chain_cache[key]
 
+    def prefix_fingerprint(self, repr_name: str, block_tokens: int) -> str:
+        """Content ID of the whole prefix: the tip name at floor(cum) —
+        its block_hash chains over every complete block, so any token
+        difference changes it. Used by check_consistency to pair turns
+        that must produce identical decodes."""
+        floor_t = self.cum_tokens - (self.cum_tokens % block_tokens)
+        if floor_t == 0:
+            floor_t = self.cum_tokens
+        return self.tip_name_at(floor_t, repr_name, block_tokens)
+
     def publish_names(self, repr_name: str, block_tokens: int,
                       model_tag: str = "qwen35b") -> list:
         """All blocks this turn produces: complete blocks + the tip block
@@ -140,8 +150,14 @@ class Scheduler:
     def build_workload(self, tokenizer):
         with open(TRACE, encoding="utf-8") as f:
             docs = [json.loads(l) for l in f]
+        # --doc-share K: sessions reuse the first K samples (i % K), so
+        # identical chains are forced onto different workers and the
+        # scheduler MUST fetch instead of recompute. NOTE: rep also
+        # depends on i % 2, so with K=2 the pairs (even sessions) and
+        # (odd sessions) are exactly identical.
+        n_samples = self.args.doc_share or len(docs)
         for i in range(self.args.sessions):
-            sample = docs[i % len(docs)]
+            sample = docs[i % n_samples]
             session = f"doc{i}"
             rep = (self.args.doc_repeat if i % 2 == 0
                    else (self.args.doc_repeat_alt
@@ -363,7 +379,10 @@ class Scheduler:
         self.records.append({"request_id": rid, "worker": w.ident.decode(),
                              "t_assigned": time.time(),
                              "queue_s": round(time.time() - turn.t_ready, 4),
-                             "E": e_resume, "xfer_blocks": xfer_names or [],
+                             "E": e_resume,
+                             "fp": turn.prefix_fingerprint(
+                                 "bf16", self.args.block_tokens),
+                             "xfer_blocks": xfer_names or [],
                              "transfer_bytes": xfer_bytes,
                              "xfer_s": round(xfer_s, 4),
                              "decision": decision})
@@ -557,6 +576,10 @@ def add_args(ap):
     ap.add_argument("--doc-chars", type=int, default=4000)
     ap.add_argument("--doc-repeat", type=int, default=1)
     ap.add_argument("--doc-repeat-alt", type=int, default=None)
+    ap.add_argument("--doc-share", type=int, default=None,
+                    help="reuse the first K doc samples across sessions "
+                         "(i %% K) to force identical chains / cross-worker "
+                         "fetch. K=2 pairs even/odd sessions exactly.")
     ap.add_argument("--decode-steps", type=int, default=4)
     ap.add_argument("--out", default=os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
