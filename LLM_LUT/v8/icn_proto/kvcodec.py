@@ -205,6 +205,30 @@ def place_cache(cache, model) -> None:
             for k, tup in list(metas.items()):
                 metas[k] = tuple(t.to(layer_device(k)) if torch.is_tensor(t) else t
                                  for t in tup)
+    # self-check: any layer state left on CPU after the move? Diagnostic
+    # for the intermittent "cpu vs cuda" cat failure — distinguishes
+    # "setattr did not stick / wrong device resolved" (this list is
+    # non-empty) from "the model swapped the cache object inside forward"
+    # (this list is empty yet the forward still fails).
+    left = []
+    for idx, layer in enumerate(cache.layers):
+        for attr in ("keys", "values"):
+            t = getattr(layer, attr, None)
+            if torch.is_tensor(t) and t.device.type == "cpu":
+                left.append((idx, attr, str(layer_device(idx))))
+        for attr in ("conv_states", "recurrent_states"):
+            d = getattr(layer, attr, None)
+            if isinstance(d, dict):
+                for k, t in d.items():
+                    if torch.is_tensor(t) and t.device.type == "cpu":
+                        left.append((idx, f"{attr}[{k}]",
+                                     str(layer_device(idx))))
+    if left:
+        print(f"[place_cache] WARN {len(left)} tensors still on CPU: "
+              f"{left[:6]}", flush=True)
+    else:
+        print("[place_cache] all layer state on accelerator devices",
+              flush=True)
 
 
 def dumps(obj: KVObject) -> bytes:

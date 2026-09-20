@@ -67,6 +67,13 @@ class Worker:
         first = next(self.model.parameters())
         self.device = first.device
         print(f"  first-layer device is {self.device}", flush=True)
+        dm = getattr(self.model, "hf_device_map", None)
+        if dm:
+            hits = [k for k in dm if k.endswith("layers.0")]
+            print(f"  device_map: {len(dm)} entries, layers.0 -> {hits}, "
+                  f"sample: {list(dm.items())[:2]}", flush=True)
+        else:
+            print("  device_map: NONE (single-device fallback)", flush=True)
 
     def _make_cache(self, repr_name):
         if repr_name not in self._factories:
@@ -110,6 +117,13 @@ class Worker:
             t1 = time.time()
             out = self.model(input_ids=ids.to(self.device),
                              past_key_values=cache, use_cache=True)
+            if out.past_key_values is not cache:
+                # hybrid models may wrap the passed cache into their own
+                # class inside forward — if so, our inject/place targeted
+                # a different object than the model actually reads
+                print(f"[{wid}] NOTE model replaced cache object in "
+                      f"forward: {type(cache).__name__} -> "
+                      f"{type(out.past_key_values).__name__}", flush=True)
             cache = out.past_key_values
             prefill_s = time.time() - t1
             print(f"[{wid}] turn {session}:{turn} prefilled "
