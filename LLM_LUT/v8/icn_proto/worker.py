@@ -207,7 +207,14 @@ class Worker:
                         hdr.get("decode_steps", 0),
                         hdr.get("repr")))
                 except Exception as exc:  # noqa: BLE001 - report, don't die
-                    hdr_out.update({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+                    import traceback
+                    tb = traceback.format_exc()
+                    print(f"[{self.args.worker_id}] turn "
+                          f"{hdr.get('session')}:{hdr.get('turn')} FAILED\n"
+                          f"{tb}", flush=True)
+                    hdr_out.update({"ok": False,
+                                    "error": f"{type(exc).__name__}: {exc}",
+                                    "traceback": tb})
                 msg.send(sock, hdr_out)
                 self.report_status(sock)
                 continue
