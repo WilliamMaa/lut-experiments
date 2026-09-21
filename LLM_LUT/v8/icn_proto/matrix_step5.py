@@ -75,6 +75,8 @@ def run_cell(args, share, pol, rep, port):
            "--gpu-pool", args.gpu_pool,
            "--gpus-per-worker", str(args.gpus_per_worker),
            "--model-path", args.model_path]
+    if args.budget_mb > 0:
+        cmd += ["--worker-mem-budget-mb", str(args.budget_mb)]
     t0 = time.time()
     proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     path = newest_json(t0 - 5, proc.stdout)
@@ -141,6 +143,9 @@ def main():
     ap.add_argument("--port-base", type=int, default=5700)
     ap.add_argument("--slo-s", type=float, default=2.0,
                     help="per-turn latency SLO for attainment")
+    ap.add_argument("--budget-mb", type=float, default=0.0,
+                    help="per-worker residency budget passed through to "
+                         "run_cluster --worker-mem-budget-mb (0 = off)")
     ap.add_argument("--manifest", default=os.path.join(
         RESULTS, "matrix_step5_manifest.json"))
     ap.add_argument("--drop-bad", action="store_true",

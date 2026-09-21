@@ -9,7 +9,8 @@ Covered:
                  a segment with no complete resident holder is skipped
   eviction       coldest tip evicted; ancestors shared with a hotter
                  resident tip protected; exclusive cold segments fully
-                 dropped; busy/in-flight workers untouched
+                 dropped; busy/in-flight workers untouched; policy-shared
+                 (b3 evicts too) with optimistic byte accounting
   delivered      a replication delivery lands in target residency and
                  counters without touching worker busy state
 
@@ -155,6 +156,28 @@ def test_eviction():
     check("in-flight worker untouched", s2._plan_evict() == [])
 
 
+def test_eviction_shared_substrate():
+    """Eviction under a memory budget is a SHARED substrate: b3 (reactive
+    only, no replication) must also evict when over budget — guards the
+    v2 change that removed the ours-only policy gate. Also guards the
+    optimistic byte accounting in _apply_evict: without it the next
+    control cycle re-evicts against the stale pre-ack byte count."""
+    print("eviction is policy-shared + optimistic bytes:")
+    turn = doc_turn()
+    s = make_sched("b3", worker_mem_budget_mb=48.0)
+    w0 = s.workers[b"w0"]
+    _, names = hold(s, w0, turn)
+    total = sum(s.dir[n]["bytes"] for n in names)
+    w0.resident_bytes = 48e6 + total
+    plan = s._plan_evict()
+    check("b3 evicts under budget", len(plan) == 1, f"n={len(plan)}")
+    nbytes = sum(s.dir.get(n, {}).get("bytes", 0) for n in plan[0]["names"])
+    s._apply_evict(None, plan)
+    check("optimistic byte accounting",
+          w0.resident_bytes == 48e6, f"{w0.resident_bytes}")
+    check("no double eviction next cycle", s._plan_evict() == [])
+
+
 def test_delivered_repl():
     print("replication delivery:")
     turn = doc_turn()
@@ -251,6 +274,7 @@ def test_repl_ack_not_swallowed():
 def main():
     test_repl_gating()
     test_eviction()
+    test_eviction_shared_substrate()
     test_delivered_repl()
     test_delivered_updates_residency()
     test_repl_ack_not_swallowed()

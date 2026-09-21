@@ -449,8 +449,11 @@ class Scheduler:
         budget = self.args.worker_mem_budget_mb * 1e6
         if budget <= 0:
             return []
-        if self.args.policy not in ("ours", "p2"):
-            return []
+        # Eviction is a SHARED substrate, not our novelty: under a
+        # memory budget every policy must respect, all of them drop
+        # coldest segments (b0-b3 degrade; ours additionally
+        # replicates, gated by G_rep). The policy gate lives in
+        # _plan_repl only.
         inflight = self._inflight()
         actions = []
         for w in self.workers.values():
@@ -510,13 +513,19 @@ class Scheduler:
             if sock is not None:
                 msg.send(sock, {"type": "evict", "names": a["names"]},
                          ident=w.ident)
+            nbytes = sum(self.dir.get(n, {}).get("bytes", 0)
+                         for n in a["names"])
             for n in a["names"]:
                 w.resident.discard(n)
                 w.tips.discard(n)
+            # Optimistic accounting: the worker's status ack lags one
+            # cycle, so without this the controller re-plans eviction
+            # against a stale (still-full) byte count and the next
+            # cycle evicts the next-coldest segment needlessly.
+            w.resident_bytes = max(0, w.resident_bytes - nbytes)
             self.evictions += 1
             self.evicted_blocks += len(a["names"])
-            self.evicted_bytes += sum(self.dir.get(n, {}).get("bytes", 0)
-                                      for n in a["names"])
+            self.evicted_bytes += nbytes
             print(f"[ctl  ] evict {len(a['names'])} blocks from "
                   f"{w.ident.decode()}", flush=True)
 
@@ -524,8 +533,9 @@ class Scheduler:
         """G_rep(p, j) = λ̂_p · ΔC_future − C_copy − C_memory > 0 (05 v3 §1).
         ΔC_future (per-hit critical-path saving) and C_copy are both the
         transfer time nbytes/xfer_rate in this prototype; C_memory is a
-        per-byte price (--repl-mem-price, 0 by default) plus a hard skip
-        when the target is at its residency budget. v1 of spatial demand:
+        per-byte price (--repl-mem-price, 0 by default); there is no
+        hard residency-budget skip — under pressure _plan_evict frees
+        space for the copy. v1 of spatial demand:
         any worker NOT holding the segment is a candidate (requests land
         on whichever worker a turn is dispatched to), and the least
         loaded holder is the copy source."""
@@ -533,7 +543,6 @@ class Scheduler:
             return []
         if self.args.policy not in ("ours", "p2"):
             return []
-        budget = self.args.worker_mem_budget_mb * 1e6
         pool = self._block_pool()
         inflight = self._inflight()
         actions = []
@@ -564,8 +573,9 @@ class Scheduler:
                     return actions
                 if w in holders:
                     continue
-                if budget > 0 and w.resident_bytes + nbytes > budget:
-                    continue
+                # No hard budget guard here: under pressure _plan_evict
+                # frees space every cycle, so replication is how a hot
+                # segment survives eviction on the holder's worker.
                 if (tip, w.ident) in self._repl_cool:
                     continue
                 if any(t == w.ident and set(names) <= set(ns)
