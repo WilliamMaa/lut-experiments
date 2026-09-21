@@ -30,10 +30,16 @@ def main():
     for r in rows:
         if r.get("json"):
             seen[r["json"]] = seen.get(r["json"], 0) + 1
-    bad = [r for r in rows
-           if not r.get("json") or r.get("rc") not in (0, None)
-           or r.get("failed") not in (0, None)
-           or (r.get("json") and seen[r["json"]] > 1)]
+    claimed = set()
+    bad = []
+    for r in rows:
+        dup = r.get("json") and seen[r["json"]] > 1
+        if dup and r["json"] not in claimed:
+            claimed.add(r["json"])      # first owner = the real run
+            continue
+        if dup or not r.get("json") or r.get("rc") not in (0, None) \
+                or r.get("failed") not in (0, None):
+            bad.append(r)
     if not bad:
         print("manifest clean: no bad cells")
         return

@@ -840,7 +840,12 @@ class Scheduler:
                     return
                 self._repl.pop(rid, None)
                 self.replications += 1
-                xfer["bytes"] = xfer.get("bytes", len(payload))
+                # fetched normally recorded wire bytes; the worker's
+                # delivered ack carries NO payload, so never call
+                # len(payload) here (the default would be evaluated
+                # eagerly and crash on None)
+                if xfer.get("bytes") is None:
+                    xfer["bytes"] = len(payload) if payload is not None else 0
                 self.replicated_bytes += xfer["bytes"]
                 xfer_s = time.time() - xfer["t"]
                 if xfer_s > 0:

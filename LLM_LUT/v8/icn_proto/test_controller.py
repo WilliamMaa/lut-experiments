@@ -172,10 +172,12 @@ def test_delivered_repl():
                  {"type": "fetched", "ok": True, "names": names},
                  payload=b"y" * 50)
     check("fetch ack advanced stage", s._repl[rid]["stage"] == "deliver")
-    # target stores the payload and acks; no turn may run
+    # target stores the payload and acks; no turn may run. The worker's
+    # delivered ack carries NO payload (production shape — regression
+    # for the len(None) crash of run 20260921 matrix cells)
     s.on_message(None, b"w1",
                  {"type": "delivered", "names": names, "repl": rid},
-                 payload=b"x" * 100)
+                 payload=None)
     w1 = s.workers[b"w1"]
     check("blocks resident on target", all(n in w1.resident for n in names))
     check("tip registered on target", tip in w1.tips)

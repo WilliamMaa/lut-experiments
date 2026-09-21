@@ -46,7 +46,14 @@ def pctl(xs, q):
     return xs[min(len(xs) - 1, int(round(q * (len(xs) - 1))))]
 
 
-def newest_json(after):
+def newest_json(after, stdout):
+    """The scheduler prints 'summary -> <path>'; trust that, fall back
+    to mtime only if the line is missing."""
+    for line in reversed((stdout or "").splitlines()):
+        if "summary ->" in line:
+            p = line.split("summary ->", 1)[1].strip()
+            if os.path.exists(p):
+                return p
     files = [f for f in glob.glob(os.path.join(RESULTS, "blkcluster_*.json"))
              if os.path.getmtime(f) > after]
     return max(files, key=os.path.getmtime) if files else None
@@ -70,7 +77,7 @@ def run_cell(args, share, pol, rep, port):
            "--model-path", args.model_path]
     t0 = time.time()
     proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
-    path = newest_json(t0 - 5)
+    path = newest_json(t0 - 5, proc.stdout)
     row = {"share": share, "policy": pol, "rep": rep,
            "rc": proc.returncode, "cell_s": round(time.time() - t0, 1),
            "json": path}
@@ -153,10 +160,20 @@ def main():
                 seen[r["json"]] = seen.get(r["json"], 0) + 1
         keep, drop = [], []
         for r in rows:
-            bad = (not r.get("json") or r.get("rc") not in (0, None)
-                   or r.get("failed") not in (0, None)
-                   or (r.get("json") and seen[r["json"]] > 1))
-            (drop if bad else keep).append(r)
+            dup = r.get("json") and seen[r["json"]] > 1
+            if dup:
+                # the earliest row owning this JSON is the real run;
+                # later rows matched it mtime-only after crashing
+                if r["json"] not in [k.get("json") for k in keep]:
+                    keep.append(r)
+                    continue
+                drop.append(r)
+                continue
+            if (not r.get("json") or r.get("rc") not in (0, None)
+                    or r.get("failed") not in (0, None)):
+                drop.append(r)
+                continue
+            keep.append(r)
         with open(args.manifest, "w", encoding="utf-8") as f:
             json.dump(keep, f, indent=1)
         print(f"dropped {len(drop)} bad row(s):")
