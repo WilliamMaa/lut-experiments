@@ -18,8 +18,9 @@ import sys
 
 METRICS = ("wall_s", "throughput_rps", "hit_rate", "resumed",
            "new_tokens_processed", "published_blocks", "transfers",
-           "transfer_bytes", "avg_latency_s", "failed", "prefill_rate",
-           "xfer_rate")
+           "transfer_bytes", "replications", "replicated_bytes",
+           "evictions", "evicted_blocks",
+           "avg_latency_s", "failed", "prefill_rate", "xfer_rate")
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -50,12 +51,15 @@ def main():
         runs.append(row)
 
     hdr = f"{'policy':<7}{'wall_s':>8}{'rps':>8}{'hit':>7}{'resumed':>9}" \
-          f"{'new_tok':>9}{'xfer':>6}{'xfer_MB':>9}{'lat_s':>8}{'fail':>6}"
+          f"{'new_tok':>9}{'xfer':>6}{'xfer_MB':>9}{'repl':>5}{'repl_MB':>9}" \
+          f"{'evict':>6}{'lat_s':>8}{'fail':>6}"
     print(hdr)
     for r in runs:
         print(f"{r['policy']:<7}{r['wall_s']:>8}{r['throughput_rps']:>8}"
               f"{r['hit_rate']:>7}{r['resumed']:>9}{r['new_tokens_processed']:>9}"
-              f"{r['transfers']:>6}{r['transfer_bytes'] / 1e6:>9.1f}"
+              f"{r['transfers']:>6}{(r['transfer_bytes'] or 0) / 1e6:>9.1f}"
+              f"{r['replications'] or 0:>5}{(r['replicated_bytes'] or 0) / 1e6:>9.1f}"
+              f"{r['evictions'] or 0:>6}"
               f"{r['avg_latency_s']:>8}{r['failed']:>6}  {r['stamp']}")
 
     # latest run per policy: the b0-vs-ours compute saving headline

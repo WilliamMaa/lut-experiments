@@ -8,6 +8,9 @@ Protocol (docs/icn-defined-addressing/05-request-lifecycle.md v3 §2):
           {type: fetched, ok: bool, names: [...]} + torch-save payload
           of the KVBlockObj list (order = names order)
   deliver (payload = torch-save of KVBlockObj list)    # blocks to store
+  evict   {names: [...]}                               # drop from residency
+          (placement controller's symmetric criterion; the worker's
+          following status is the implicit ack)
   assign  {request_id, session, turn,
            resume_names: [...],    # contiguous block chain [0, E) to inject
            new_block_names: [...], # chain blocks the worker should publish
@@ -277,6 +280,14 @@ class Worker:
                       flush=True)
                 msg.send(sock, {"type": "delivered",
                                 "names": [str(o.name) for o in objs]})
+                self.report_status(sock)
+                continue
+            if mtype == "evict":
+                gone = [self.resident.pop(n) for n in hdr.get("names", [])
+                        if n in self.resident]
+                print(f"[{self.args.worker_id}] evicted {len(gone)} blocks "
+                      f"({sum(o.nbytes() for o in gone) / 1e6:.1f}MB)",
+                      flush=True)
                 self.report_status(sock)
                 continue
             if mtype == "assign":

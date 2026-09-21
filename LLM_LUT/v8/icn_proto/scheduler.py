@@ -12,6 +12,9 @@ Per turn:
   Dispatch  fetch blocks (bundle) -> deliver -> assign
   Publish worker extracts chain blocks it does not yet hold; the last
           block of every batch carries the GDN linear checkpoint
+  Slow    placement controller (05 v3 §3, 'ours' only): proactive
+          segment replication under the G_rep economic trigger, plus
+          coldest-segment eviction under a per-worker memory budget
 
 Run (spawned by run_cluster.py, which also starts the workers):
     python -m icn_proto.run_cluster --sessions 16 ...
@@ -29,7 +32,7 @@ import zmq
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from icn_proto import msg
-from icn_proto.blkchain import chain_through, derive_chain
+from icn_proto.blkchain import GENESIS, BlockName, chain_through, derive_chain
 
 TRACE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                      "data", "multi_turn_prompts_v3.jsonl")
@@ -153,6 +156,18 @@ class Scheduler:
         self.t_start = time.time()
         self.done_sessions = 0
         self._xfer = {}
+        # Placement controller (slow path, 05 v3 §3): proactive segment
+        # replication + eviction. Replication transfers ride the same
+        # fetch/deliver data plane as demand fetches but live in their
+        # own table (no turn, no busy flag).
+        self._repl = {}
+        self._repl_seq = 0
+        self._repl_cool = {}        # (tip, target_ident) -> cooldown expiry
+        self.replications = 0
+        self.replicated_bytes = 0
+        self.evictions = 0
+        self.evicted_blocks = 0
+        self.evicted_bytes = 0
         self.prefill_rate = self.PREFILL_RATE0
         self.xfer_rate = self.XFER_RATE0
 
@@ -365,6 +380,208 @@ class Scheduler:
         _, ident, e, fetch, decision = best
         return ident, e, fetch, decision
 
+    # ---- Placement controller (slow path, 05 v3 §3) ------------------------
+
+    def controller(self, sock):
+        """Event-driven slow path, runs after every result; 'ours' only
+        (b3 stays pure reactive — that contrast IS the step-4 claim).
+        Plans are pure (_plan_*); _apply_* mutates scheduler state and,
+        when sock is given, sends the corresponding messages."""
+        if self.args.policy not in ("ours", "p2"):
+            return
+        self._apply_evict(sock, self._plan_evict())
+        # replication plans see post-eviction residency
+        self._apply_repl(sock, self._plan_repl())
+
+    @staticmethod
+    def _chain_names(tip_name, pool):
+        """Ancestors of a tip block derived from NAMES ALONE by walking
+        parent_hash links (blkchain §1). `pool` maps block_hash -> name
+        over every known block (directory + all workers' residency).
+        Returns None when the chain is broken below the tip — a partial
+        segment cannot be replicated or resumed, so callers skip it."""
+        names = []
+        cur = tip_name
+        for _ in range(1_000_000):
+            try:
+                bn = BlockName.parse(cur)
+            except ValueError:
+                return None
+            if bn.parent_hash == GENESIS or bn.span_start == 0:
+                return names
+            nxt = pool.get(bn.parent_hash)
+            if nxt is None:
+                return None
+            names.append(nxt)
+            cur = nxt
+        return None
+
+    def _block_pool(self):
+        pool = {}
+        for n in list(self.dir) + [n for w in self.workers.values()
+                                   for n in w.resident]:
+            try:
+                pool.setdefault(BlockName.parse(n).block_hash, n)
+            except ValueError:
+                continue
+        return pool
+
+    def _inflight(self):
+        """Names currently riding the wire (demand + replication)."""
+        out = []
+        for x in list(self._xfer.values()) + list(self._repl.values()):
+            out.append((x.get("holder"), x.get("target"), x["names"]))
+        return out
+
+    def _plan_evict(self):
+        """Symmetric criterion of G_rep (05 v3 §3): drop the coldest
+        resident segments until a worker is back under its memory
+        budget. Ancestors shared with any hotter resident tip are
+        protected (segments are the placement unit, not blocks)."""
+        budget = self.args.worker_mem_budget_mb * 1e6
+        if budget <= 0:
+            return []
+        if self.args.policy not in ("ours", "p2"):
+            return []
+        inflight = self._inflight()
+        actions = []
+        for w in self.workers.values():
+            if w.busy or w.resident_bytes <= budget:
+                continue
+            if any(h == w.ident or t == w.ident
+                   for h, t, _ in inflight):
+                continue
+            excess = w.resident_bytes - budget
+            pool = {}
+            for n in w.resident:
+                try:
+                    pool.setdefault(BlockName.parse(n).block_hash, n)
+                except ValueError:
+                    continue
+            # Protection is counted per BLOCK over every resident tip's
+            # FULL resume set (ancestors + tip): a tip block that is also
+            # an interior chain block of a hotter tip (block-aligned
+            # tips) is infrastructure and must survive.
+            fulls, counts = {}, {}
+            broken = False
+            for tip in w.tips:
+                c = self._chain_names(tip, pool)
+                if c is None:
+                    broken = True
+                    break
+                fulls[tip] = c + [tip]
+                for n in fulls[tip]:
+                    counts[n] = counts.get(n, 0) + 1
+            if broken:
+                continue          # residency state we cannot reason about
+            names, freed = [], 0
+            cold_first = sorted(
+                fulls, key=lambda n: self.dir.get(n, {}).get("lambda", 0.0))
+            for tip in cold_first:
+                if freed >= excess:
+                    break
+                for n in fulls[tip]:
+                    counts[n] -= 1
+                    if counts[n] == 0:
+                        names.append(n)
+                freed += sum(self.dir.get(n, {}).get("bytes", 0)
+                             for n in names)
+            names = list(dict.fromkeys(names))
+            if names:
+                actions.append({"worker": w.ident, "names": names})
+        return actions
+
+    def _apply_evict(self, sock, actions):
+        for a in actions:
+            w = self.workers[a["worker"]]
+            if sock is not None:
+                msg.send(sock, {"type": "evict", "names": a["names"]},
+                         ident=w.ident)
+            for n in a["names"]:
+                w.resident.discard(n)
+                w.tips.discard(n)
+            self.evictions += 1
+            self.evicted_blocks += len(a["names"])
+            self.evicted_bytes += sum(self.dir.get(n, {}).get("bytes", 0)
+                                      for n in a["names"])
+            print(f"[ctl  ] evict {len(a['names'])} blocks from "
+                  f"{w.ident.decode()}", flush=True)
+
+    def _plan_repl(self):
+        """G_rep(p, j) = λ̂_p · ΔC_future − C_copy − C_memory > 0 (05 v3 §1).
+        ΔC_future (per-hit critical-path saving) and C_copy are both the
+        transfer time nbytes/xfer_rate in this prototype; C_memory is a
+        per-byte price (--repl-mem-price, 0 by default) plus a hard skip
+        when the target is at its residency budget. v1 of spatial demand:
+        any worker NOT holding the segment is a candidate (requests land
+        on whichever worker a turn is dispatched to), and the least
+        loaded holder is the copy source."""
+        if len(self._repl) >= self.args.max_repl_inflight:
+            return []
+        if self.args.policy not in ("ours", "p2"):
+            return []
+        budget = self.args.worker_mem_budget_mb * 1e6
+        pool = self._block_pool()
+        inflight = self._inflight()
+        actions = []
+        hot_first = sorted(
+            self.tips,
+            key=lambda n: -self.dir.get(n, {}).get("lambda", 0.0))
+        for tip in hot_first:
+            e = self.dir.get(tip)
+            if not e or e["lambda"] < self.args.repl_min_lambda:
+                continue
+            chain = self._chain_names(tip, pool)
+            if chain is None:
+                continue
+            names = chain + [tip]
+            if any(n not in self.dir for n in names):
+                continue          # cannot price an unknown block
+            nbytes = sum(self.dir[n]["bytes"] for n in names)
+            holders = [w for w in self.workers.values()
+                       if all(n in w.resident for n in names)]
+            if not holders:
+                continue
+            holders.sort(key=lambda w: w.resident_bytes)
+            delta_c = nbytes / self.xfer_rate
+            g = e["lambda"] * delta_c - delta_c \
+                - nbytes * self.args.repl_mem_price
+            if g <= 0:
+                continue
+            for w in self.workers.values():
+                if len(self._repl) + len(actions) \
+                        >= self.args.max_repl_inflight:
+                    return actions
+                if w in holders:
+                    continue
+                if budget > 0 and w.resident_bytes + nbytes > budget:
+                    continue
+                if (tip, w.ident) in self._repl_cool:
+                    continue
+                if any(t == w.ident and set(names) <= set(ns)
+                       for _, t, ns in inflight):
+                    continue      # demand fetch already delivering it
+                actions.append({"tip": tip, "holder": holders[0].ident,
+                                "target": w.ident, "names": names,
+                                "bytes": nbytes, "g": round(g, 4)})
+        return actions
+
+    def _apply_repl(self, sock, actions):
+        for a in actions:
+            rid = f"repl:{self._repl_seq}"
+            self._repl_seq += 1
+            self._repl[rid] = {"stage": "fetch", "holder": a["holder"],
+                               "target": a["target"], "names": a["names"],
+                               "tip": a["tip"], "t": time.time()}
+            self._repl_cool[(a["tip"], a["target"])] = \
+                time.time() + self.args.repl_cooldown
+            if sock is not None:
+                msg.send(sock, {"type": "fetch", "names": a["names"],
+                                "repl": rid}, ident=a["holder"])
+            print(f"[ctl  ] replicate {len(a['names'])} blocks "
+                  f"{a['holder'].decode()} -> {a['target'].decode()} "
+                  f"tip=...{a['tip'][-40:]} G={a['g']}", flush=True)
+
     # ---- event loop -------------------------------------------------------
 
     def run(self):
@@ -403,10 +620,16 @@ class Scheduler:
                         print(f"[watchdog] xfer {rid} stuck in stage "
                               f"{x['stage']} for {int(now - x['t_fetch'])}s",
                               flush=True)
+                for rid, x in self._repl.items():
+                    if now - x["t"] > 120:
+                        print(f"[watchdog] repl {rid} stuck in stage "
+                              f"{x['stage']} for {int(now - x['t'])}s",
+                              flush=True)
                 if sock not in evts:
                     continue
                 ident, hdr, payload = msg.recv(sock)
                 self.on_message(sock, ident, hdr, payload)
+                self.controller(sock)
         finally:
             for w in self.workers.values():
                 msg.send(sock, {"type": "shutdown"}, ident=w.ident)
@@ -542,12 +765,9 @@ class Scheduler:
             return
         if mtype == "fetched":
             # pair by holder + names: two sessions may fetch the SAME
-            # blocks to different targets concurrently
-            rid, xfer = next(
-                ((r, x) for r, x in self._xfer.items()
-                 if x["stage"] == "fetch"
-                 and x["holder"] == ident
-                 and x["names"] == hdr.get("names")), (None, None))
+            # blocks to different targets concurrently. Demand fetches
+            # (a waiting turn) take priority over controller replications.
+            rid, xfer, kind = self._pair_fetch(ident, hdr.get("names"))
             if not xfer:
                 print(f"[xfer ] WARN fetched with no matching xfer from "
                       f"{ident.decode()}: ok={hdr.get('ok')} "
@@ -556,13 +776,29 @@ class Scheduler:
             if hdr.get("ok"):
                 xfer["stage"] = "deliver"
                 xfer["bytes"] = len(payload)
-                print(f"[xfer ] {rid} fetched {xfer['bytes']/1e6:.1f}MB "
-                      f"from {ident.decode()} in "
-                      f"{time.time() - xfer['t_fetch']:.2f}s", flush=True)
-                msg.send(sock, {"type": "deliver"}, payload=payload,
-                         ident=xfer["target"])
+                if kind == "repl":
+                    xfer_s = time.time() - xfer["t"]
+                    print(f"[ctl  ] {rid} fetched {xfer['bytes']/1e6:.1f}MB "
+                          f"from {ident.decode()} in {xfer_s:.2f}s",
+                          flush=True)
+                    msg.send(sock, {"type": "deliver", "repl": rid},
+                             payload=payload, ident=xfer["target"])
+                else:
+                    print(f"[xfer ] {rid} fetched {xfer['bytes']/1e6:.1f}MB "
+                          f"from {ident.decode()} in "
+                          f"{time.time() - xfer['t_fetch']:.2f}s", flush=True)
+                    msg.send(sock, {"type": "deliver"}, payload=payload,
+                             ident=xfer["target"])
             else:
-                # holder lost blocks: degrade to the local boundary
+                # holder lost blocks: demand degrades to the local
+                # boundary; a failed replication just aborts (zero-replica
+                # is legal — identity survives via re-derivation)
+                if kind == "repl":
+                    print(f"[ctl  ] {rid} replication FAILED (missing "
+                          f"{len(hdr.get('missing') or [])}), abort",
+                          flush=True)
+                    self._repl.pop(rid, None)
+                    return
                 print(f"[xfer ] {rid} fetch FAILED (missing "
                       f"{len(hdr.get('missing') or [])}), degrade to "
                       f"E_loc={xfer['E_loc']}", flush=True)
@@ -571,30 +807,65 @@ class Scheduler:
                 self.send_assign(sock, xfer["target"], turn, xfer["E_loc"])
             return
         if mtype == "delivered":
-            # pair by target worker: concurrent transfers to different
-            # workers must not cross
-            rid, xfer = next(
-                ((r, x) for r, x in self._xfer.items()
+            # pair by target + names: demand fetches and controller
+            # replications can be in flight to the SAME worker
+            names = hdr.get("names") or []
+            rid, xfer, kind = next(
+                ((r, x, "demand") for r, x in self._xfer.items()
                  if x["stage"] == "deliver"
-                 and x["target"] == ident), (None, None))
-            if xfer:
-                self._xfer.pop(rid, None)
-                self.transfer_bytes += xfer["bytes"]
-                self.transfers += 1
-                xfer_s = time.time() - xfer["t_fetch"]
+                 and x["target"] == ident and x["names"] == names),
+                (None, None, None))
+            if not xfer and hdr.get("repl"):
+                rid = hdr["repl"]
+                xfer = self._repl.get(rid)
+                kind = "repl" if xfer else None
+            if not xfer:
+                return
+            if kind == "repl":
+                self._repl.pop(rid, None)
+                self.replications += 1
+                xfer["bytes"] = xfer.get("bytes", len(payload))
+                self.replicated_bytes += xfer["bytes"]
+                xfer_s = time.time() - xfer["t"]
                 if xfer_s > 0:
                     self.xfer_rate = (0.7 * self.xfer_rate
                                       + 0.3 * xfer["bytes"] / xfer_s)
-                print(f"[xfer ] {rid} delivered to {ident.decode()}, "
-                      f"assign E={self._tip_end(xfer['names'][-1])}",
-                      flush=True)
-                e = self._tip_end(xfer["names"][-1])
-                self.send_assign(sock, xfer["target"], xfer["turn"], e,
-                                 xfer_names=xfer["names"],
-                                 xfer_bytes=xfer.get("bytes", 0),
-                                 xfer_s=xfer_s,
-                                 decision=xfer.get("decision"))
+                w = self.workers[xfer["target"]]
+                w.resident |= set(xfer["names"])
+                w.tips.add(xfer["tip"])
+                print(f"[ctl  ] {rid} delivered to {ident.decode()} "
+                      f"({xfer['bytes']/1e6:.1f}MB in {xfer_s:.2f}s), "
+                      f"tip now resident", flush=True)
+                return
+            self._xfer.pop(rid, None)
+            self.transfer_bytes += xfer["bytes"]
+            self.transfers += 1
+            xfer_s = time.time() - xfer["t_fetch"]
+            if xfer_s > 0:
+                self.xfer_rate = (0.7 * self.xfer_rate
+                                  + 0.3 * xfer["bytes"] / xfer_s)
+            print(f"[xfer ] {rid} delivered to {ident.decode()}, "
+                  f"assign E={self._tip_end(xfer['names'][-1])}",
+                  flush=True)
+            e = self._tip_end(xfer["names"][-1])
+            self.send_assign(sock, xfer["target"], xfer["turn"], e,
+                             xfer_names=xfer["names"],
+                             xfer_bytes=xfer.get("bytes", 0),
+                             xfer_s=xfer_s,
+                             decision=xfer.get("decision"))
             return
+
+    def _pair_fetch(self, holder, names):
+        """A holder's fetched reply can serve a demand fetch or a
+        controller replication; demand wins (a turn is waiting)."""
+        for table, kind in ((self._xfer, "demand"), (self._repl, "repl")):
+            hit = next(
+                ((r, x) for r, x in table.items()
+                 if x["stage"] == "fetch" and x["holder"] == holder
+                 and x["names"] == names), (None, None))
+            if hit[0] is not None:
+                return hit[0], hit[1], kind
+        return None, None, None
 
     @staticmethod
     def _tip_end(name):
@@ -651,6 +922,11 @@ class Scheduler:
             "published_bytes": published_bytes,
             "transfers": self.transfers,
             "transfer_bytes": self.transfer_bytes,
+            "replications": self.replications,
+            "replicated_bytes": self.replicated_bytes,
+            "evictions": self.evictions,
+            "evicted_blocks": self.evicted_blocks,
+            "evicted_bytes": self.evicted_bytes,
             "avg_latency_s": round(sum(r["latency_s"] for r in ok)
                                    / max(1, len(ok)), 4),
             "workers": workers,
@@ -679,6 +955,8 @@ class Scheduler:
         for k in ("wall_s", "throughput_rps", "hit_rate", "resumed",
                   "new_tokens_processed", "published_blocks",
                   "transfers", "transfer_bytes",
+                  "replications", "replicated_bytes",
+                  "evictions", "evicted_blocks",
                   "avg_latency_s", "failed", "prefill_rate", "xfer_rate"):
             print(f"  {k}: {out[k]}")
         for wid, ws in workers.items():
@@ -708,6 +986,22 @@ def add_args(ap):
     ap.add_argument("--wait-threshold", type=float, default=2.0,
                     help="b2: hold a turn for a busy warm worker while its "
                          "ETA is below this many seconds")
+    ap.add_argument("--worker-mem-budget-mb", type=float, default=0.0,
+                    help="placement controller: per-worker residency budget "
+                         "in MB; 0 (default) disables eviction and the "
+                         "replication memory guard")
+    ap.add_argument("--repl-min-lambda", type=float, default=0.05,
+                    help="placement controller: ignore tips with demand "
+                         "EWMA below this many hits/s")
+    ap.add_argument("--repl-cooldown", type=float, default=15.0,
+                    help="placement controller: seconds before re-attempting "
+                         "the same (tip, target) replication")
+    ap.add_argument("--max-repl-inflight", type=int, default=2,
+                    help="placement controller: cap on concurrent "
+                         "replication transfers")
+    ap.add_argument("--repl-mem-price", type=float, default=0.0,
+                    help="placement controller: C_memory per byte-second in "
+                         "G_rep; 0 = memory is free at prototype scale")
     ap.add_argument("--repr", default="bf16", choices=["bf16"])
     ap.add_argument("--block-tokens", type=int, default=16,
                     help="prefix block length b (05 v3 §1)")
