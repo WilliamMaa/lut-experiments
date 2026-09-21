@@ -133,10 +133,38 @@ def main():
                     help="per-turn latency SLO for attainment")
     ap.add_argument("--manifest", default=os.path.join(
         RESULTS, "matrix_step5_manifest.json"))
+    ap.add_argument("--drop-bad", action="store_true",
+                    help="remove corrupt rows from the manifest (rc!=0, "
+                         "no JSON, failed>0, or a JSON path shared by "
+                         "multiple rows) and exit — then rerun to re-do "
+                         "just those cells")
     args = ap.parse_args()
 
     shares = [int(x) for x in args.shares.split(",") if x.strip()]
     policies = [x.strip() for x in args.policies.split(",") if x.strip()]
+
+    if args.drop_bad:
+        if not os.path.exists(args.manifest):
+            sys.exit("no manifest to clean")
+        rows = json.load(open(args.manifest, encoding="utf-8"))
+        seen = {}
+        for r in rows:
+            if r.get("json"):
+                seen[r["json"]] = seen.get(r["json"], 0) + 1
+        keep, drop = [], []
+        for r in rows:
+            bad = (not r.get("json") or r.get("rc") not in (0, None)
+                   or r.get("failed") not in (0, None)
+                   or (r.get("json") and seen[r["json"]] > 1))
+            (drop if bad else keep).append(r)
+        with open(args.manifest, "w", encoding="utf-8") as f:
+            json.dump(keep, f, indent=1)
+        print(f"dropped {len(drop)} bad row(s):")
+        for r in drop:
+            print(f"  share={r['share']} policy={r['policy']} rep={r['rep']} "
+                  f"rc={r.get('rc')} json={os.path.basename(r.get('json') or '?')}")
+        return
+
     cells = [(sh, pol, rep) for sh in shares for pol in policies
              for rep in range(args.reps)]
     os.makedirs(RESULTS, exist_ok=True)
