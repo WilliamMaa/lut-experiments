@@ -350,6 +350,15 @@ class Scheduler:
                 for t_pos in reversed(cand):
                     need = [n for n in self.resume_names(turn, t_pos)
                             if n not in w.resident]
+                    if not need:
+                        # the whole resume set (tip block included) is
+                        # already resident — a FREE extension, not a
+                        # fetch. An empty `need` would also make the
+                        # all(...) holder check vacuous and ship a
+                        # zero-block fetch that crashes the deliver
+                        # path (share=8/ours/budget=48 crash, 20260922)
+                        e_max = t_pos
+                        break
                     holders = [x for x in self.workers.values()
                                if x is not w and all(n in x.resident
                                                      for n in need)]
@@ -368,8 +377,14 @@ class Scheduler:
                 cost += fetch_bytes / self.xfer_rate
             eta = self.eta(w)   # expected finish of the in-flight turn
             cost += eta
-            mode = ("local" if e_max == e_loc and e_loc > 0
-                    else "fetch" if fetch else "fresh")
+            if e_max == e_loc and e_loc > 0:
+                mode = "local"
+            elif fetch:
+                mode = "fetch"
+            elif e_max > 0:
+                mode = "local"      # free extension over resident blocks
+            else:
+                mode = "fresh"
             costs[w.ident.decode()] = {
                 "mode": mode, "E": e_max, "fresh": fresh,
                 "eta_s": round(eta, 4), "rate": round(rate, 1),
@@ -932,6 +947,15 @@ class Scheduler:
                 self._xfer.pop(rid, None)
                 self.transfer_bytes += xfer["bytes"]
                 self.transfers += 1
+                if not xfer["names"]:
+                    # zero-block fetch (only possible via a stale plan):
+                    # nothing was delivered — degrade to the local
+                    # boundary instead of indexing into an empty list
+                    print(f"[xfer ] {rid} empty delivery, degrade to "
+                          f"E_loc={xfer['E_loc']}", flush=True)
+                    self.send_assign(sock, xfer["target"], xfer["turn"],
+                                     xfer["E_loc"])
+                    return
                 # the worker stored these blocks the moment deliver
                 # landed — reflect it NOW instead of waiting for the
                 # trailing status; a stale view makes the controller

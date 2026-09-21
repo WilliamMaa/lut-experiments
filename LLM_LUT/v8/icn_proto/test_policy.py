@@ -140,11 +140,43 @@ def test_b3_ours():
         check(f"{pol}: mode fetch", dec["mode"] == "fetch", dec["mode"])
 
 
+def test_free_extension_no_fetch():
+    """Regression (share=8/ours/budget=48 crash, 20260922): a worker can
+    hold EVERY block of a resume set — tip block included — without the
+    tip in w.tips (evicted as a tip while the block survived as shared
+    infrastructure of a hotter segment). match_local then stops below
+    the global tip, and the fetch candidate loop used to see an EMPTY
+    `need`, pass the vacuous all(...) holder check, and ship a
+    zero-block fetch that crashed the deliver path (names[-1] on []).
+    Correct behaviour: a free local extension, no fetch."""
+    print("free extension over resident blocks:")
+    s = make_sched("ours")
+    turn = doc_turn()
+    w0, w1 = s.workers[b"w0"], s.workers[b"w1"]
+    w1.busy = True
+    w1.t_assign = 0.0
+    w1.cur_plan = {"prefill_tokens": 10 ** 6, "decode_steps": 0}
+    warm_with(s, w1, turn, N_TOK)          # global tip at 1024 lives on w1
+    warm_with(s, w0, turn, N_TOK // 2)     # w0's own tip stops at 512
+    # the eviction shape: w0 keeps every block up to 1024 (incl. the tip
+    # block) but has lost the 1024 tip from its tip set
+    for n in s.resume_names(turn, N_TOK):
+        w0.resident.add(n)
+    w0.tips.discard(turn.tip_name_at(N_TOK, "bf16", BLOCK))
+    out = s.choose(turn)
+    check("chooses w0", out is not None and out[0] == b"w0")
+    _, e, fetch, dec = out
+    check("extends to chain end", e == N_TOK, f"E={e}")
+    check("no zero-block fetch", fetch is None, str(fetch))
+    check("mode local (free extension)", dec["mode"] == "local", dec["mode"])
+
+
 def main():
     test_b0()
     test_b1()
     test_b2()
     test_b3_ours()
+    test_free_extension_no_fetch()
     print("test_policy: ALL PASS")
 
 
