@@ -81,6 +81,7 @@ def run_cell(args, share, pol, rep, port):
     proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
     path = newest_json(t0 - 5, proc.stdout)
     row = {"share": share, "policy": pol, "rep": rep,
+           "budget_mb": args.budget_mb,
            "rc": proc.returncode, "cell_s": round(time.time() - t0, 1),
            "json": path,
            # keep the tail on every cell: crashes that still match an
@@ -105,16 +106,21 @@ def aggregate(rows, slo_s):
     groups = {}
     for r in rows:
         if r.get("json") and r.get("failed") == 0:
-            groups.setdefault((r["share"], r["policy"]), []).append(r)
-    print(f"\n{'share':>6} {'policy':<7}{'runs':>5}{'rps':>8}{'hit':>7}"
-          f"{'new_tok':>9}{'xfer':>6}{'repl':>6}{'p50':>8}{'p95':>8}"
+            groups.setdefault((r.get("budget_mb", 0.0), r["share"],
+                               r["policy"]), []).append(r)
+    print(f"\n{'budget':>7} {'share':>6} {'policy':<7}{'runs':>5}{'rps':>8}"
+          f"{'hit':>7}"
+          f"{'new_tok':>9}{'xfer':>6}{'repl':>6}{'evict':>7}{'p50':>8}"
+          f"{'p95':>8}"
           f"{'SLO@' + str(slo_s) + 's':>9}{'wall':>8}")
-    for (share, pol), rs in sorted(groups.items()):
+    for (budget, share, pol), rs in sorted(groups.items()):
         def m(k):
             return statistics.mean(r[k] for r in rs)
-        print(f"{share:>6} {pol:<7}{len(rs):>5}{m('throughput_rps'):>8.4f}"
+        print(f"{budget:>7.0f} {share:>6} {pol:<7}{len(rs):>5}"
+              f"{m('throughput_rps'):>8.4f}"
               f"{m('hit_rate'):>7.3f}{m('new_tokens_processed'):>9.0f}"
               f"{m('transfers'):>6.1f}{m('replications'):>6.1f}"
+              f"{m('evictions'):>7.1f}"
               f"{m('p50_s'):>8.3f}{m('p95_s'):>8.3f}{m('slo_att'):>9.3f}"
               f"{m('wall_s'):>8.1f}")
     bad = [r for r in rows if not r.get("json") or r.get("failed")]
@@ -200,10 +206,13 @@ def main():
             print(f"resuming: {len(rows)} cell(s) already in manifest")
         except json.JSONDecodeError:
             pass
-    done = {(r["share"], r["policy"], r["rep"]) for r in rows}
+    # budget is part of the cell key: a v2 (budget>0) run must not
+    # inherit v1 (budget=0) cells from the manifest
+    done = {(r.get("budget_mb", 0.0), r["share"], r["policy"], r["rep"])
+            for r in rows}
 
     for i, (sh, pol, rep) in enumerate(cells):
-        if (sh, pol, rep) in done:
+        if (args.budget_mb, sh, pol, rep) in done:
             continue
         print(f"=== cell share={sh} policy={pol} rep={rep} "
               f"({len(done) + 1}/{len(cells)}) ===", flush=True)
