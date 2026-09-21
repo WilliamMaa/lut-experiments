@@ -34,6 +34,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from icn_proto import msg
 from icn_proto.blkchain import GENESIS, BlockName, chain_through, derive_chain
 
+STALL_S = 300.0   # watchdog hard-fail: max seconds a worker may stall
+
 TRACE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                      "data", "multi_turn_prompts_v3.jsonl")
 
@@ -654,6 +656,7 @@ class Scheduler:
                         print(f"[watchdog] repl {rid} stuck in stage "
                               f"{x['stage']} for {int(now - x['t'])}s",
                               flush=True)
+                self._watchdog_fail(sock, now)
                 if sock not in evts:
                     continue
                 ident, hdr, payload = msg.recv(sock)
@@ -666,6 +669,50 @@ class Scheduler:
             sock.close()
             ctx.term()
         return self.summary()
+
+    def _watchdog_fail(self, sock, now):
+        """Last-resort liveness (the 120/180s loops above only print).
+        After STALL_S seconds a wedged worker or a lost ack is FAILED:
+        the turn records ok=False, the session advances, and the cell
+        finishes with failed>0 — the matrix marks it BAD and moves on
+        instead of hanging until the cell timeout. Late results for an
+        already-failed turn are discarded by the wd_failed guard."""
+        for w in self.workers.values():
+            if not w.busy or now - w.t_assign <= STALL_S:
+                continue
+            rid = w.current
+            if rid is None:
+                # busy in a demand fetch/deliver (no turn assigned yet):
+                # degrade to the pre-fetch local boundary, exactly like
+                # a fetch-failed ack does
+                for xrid, x in list(self._xfer.items()):
+                    if x["target"] == w.ident:
+                        print(f"[watchdog] xfer {xrid} stalled, degrade "
+                              f"to E_loc={x['E_loc']}", flush=True)
+                        self._xfer.pop(xrid, None)
+                        self.send_assign(sock, x["target"], x["turn"],
+                                         x["E_loc"])
+                continue
+            print(f"[watchdog] turn {rid} stuck on {w.ident.decode()} "
+                  f"for {int(now - w.t_assign)}s — failing", flush=True)
+            w.busy = False
+            w.current = None
+            w.cur_plan = None
+            rec = next((r for r in reversed(self.records)
+                        if r["request_id"] == rid), None)
+            if rec and "ok" not in rec:
+                rec.update({"ok": False,
+                            "error": "watchdog: worker stall",
+                            "prefill_s": None, "published": []})
+                rec["latency_s"] = round(now - rec.pop("t_assigned"), 4)
+                rec["wd_failed"] = True
+                self.advance(rid)
+        # replications are best-effort: a stuck copy just aborts
+        for rid, x in list(self._repl.items()):
+            if now - x["t"] > STALL_S:
+                print(f"[watchdog] repl {rid} abandoned after "
+                      f"{int(now - x['t'])}s", flush=True)
+                self._repl.pop(rid, None)
 
     def dispatch(self, sock):
         for turn in list(self.ready):
@@ -759,6 +806,13 @@ class Scheduler:
                   f"err={hdr.get('error')}", flush=True)
             rec = next((r for r in reversed(self.records)
                         if r["request_id"] == rid), None)
+            if rec and rec.get("wd_failed"):
+                # the watchdog already failed and advanced this turn; a
+                # late result from a wedged worker only frees the worker
+                w.busy = False
+                w.current = None
+                w.cur_plan = None
+                return
             if rec:
                 rec.update({k: hdr.get(k) for k in
                             ("ok", "resumed", "prefill_s", "decode_s",

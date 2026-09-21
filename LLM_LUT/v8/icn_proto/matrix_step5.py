@@ -78,15 +78,42 @@ def run_cell(args, share, pol, rep, port):
     if args.budget_mb > 0:
         cmd += ["--worker-mem-budget-mb", str(args.budget_mb)]
     t0 = time.time()
-    proc = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True)
-    path = newest_json(t0 - 5, proc.stdout)
+    # a hung cell must not stall the matrix: kill it, log everything,
+    # mark BAD, move on. The full stdout/stderr also lands on disk per
+    # cell so post-mortems never depend on what scrolled past
+    try:
+        proc = subprocess.run(cmd, cwd=ROOT, capture_output=True,
+                              text=True, timeout=args.cell_timeout)
+        rc, out, err = proc.returncode, proc.stdout, proc.stderr
+    except subprocess.TimeoutExpired as e:
+        subprocess.run(["pkill", "-f", "icn_proto.worker"],
+                       check=False, capture_output=True)
+        time.sleep(3)
+        rc, out, err = -9, e.stdout or "", (e.stderr or "")
+        if isinstance(out, bytes):
+            out = out.decode(errors="replace")
+        if isinstance(err, bytes):
+            err = err.decode(errors="replace")
+        err = (err + f"\n[matrix] CELL TIMEOUT after {args.cell_timeout}s"
+                      " — killed\n")
+    os.makedirs(os.path.join(RESULTS, "cell_logs"), exist_ok=True)
+    log_path = os.path.join(
+        RESULTS, "cell_logs",
+        f"cell_s{share}_{pol}_r{rep}_b{args.budget_mb:g}.log")
+    with open(log_path, "w", encoding="utf-8") as f:
+        f.write("$ " + " ".join(cmd) + "\n\n--- stdout ---\n")
+        f.write(out or "")
+        f.write("\n--- stderr ---\n")
+        f.write(err or "")
+    path = newest_json(t0 - 5, out)
     row = {"share": share, "policy": pol, "rep": rep,
            "budget_mb": args.budget_mb,
-           "rc": proc.returncode, "cell_s": round(time.time() - t0, 1),
+           "rc": rc, "cell_s": round(time.time() - t0, 1),
+           "log": os.path.relpath(log_path, ROOT),
            "json": path,
            # keep the tail on every cell: crashes that still match an
            # mtime-old JSON used to lose their traceback
-           "stderr_tail": ((proc.stderr or "") + "\n" + (proc.stdout or ""))[-3000:]}
+           "stderr_tail": ((err or "") + "\n" + (out or ""))[-3000:]}
     if path:
         d = json.load(open(path, encoding="utf-8"))
         for k in METRICS:
@@ -98,7 +125,7 @@ def run_cell(args, share, pol, rep, port):
                                / max(1, len(lat)), 4)
         row["n"] = len(lat)
     else:
-        row["error"] = (proc.stderr or "")[-2000:]
+        row["error"] = (err or "")[-2000:]
     return row
 
 
@@ -152,6 +179,9 @@ def main():
     ap.add_argument("--budget-mb", type=float, default=0.0,
                     help="per-worker residency budget passed through to "
                          "run_cluster --worker-mem-budget-mb (0 = off)")
+    ap.add_argument("--cell-timeout", type=float, default=900.0,
+                    help="seconds before a cell is killed and marked BAD "
+                         "(0 = wait forever)")
     ap.add_argument("--manifest", default=os.path.join(
         RESULTS, "matrix_step5_manifest.json"))
     ap.add_argument("--drop-bad", action="store_true",

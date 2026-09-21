@@ -271,10 +271,47 @@ def test_repl_ack_not_swallowed():
     check("repl table drained", s._repl == {})
 
 
+def test_watchdog_fail():
+    """A worker stall must fail the turn and advance the session (the
+    share=8/ours/budget=48 cell of the 20260921 v2 run hung forever on
+    a stuck worker). A late result for the failed turn must not advance
+    the session twice."""
+    print("watchdog hard-fail:")
+    s = make_sched("ours")
+    turn = doc_turn(seed=5)
+    s.turns_of = {"doc5": [turn]}
+    w0 = s.workers[b"w0"]
+    w0.busy = True
+    w0.current = "doc5:-1"
+    w0.t_assign = time.time() - 301
+    s.records.append({"request_id": "doc5:-1", "worker": "w0",
+                      "t_assigned": time.time() - 301, "E": 0, "fp": "x",
+                      "xfer_blocks": [], "transfer_bytes": 0,
+                      "xfer_s": 0.0, "decision": None})
+    s._watchdog_fail(None, time.time())
+    rec = s.records[0]
+    check("turn failed by watchdog", rec.get("ok") is False)
+    check("worker freed", not w0.busy and w0.current is None)
+    check("session advanced", s.done_sessions == 1)
+    check("error tagged", "watchdog" in (rec.get("error") or ""))
+
+    class FakeSock:
+        def send_multipart(self, frames):
+            pass
+
+    # late result from the wedged worker must not double-advance
+    s.on_message(FakeSock(), b"w0",
+                 {"type": "result", "request_id": "doc5:-1", "ok": True},
+                 payload=None)
+    check("late result ignored", s.done_sessions == 1
+          and s.records[0]["ok"] is False)
+
+
 def main():
     test_repl_gating()
     test_eviction()
     test_eviction_shared_substrate()
+    test_watchdog_fail()
     test_delivered_repl()
     test_delivered_updates_residency()
     test_repl_ack_not_swallowed()
