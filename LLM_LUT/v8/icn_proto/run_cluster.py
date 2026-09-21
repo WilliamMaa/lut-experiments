@@ -69,12 +69,19 @@ def main():
                          "reshuffling. Never 'auto' (project red line).")
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--no-share", action="store_true",
-                    help="baseline mode: disable cross-session content sharing "
-                         "(doc-turn NRS reuse off); every session prefills its "
-                         "own document. Paired with the default (sharing on) "
-                         "it isolates the ICN system-level compute saving.")
+                    help="baseline shortcut for the sharing A/B (run_sharing): "
+                         "forces --policy b0 (load-only, no content awareness, "
+                         "every turn prefills its full prefix). Kept so old "
+                         "matrix cells keep working; new experiments should "
+                         "pass --policy directly.")
     sched_mod.add_args(ap)
     args = ap.parse_args()
+
+    if args.no_share:
+        if args.policy != "b0":
+            print(f"[launcher] --no-share: overriding --policy {args.policy} "
+                  f"-> b0 (load-only baseline)")
+        args.policy = "b0"
 
     pool = [int(x) for x in args.gpu_pool.split(",") if x.strip() != ""]
     if len(pool) % args.gpus_per_worker != 0:

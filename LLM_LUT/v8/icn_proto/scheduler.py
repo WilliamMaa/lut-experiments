@@ -286,33 +286,55 @@ class Scheduler:
         # never target their own tail — those tokens are prefilled
         # locally (zero-prefill + decode is illegal on the worker).
         tip_bound = self._match_cap(turn)
+        pol = self.args.policy
+        if pol == "p2":            # legacy alias
+            pol = "ours"
         idle = [w for w in self.workers.values() if not w.busy]
+        # B2 planned affinity (CacheRoute-style): if a worker holding this
+        # chain locally is busy but nearly done, and no idle worker is
+        # warm, HOLD the turn — it stays in self.ready and is retried on
+        # the next result. Deadlock-free: once eta exceeds the threshold
+        # the next choose falls through to a cold start.
+        if pol == "b2" and not any(
+                self.match_local(turn, w, tip_bound) > 0 for w in idle):
+            warm_busy = [w for w in self.workers.values()
+                         if w.busy
+                         and self.eta(w) < self.args.wait_threshold
+                         and self.match_local(turn, w, tip_bound) > 0]
+            if warm_busy:
+                return None
         if not idle:
             return None
         tips_global = set().union(*(w.tips for w in self.workers.values()))
         best = None
         costs = {}
         for w in idle:
-            e_loc = self.match_local(turn, w, tip_bound)
+            # B0 (load-only): no content awareness at all — never resume,
+            # never fetch; every turn prefills its full prefix on the
+            # least-loaded idle worker.
+            e_loc = 0 if pol == "b0" else \
+                self.match_local(turn, w, tip_bound)
             print(f"[match] {turn.session}:{turn.turn} w={w.ident.decode()} "
                   f"tips={len(w.tips)} resident={len(w.resident)} "
                   f"e_loc={e_loc}", flush=True)
             # candidate extension targets: tip positions above e_loc whose
-            # missing blocks are all on ONE other worker.
+            # missing blocks are all on ONE other worker. Fetch is a B3+
+            # capability.
             fetch = None
             e_max = e_loc
-            cand = sorted(self._tip_end(tn) for tn in tips_global
-                          if e_loc < self._tip_end(tn) <= tip_bound)
-            for t_pos in reversed(cand):
-                need = [n for n in self.resume_names(turn, t_pos)
-                        if n not in w.resident]
-                holders = [x for x in self.workers.values()
-                           if x is not w and all(n in x.resident
-                                                 for n in need)]
-                if holders:
-                    fetch = (holders[0].ident, need)
-                    e_max = t_pos
-                    break
+            if pol in ("b3", "ours"):
+                cand = sorted(self._tip_end(tn) for tn in tips_global
+                              if e_loc < self._tip_end(tn) <= tip_bound)
+                for t_pos in reversed(cand):
+                    need = [n for n in self.resume_names(turn, t_pos)
+                            if n not in w.resident]
+                    holders = [x for x in self.workers.values()
+                               if x is not w and all(n in x.resident
+                                                     for n in need)]
+                    if holders:
+                        fetch = (holders[0].ident, need)
+                        e_max = t_pos
+                        break
             fresh = turn.cum_tokens - e_max
             fetch_bytes = sum(self.dir.get(bn, {}).get("bytes", 0)
                               for bn in (fetch[1] if fetch else []))
@@ -335,7 +357,7 @@ class Scheduler:
             if best is None or rank < best[0]:
                 best = (rank, w.ident, e_max, fetch,
                         {"mode": mode, "E": e_max, "E_loc": e_loc,
-                         "cost_s": round(cost, 4),
+                         "cost_s": round(cost, 4), "policy": pol,
                          "fresh": fresh, "fetch_bytes": fetch_bytes,
                          "options": costs})
         if best is None:
@@ -673,10 +695,19 @@ class Scheduler:
 def add_args(ap):
     ap.add_argument("--bind", default="tcp://127.0.0.1:5570")
     ap.add_argument("--model-path", required=True)
-    ap.add_argument("--policy", default="p2", choices=["p2"],
-                    help="v1 of the block protocol implements the single "
-                         "fast-path chooser; B0-B3 policy switches land in "
-                         "step 3 (05 v3 §6).")
+    ap.add_argument("--policy", default="ours",
+                    choices=["b0", "b1", "b2", "b3", "ours", "p2"],
+                    help="fast-path capability subset (05 v3 §6 step 3): "
+                         "b0 = load-only, no content awareness; "
+                         "b1 = reactive locality+load, no fetch; "
+                         "b2 = planned affinity (waits for a nearly-done "
+                         "warm worker up to --wait-threshold); "
+                         "b3 = b1 + cross-worker KV fetch; "
+                         "ours = b3 (+ placement controller in step 4). "
+                         "p2 is a legacy alias of ours.")
+    ap.add_argument("--wait-threshold", type=float, default=2.0,
+                    help="b2: hold a turn for a busy warm worker while its "
+                         "ETA is below this many seconds")
     ap.add_argument("--repr", default="bf16", choices=["bf16"])
     ap.add_argument("--block-tokens", type=int, default=16,
                     help="prefix block length b (05 v3 §1)")
