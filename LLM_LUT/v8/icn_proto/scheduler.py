@@ -175,12 +175,13 @@ class Scheduler:
         e = self.dir.get(name)
         if e is None:
             self.dir[name] = e = {"bytes": int(nbytes), "first": t or time.time(),
-                                  "last": 0.0, "count": 0, "lambda": 0.0}
+                                  "last": 0.0, "count": 0, "lambda": 0.0,
+                                  "loc": {}}
         else:
             e["bytes"] = int(nbytes)
         return e
 
-    def note_access(self, names, t=None):
+    def note_access(self, names, wid=None, t=None):
         t = t or time.time()
         for n in names:
             e = self.dir.get(n)
@@ -190,6 +191,10 @@ class Scheduler:
                 inst = 1.0 / max(t - e["last"], 1e-3)
                 e["lambda"] = (inst if e["count"] == 1
                                else 0.7 * e["lambda"] + 0.3 * inst)
+                if wid:
+                    loc = e["loc"].setdefault(wid, 0.0)
+                    e["loc"][wid] = (inst if loc == 0.0
+                                     else 0.7 * loc + 0.3 * inst)
             e["last"] = t
             e["count"] += 1
 
@@ -408,13 +413,16 @@ class Scheduler:
             except ValueError:
                 return None
             if bn.parent_hash == GENESIS or bn.span_start == 0:
-                return names
+                break
             nxt = pool.get(bn.parent_hash)
             if nxt is None:
                 return None
-            names.append(nxt)
+            names.append(nxt)         # tip -> genesis order while walking
             cur = nxt
-        return None
+        else:
+            return None               # parent walk never terminated
+        names.reverse()               # genesis-first, matching resume_names
+        return names
 
     def _block_pool(self):
         pool = {}
@@ -475,8 +483,13 @@ class Scheduler:
             if broken:
                 continue          # residency state we cannot reason about
             names, freed = [], 0
-            cold_first = sorted(
-                fulls, key=lambda n: self.dir.get(n, {}).get("lambda", 0.0))
+            wid = w.ident.decode()
+
+            def _local_cold(tip):
+                e = self.dir.get(tip, {})
+                return e.get("loc", {}).get(wid, e.get("lambda", 0.0))
+
+            cold_first = sorted(fulls, key=_local_cold)
             for tip in cold_first:
                 if freed >= excess:
                     break
@@ -544,10 +557,7 @@ class Scheduler:
                 continue
             holders.sort(key=lambda w: w.resident_bytes)
             delta_c = nbytes / self.xfer_rate
-            g = e["lambda"] * delta_c - delta_c \
-                - nbytes * self.args.repl_mem_price
-            if g <= 0:
-                continue
+            c_mem = nbytes * self.args.repl_mem_price
             for w in self.workers.values():
                 if len(self._repl) + len(actions) \
                         >= self.args.max_repl_inflight:
@@ -561,6 +571,15 @@ class Scheduler:
                 if any(t == w.ident and set(names) <= set(ns)
                        for _, t, ns in inflight):
                     continue      # demand fetch already delivering it
+                # G_rep evaluated with the demand OBSERVED AT THIS
+                # TARGET (spatial demand); unseen locators get a
+                # uniform-routing prior share of the global rate
+                lam = e["loc"].get(w.ident.decode())
+                if lam is None:
+                    lam = e["lambda"] / max(1, len(self.workers))
+                g = lam * delta_c - delta_c - c_mem
+                if g <= 0:
+                    continue
                 actions.append({"tip": tip, "holder": holders[0].ident,
                                 "target": w.ident, "names": names,
                                 "bytes": nbytes, "g": round(g, 4)})
@@ -678,8 +697,10 @@ class Scheduler:
         self._xfer.pop(rid, None)
         resume_names = self.resume_names(turn, e_resume)
         new_names = turn.publish_names("bf16", self.args.block_tokens)
-        # demand accounting: every resumed block contributed to this turn
-        self.note_access(resume_names)
+        # demand accounting: every resumed block contributed to this turn;
+        # the accessing worker id feeds the per-locator demand signal
+        # (05 v3 §3: placement follows SPATIAL demand, not global popularity)
+        self.note_access(resume_names, w.ident.decode())
         print(f"[assign] {rid} -> {w.ident.decode()} "
               f"E={e_resume} resume_blocks={len(resume_names)} "
               f"publish_blocks={len(new_names)} "
@@ -807,21 +828,16 @@ class Scheduler:
                 self.send_assign(sock, xfer["target"], turn, xfer["E_loc"])
             return
         if mtype == "delivered":
-            # pair by target + names: demand fetches and controller
-            # replications can be in flight to the SAME worker
             names = hdr.get("names") or []
-            rid, xfer, kind = next(
-                ((r, x, "demand") for r, x in self._xfer.items()
-                 if x["stage"] == "deliver"
-                 and x["target"] == ident and x["names"] == names),
-                (None, None, None))
-            if not xfer and hdr.get("repl"):
+            if hdr.get("repl"):
+                # controller replication ack: paired by the echoed rid —
+                # a demand fetch may be delivering the SAME names to the
+                # same worker concurrently and must not swallow this ack
                 rid = hdr["repl"]
                 xfer = self._repl.get(rid)
-                kind = "repl" if xfer else None
-            if not xfer:
-                return
-            if kind == "repl":
+                if not xfer or xfer["stage"] != "deliver" \
+                        or xfer["target"] != ident:
+                    return
                 self._repl.pop(rid, None)
                 self.replications += 1
                 xfer["bytes"] = xfer.get("bytes", len(payload))
@@ -837,22 +853,38 @@ class Scheduler:
                       f"({xfer['bytes']/1e6:.1f}MB in {xfer_s:.2f}s), "
                       f"tip now resident", flush=True)
                 return
-            self._xfer.pop(rid, None)
-            self.transfer_bytes += xfer["bytes"]
-            self.transfers += 1
-            xfer_s = time.time() - xfer["t_fetch"]
-            if xfer_s > 0:
-                self.xfer_rate = (0.7 * self.xfer_rate
-                                  + 0.3 * xfer["bytes"] / xfer_s)
-            print(f"[xfer ] {rid} delivered to {ident.decode()}, "
-                  f"assign E={self._tip_end(xfer['names'][-1])}",
-                  flush=True)
-            e = self._tip_end(xfer["names"][-1])
-            self.send_assign(sock, xfer["target"], xfer["turn"], e,
-                             xfer_names=xfer["names"],
-                             xfer_bytes=xfer.get("bytes", 0),
-                             xfer_s=xfer_s,
-                             decision=xfer.get("decision"))
+            # demand fetch ack: pair by (worker, names)
+            rid, xfer = next(
+                ((r, x) for r, x in self._xfer.items()
+                 if x["stage"] == "deliver"
+                 and x["target"] == ident and x["names"] == names),
+                (None, None))
+            if xfer:
+                self._xfer.pop(rid, None)
+                self.transfer_bytes += xfer["bytes"]
+                self.transfers += 1
+                # the worker stored these blocks the moment deliver
+                # landed — reflect it NOW instead of waiting for the
+                # trailing status; a stale view makes the controller
+                # plan redundant copies of just-delivered segments
+                w = self.workers[xfer["target"]]
+                w.resident |= set(xfer["names"])
+                tip = xfer["names"][-1]
+                if tip in self.tips:
+                    w.tips.add(tip)
+                xfer_s = time.time() - xfer["t_fetch"]
+                if xfer_s > 0:
+                    self.xfer_rate = (0.7 * self.xfer_rate
+                                      + 0.3 * xfer["bytes"] / xfer_s)
+                print(f"[xfer ] {rid} delivered to {ident.decode()}, "
+                      f"assign E={self._tip_end(xfer['names'][-1])}",
+                      flush=True)
+                e = self._tip_end(xfer["names"][-1])
+                self.send_assign(sock, xfer["target"], xfer["turn"], e,
+                                 xfer_names=xfer["names"],
+                                 xfer_bytes=xfer.get("bytes", 0),
+                                 xfer_s=xfer_s,
+                                 decision=xfer.get("decision"))
             return
 
     def _pair_fetch(self, holder, names):

@@ -18,6 +18,7 @@ Run:  python -m icn_proto.test_controller
 
 import os
 import sys
+import time
 import types
 from argparse import Namespace
 
@@ -55,6 +56,7 @@ def hold(sched, w, turn, t_pos=N_TOK, mb=1, lam=2.0):
     for n in names:
         e = sched.dir_add(n, mb * MB)
         e["lambda"] = lam
+        e["loc"] = {"w1": lam}
     sched.tips.add(tip)
     return tip, names
 
@@ -91,6 +93,7 @@ def test_repl_gating():
     s4 = make_sched("ours")
     tip4, _ = hold(s4, s4.workers[b"w0"], turn)
     s4.dir[tip4]["lambda"] = 0.2      # below the G>0 break-even (~1/s)
+    s4.dir[tip4]["loc"] = {"w1": 0.2}
     check("cold tip not replicated", s4._plan_repl() == [])
 
     s5 = make_sched("ours")
@@ -159,7 +162,17 @@ def test_delivered_repl():
     tip, names = hold(s, s.workers[b"w0"], turn)
     s._apply_repl(None, s._plan_repl())
     rid = next(iter(s._repl))
-    # worker w1 stores the payload and acks; no turn may run
+
+    class FakeSock:
+        def send_multipart(self, frames):
+            pass
+
+    # holder replies, scheduler forwards the payload to the target
+    s.on_message(FakeSock(), b"w0",
+                 {"type": "fetched", "ok": True, "names": names},
+                 payload=b"y" * 50)
+    check("fetch ack advanced stage", s._repl[rid]["stage"] == "deliver")
+    # target stores the payload and acks; no turn may run
     s.on_message(None, b"w1",
                  {"type": "delivered", "names": names, "repl": rid},
                  payload=b"x" * 100)
@@ -167,14 +180,78 @@ def test_delivered_repl():
     check("blocks resident on target", all(n in w1.resident for n in names))
     check("tip registered on target", tip in w1.tips)
     check("transfer table drained", s._repl == {})
-    check("counters", s.replications == 1 and s.replicated_bytes == 100)
+    check("counters", s.replications == 1 and s.replicated_bytes == 50)
     check("worker not marked busy", not w1.busy)
+
+
+def test_delivered_updates_residency():
+    """Regression: a demand fetch delivery must update the TARGET
+    worker's residency view immediately. A stale view made the
+    controller plan a redundant replication of just-delivered blocks
+    (run 20260921_144351), whose ack then crossed with the demand
+    fetch's ack."""
+    print("delivered-demand residency update:")
+    turn = doc_turn()
+    s = make_sched("ours")
+    tip, names = hold(s, s.workers[b"w0"], turn)
+    s._xfer["doc9:0"] = {"stage": "deliver", "holder": b"w0",
+                         "target": b"w1", "names": names, "bytes": 100,
+                         "t_fetch": time.time(), "turn": turn, "E_loc": 0,
+                         "decision": None}
+    sent = []
+
+    class FakeSock:
+        def send_multipart(self, frames):
+            sent.append(frames)
+
+    s.on_message(FakeSock(), b"w1",
+                 {"type": "delivered", "names": names}, payload=b"x" * 100)
+    w1 = s.workers[b"w1"]
+    check("blocks resident on target", all(n in w1.resident for n in names))
+    check("tip registered on target", tip in w1.tips)
+    check("assign was dispatched", len(sent) == 1)
+    check("no redundant replication planned", s._plan_repl() == [])
+
+
+def test_repl_ack_not_swallowed():
+    """A replication ack must be attributed by its echoed rid even when
+    a demand xfer with identical names exists."""
+    print("replication ack attribution:")
+    turn = doc_turn()
+    s = make_sched("ours")
+    tip, names = hold(s, s.workers[b"w0"], turn)
+    s._apply_repl(None, s._plan_repl())
+    rid = next(iter(s._repl))
+    # concurrent demand xfer, same names, same target, stage deliver
+    s._xfer["doc9:0"] = {"stage": "deliver", "holder": b"w0",
+                         "target": b"w1", "names": names, "bytes": 100,
+                         "t_fetch": time.time(), "turn": turn, "E_loc": 0,
+                         "decision": None}
+
+    class FakeSock:
+        def send_multipart(self, frames):
+            pass
+
+    # holder acks the replication fetch -> stage becomes deliver
+    s.on_message(FakeSock(), b"w0",
+                 {"type": "fetched", "ok": True, "names": names},
+                 payload=b"y" * 50)
+    # the delivery ack carries repl rid and must NOT be swallowed by
+    # the demand xfer with identical names
+    s.on_message(None, b"w1",
+                 {"type": "delivered", "names": names, "repl": rid},
+                 payload=b"x" * 100)
+    check("replication counted", s.replications == 1)
+    check("demand xfer untouched", "doc9:0" in s._xfer)
+    check("repl table drained", s._repl == {})
 
 
 def main():
     test_repl_gating()
     test_eviction()
     test_delivered_repl()
+    test_delivered_updates_residency()
+    test_repl_ack_not_swallowed()
     print("test_controller: ALL PASS")
 
 

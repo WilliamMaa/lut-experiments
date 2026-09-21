@@ -278,8 +278,11 @@ class Worker:
                       f"{len(objs)} blocks "
                       f"({sum(o.nbytes() for o in objs) / 1e6:.1f}MB)",
                       flush=True)
+                # echo repl so the scheduler can attribute this ack to a
+                # controller replication rather than a demand fetch
                 msg.send(sock, {"type": "delivered",
-                                "names": [str(o.name) for o in objs]})
+                                "names": [str(o.name) for o in objs],
+                                "repl": hdr.get("repl")})
                 self.report_status(sock)
                 continue
             if mtype == "evict":
