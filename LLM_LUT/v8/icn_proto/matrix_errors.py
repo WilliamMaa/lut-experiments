@@ -48,7 +48,7 @@ def main():
         print(f"=== share={r['share']} policy={r['policy']} rep={r['rep']} "
               f"rc={r.get('rc')} cell_s={r.get('cell_s')} "
               f"failed={r.get('failed')} dup_json={dup} ===")
-        err = (r.get("error") or "").strip()
+        err = (r.get("stderr_tail") or r.get("error") or "").strip()
         if err:
             print(err[-args.tail:])
         else:

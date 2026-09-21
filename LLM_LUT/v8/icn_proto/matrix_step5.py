@@ -80,7 +80,10 @@ def run_cell(args, share, pol, rep, port):
     path = newest_json(t0 - 5, proc.stdout)
     row = {"share": share, "policy": pol, "rep": rep,
            "rc": proc.returncode, "cell_s": round(time.time() - t0, 1),
-           "json": path}
+           "json": path,
+           # keep the tail on every cell: crashes that still match an
+           # mtime-old JSON used to lose their traceback
+           "stderr_tail": ((proc.stderr or "") + "\n" + (proc.stdout or ""))[-3000:]}
     if path:
         d = json.load(open(path, encoding="utf-8"))
         for k in METRICS:
