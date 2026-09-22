@@ -36,7 +36,16 @@ METRICS = ("wall_s", "throughput_rps", "hit_rate", "resumed",
            "new_tokens_processed", "published_blocks", "transfers",
            "transfer_bytes", "replications", "replicated_bytes",
            "evictions", "avg_latency_s", "failed", "prefill_rate",
-           "xfer_rate")
+           "xfer_rate", "p50_resp_s", "p95_resp_s")
+
+
+def wl_signature(args):
+    """Workload-shape signature — part of the manifest cell key so
+    closed-loop and open-arrival cells never mix."""
+    if args.arrival == "poisson":
+        return (f"pp{args.arrival_rate:g}_z{args.zipf_n}s{args.zipf_s:g}"
+                f"_t{args.think_s:g}_sd{args.seed}")
+    return "cl"
 
 
 def pctl(xs, q):
@@ -79,6 +88,13 @@ def run_cell(args, share, pol, rep, port):
         cmd += ["--worker-mem-budget-mb", str(args.budget_mb)]
     if args.repl_mem_price > 0:
         cmd += ["--repl-mem-price", str(args.repl_mem_price)]
+    if args.arrival == "poisson":
+        cmd += ["--arrival", "poisson",
+                "--arrival-rate", str(args.arrival_rate),
+                "--zipf-n", str(args.zipf_n),
+                "--zipf-s", str(args.zipf_s),
+                "--think-s", str(args.think_s),
+                "--seed", str(args.seed)]
     t0 = time.time()
     # a hung cell must not stall the matrix: kill it, log everything,
     # mark BAD, move on. The full stdout/stderr also lands on disk per
@@ -101,8 +117,8 @@ def run_cell(args, share, pol, rep, port):
     os.makedirs(os.path.join(RESULTS, "cell_logs"), exist_ok=True)
     log_path = os.path.join(
         RESULTS, "cell_logs",
-        f"cell_s{share}_{pol}_r{rep}_b{args.budget_mb:g}"
-        f"_p{args.repl_mem_price:g}.log")
+        f"cell_{wl_signature(args)}_s{share}_{pol}_r{rep}"
+        f"_b{args.budget_mb:g}_p{args.repl_mem_price:g}.log")
     with open(log_path, "w", encoding="utf-8") as f:
         f.write("$ " + " ".join(cmd) + "\n\n--- stdout ---\n")
         f.write(out or "")
@@ -112,6 +128,7 @@ def run_cell(args, share, pol, rep, port):
     row = {"share": share, "policy": pol, "rep": rep,
            "budget_mb": args.budget_mb,
            "repl_mem_price": args.repl_mem_price,
+           "wl": wl_signature(args),
            "rc": rc, "cell_s": round(time.time() - t0, 1),
            "log": os.path.relpath(log_path, ROOT),
            "json": path,
@@ -137,18 +154,20 @@ def aggregate(rows, slo_s):
     groups = {}
     for r in rows:
         if r.get("json") and r.get("failed") == 0:
-            groups.setdefault((r.get("budget_mb", 0.0),
+            groups.setdefault((r.get("wl", "cl"), r.get("budget_mb", 0.0),
                                r.get("repl_mem_price", 0.0),
                                r["share"], r["policy"]), []).append(r)
-    print(f"\n{'budget':>7} {'price':>7} {'share':>6} {'policy':<7}{'runs':>5}"
+    print(f"\n{'wl':<18} {'budget':>7} {'price':>7} {'share':>6} "
+          f"{'policy':<7}{'runs':>5}"
           f"{'rps':>8}{'hit':>7}"
           f"{'new_tok':>9}{'xfer':>6}{'repl':>6}{'evict':>7}{'p50':>8}"
           f"{'p95':>8}"
           f"{'SLO@' + str(slo_s) + 's':>9}{'wall':>8}")
-    for (budget, price, share, pol), rs in sorted(groups.items()):
+    for (wl, budget, price, share, pol), rs in sorted(groups.items()):
         def m(k):
             return statistics.mean(r[k] for r in rs)
-        print(f"{budget:>7.0f} {price:>7.2g} {share:>6} {pol:<7}{len(rs):>5}"
+        print(f"{wl:<18} {budget:>7.0f} {price:>7.2g} {share:>6} "
+              f"{pol:<7}{len(rs):>5}"
               f"{m('throughput_rps'):>8.4f}"
               f"{m('hit_rate'):>7.3f}{m('new_tokens_processed'):>9.0f}"
               f"{m('transfers'):>6.1f}{m('replications'):>6.1f}"
@@ -190,6 +209,12 @@ def main():
     ap.add_argument("--repl-mem-price", type=float, default=0.0,
                     help="per-byte memory price passed through to "
                          "run_cluster --repl-mem-price (v3 pricing)")
+    ap.add_argument("--arrival", choices=["none", "poisson"], default="none")
+    ap.add_argument("--arrival-rate", type=float, default=1.0)
+    ap.add_argument("--zipf-n", type=int, default=16)
+    ap.add_argument("--zipf-s", type=float, default=1.2)
+    ap.add_argument("--think-s", type=float, default=2.0)
+    ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--manifest", default=os.path.join(
         RESULTS, "matrix_step5_manifest.json"))
     ap.add_argument("--drop-bad", action="store_true",
@@ -244,13 +269,15 @@ def main():
             print(f"resuming: {len(rows)} cell(s) already in manifest")
         except json.JSONDecodeError:
             pass
-    # budget (and memory price) are part of the cell key: a v2/v3 run
-    # must not inherit v1 (budget=0, price=0) cells from the manifest
+    # budget / price / workload-shape are part of the cell key: a later
+    # run must never inherit cells from a different configuration
     done = {(r.get("budget_mb", 0.0), r.get("repl_mem_price", 0.0),
+             r.get("wl", "cl"),
              r["share"], r["policy"], r["rep"]) for r in rows}
 
     for i, (sh, pol, rep) in enumerate(cells):
-        if (args.budget_mb, args.repl_mem_price, sh, pol, rep) in done:
+        if (args.budget_mb, args.repl_mem_price, wl_signature(args),
+                sh, pol, rep) in done:
             continue
         print(f"=== cell share={sh} policy={pol} rep={rep} "
               f"({len(done) + 1}/{len(cells)}) ===", flush=True)

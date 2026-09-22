@@ -22,8 +22,10 @@ Run (spawned by run_cluster.py, which also starts the workers):
 
 import json
 import os
+import random
 import sys
 import time
+import heapq
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -56,7 +58,9 @@ class Turn:
     turn: int
     prefill_ids: list
     prefix_ids: list
-    t_ready: float = 0.0
+    t_ready: float = 0.0      # entered the ready queue (queue_s baseline)
+    t_arrive: float = 0.0     # client-observed arrival (TTFT baseline);
+                              # == t_ready in closed-loop mode
     _chain_cache: dict = field(default_factory=dict, repr=False,
                                compare=False)
 
@@ -172,6 +176,14 @@ class Scheduler:
         self.evicted_bytes = 0
         self.prefill_rate = self.PREFILL_RATE0
         self.xfer_rate = self.XFER_RATE0
+        # Open-arrival machinery (step 6): sessions arrive on a Poisson
+        # clock and a session's next turn only becomes ready after a
+        # think-time delay. Until then turns sit in the arrivals min-heap
+        # and the poll loop sleeps until the earliest one is due —
+        # closed-loop mode leaves the heap empty and behaves as before.
+        self.arrivals = []            # heap of (t_arrive, seq, Turn)
+        self._arr_seq = 0
+        self._think_rng = random.Random(getattr(args, "seed", 0) + 1)
 
     def dir_add(self, name, nbytes, t=None):
         e = self.dir.get(name)
@@ -211,13 +223,37 @@ class Scheduler:
         # depends on i % 2, so with K=2 the pairs (even sessions) and
         # (odd sessions) are exactly identical.
         n_samples = self.args.doc_share or len(docs)
+        poisson = self.args.arrival == "poisson"
+        rng = random.Random(self.args.seed)
+        # zipf catalog: doc popularity across --zipf-n catalog slots.
+        # Weights 1/k^s; the hottest slot is shared by a large fraction
+        # of all sessions, the tail is seen once or twice — this is what
+        # keeps "hot docs living on few workers" a STEADY state instead
+        # of the closed-loop one-shot warm-up.
+        if poisson and self.args.zipf_n > 0:
+            s = self.args.zipf_s
+            weights = [1.0 / (k + 1) ** s for k in range(self.args.zipf_n)]
+        else:
+            weights = None
+        now = time.time()
+        t_arr = 0.0
         for i in range(self.args.sessions):
-            sample = docs[i % n_samples]
+            if weights:
+                idx = rng.choices(range(len(weights)), weights=weights)[0]
+            else:
+                idx = i % n_samples
+            if poisson:
+                t_arr += rng.expovariate(self.args.arrival_rate)
             session = f"doc{i}"
-            rep = (self.args.doc_repeat if i % 2 == 0
+            # chain identity follows the DOC index (not session parity):
+            # every session drawing the same catalog slot must produce
+            # the IDENTICAL chain, otherwise content sharing is silently
+            # destroyed by the rep alternation
+            rep = (self.args.doc_repeat if idx % 2 == 0
                    else (self.args.doc_repeat_alt
                          if self.args.doc_repeat_alt is not None
                          else self.args.doc_repeat))
+            sample = docs[idx % len(docs)]
             doc_text = (sample["document"] * rep)[: self.args.doc_chars]
             doc_ids = tokenizer(doc_text,
                                 return_tensors="pt").input_ids[0].tolist()
@@ -230,8 +266,23 @@ class Scheduler:
                 turns.append(Turn(session, t, list(q_ids), list(prefix)))
             self.turns_of[session] = turns
             self.pending_next[session] = 0
-            turns[0].t_ready = time.time()
-            self.ready.append(turns[0])
+            turns[0].t_arrive = now + t_arr
+            if poisson:
+                heapq.heappush(self.arrivals,
+                               (turns[0].t_arrive, self._arr_seq, turns[0]))
+                self._arr_seq += 1
+            else:
+                turns[0].t_ready = now
+                self.ready.append(turns[0])
+
+    def _release_arrivals(self, now):
+        """Move due arrivals into the ready queue. t_ready is pinned to
+        the ARRIVAL time (not release time) so queue_s stays a true
+        arrival→assign queueing measure."""
+        while self.arrivals and self.arrivals[0][0] <= now:
+            _, _, turn = heapq.heappop(self.arrivals)
+            turn.t_ready = turn.t_arrive
+            self.ready.append(turn)
 
     # ---- Match + Schedule (05 v3 §2) -------------------------------------
 
@@ -668,8 +719,18 @@ class Scheduler:
 
         try:
             while not self.finished():
+                self._release_arrivals(time.time())
                 self.dispatch(sock)
-                evts = dict(poller.poll(timeout=1000))
+                # sleep until the next interesting event: an arriving
+                # turn (open loop) or the 1s housekeeping tick, whichever
+                # is sooner. Without this the open-loop scheduler would
+                # idle-spin a second past every arrival.
+                if self.arrivals:
+                    wait_ms = max(0.0, (self.arrivals[0][0] - time.time()))
+                    wait_ms = min(1000.0, wait_ms * 1000.0)
+                else:
+                    wait_ms = 1000.0
+                evts = dict(poller.poll(timeout=int(wait_ms)))
                 now = time.time()
                 for w in self.workers.values():
                     if w.busy and now - w.t_assign > 180:
@@ -803,6 +864,7 @@ class Scheduler:
         }, ident=ident)
         self.records.append({"request_id": rid, "worker": w.ident.decode(),
                              "t_assigned": time.time(),
+                             "t_arrive": turn.t_arrive,
                              "queue_s": round(time.time() - turn.t_ready, 4),
                              "E": e_resume,
                              "fp": turn.prefix_fingerprint(
@@ -1020,8 +1082,18 @@ class Scheduler:
         self.pending_next[session] = nxt
         turns = self.turns_of[session]
         if nxt < len(turns):
-            turns[nxt].t_ready = time.time()
-            self.ready.append(turns[nxt])
+            nxt_turn = turns[nxt]
+            if self.args.arrival == "poisson":
+                # a real user thinks before asking the next question:
+                # the turn enters the arrivals stream, not the ready queue
+                delay = self._think_rng.expovariate(1.0 / self.args.think_s)
+                nxt_turn.t_arrive = time.time() + delay
+                heapq.heappush(self.arrivals,
+                               (nxt_turn.t_arrive, self._arr_seq, nxt_turn))
+                self._arr_seq += 1
+            else:
+                nxt_turn.t_ready = time.time()
+                self.ready.append(nxt_turn)
         else:
             self.done_sessions += 1
 
@@ -1030,10 +1102,26 @@ class Scheduler:
 
     # ---- reporting --------------------------------------------------------
 
+    @staticmethod
+    def _pctl(xs, q):
+        if not xs:
+            return None
+        xs = sorted(xs)
+        return round(xs[min(len(xs) - 1, int(round(q * (len(xs) - 1))))], 4)
+
     def summary(self):
         ok = [r for r in self.records if r.get("ok")]
         failed = [r for r in self.records if not r.get("ok")]
         wall = time.time() - self.t_start
+        # open loop: count throughput over the busy span (first arrival →
+        # last result), not from scheduler init — otherwise a long idle
+        # head before the first arrival dilutes QPS
+        if self.args.arrival == "poisson" and ok:
+            done = [(r.get("t_arrive") or 0) + r.get("queue_s", 0)
+                    + r["latency_s"] for r in ok]
+            span = max(done) - min(r.get("t_arrive") or 0 for r in ok)
+        else:
+            span = wall
         total_new = sum(r.get("prefill_tokens", 0) for r in ok)
         resumed = [r for r in ok if r.get("resumed")]
         published_blocks = sum(len(r.get("published") or []) for r in ok)
@@ -1054,7 +1142,7 @@ class Scheduler:
             "wall_s": round(wall, 2),
             "requests": len(self.records),
             "failed": len(failed),
-            "throughput_rps": round(len(ok) / wall, 4),
+            "throughput_rps": round(len(ok) / max(span, 1e-6), 4),
             "resumed": len(resumed),
             "hit_rate": round(len(resumed) / max(1, len(ok)), 4),
             "new_tokens_processed": total_new,
@@ -1069,6 +1157,10 @@ class Scheduler:
             "evicted_bytes": self.evicted_bytes,
             "avg_latency_s": round(sum(r["latency_s"] for r in ok)
                                    / max(1, len(ok)), 4),
+            "p50_resp_s": self._pctl([r.get("queue_s", 0) + r["latency_s"]
+                                      for r in ok], 0.5),
+            "p95_resp_s": self._pctl([r.get("queue_s", 0) + r["latency_s"]
+                                      for r in ok], 0.95),
             "workers": workers,
             "directory": {
                 "entries": len(self.dir),
@@ -1097,7 +1189,8 @@ class Scheduler:
                   "transfers", "transfer_bytes",
                   "replications", "replicated_bytes",
                   "evictions", "evicted_blocks",
-                  "avg_latency_s", "failed", "prefill_rate", "xfer_rate"):
+                  "avg_latency_s", "failed", "prefill_rate", "xfer_rate",
+                  "p50_resp_s", "p95_resp_s"):
             print(f"  {k}: {out[k]}")
         for wid, ws in workers.items():
             print(f"  worker {wid}: {ws}")
@@ -1155,6 +1248,23 @@ def add_args(ap):
                          "(i %% K) to force identical chains / cross-worker "
                          "fetch. K=2 pairs even/odd sessions exactly.")
     ap.add_argument("--decode-steps", type=int, default=4)
+    ap.add_argument("--arrival", choices=["none", "poisson"], default="none",
+                    help="workload shape: none (default) = closed loop, all "
+                         "sessions start at once; poisson = open arrival "
+                         "stream — sessions arrive at --arrival-rate, doc "
+                         "popularity follows a zipf catalog, and a "
+                         "session's next turn arrives after --think-s")
+    ap.add_argument("--arrival-rate", type=float, default=1.0,
+                    help="poisson session arrival rate (sessions/s)")
+    ap.add_argument("--zipf-n", type=int, default=16,
+                    help="poisson: catalog size for zipf doc popularity "
+                         "(0 = fall back to --doc-share cycling)")
+    ap.add_argument("--zipf-s", type=float, default=1.2,
+                    help="poisson: zipf exponent (higher = hotter hotspot)")
+    ap.add_argument("--think-s", type=float, default=2.0,
+                    help="poisson: mean user think time between turns (s)")
+    ap.add_argument("--seed", type=int, default=0,
+                    help="workload RNG seed (arrival times + zipf draws)")
     ap.add_argument("--out", default=os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "results", "icn_proto"))
