@@ -642,7 +642,22 @@ class Scheduler:
         poller.register(sock, zmq.POLLIN)
 
         hellos = set()
+        poller0 = zmq.Poller()
+        poller0.register(sock, zmq.POLLIN)
+        hello_deadline = time.time() + 180.0
         while len(hellos) < len(self.workers):
+            # a worker that never comes up (GPU OOM, orphan holding the
+            # port, crashed at load) must fail FAST and loudly — the
+            # pre-timeout version blocked here forever and burned the
+            # whole cell budget on a startup deadlock
+            left = hello_deadline - time.time()
+            if left <= 0 or not dict(poller0.poll(timeout=int(min(30.0, left) * 1000))):
+                missing = [wid.decode() for wid in self.workers
+                           if wid.decode() not in hellos]
+                raise RuntimeError(
+                    f"workers never said hello within 180s: {missing} — "
+                    "check for orphaned icn_proto processes holding GPU "
+                    "memory or the zmq port (pkill -f icn_proto)")
             ident, hdr, _ = msg.recv(sock)
             if hdr.get("type") == "hello":
                 hellos.add(hdr["worker_id"])
