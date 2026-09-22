@@ -77,6 +77,8 @@ def run_cell(args, share, pol, rep, port):
            "--model-path", args.model_path]
     if args.budget_mb > 0:
         cmd += ["--worker-mem-budget-mb", str(args.budget_mb)]
+    if args.repl_mem_price > 0:
+        cmd += ["--repl-mem-price", str(args.repl_mem_price)]
     t0 = time.time()
     # a hung cell must not stall the matrix: kill it, log everything,
     # mark BAD, move on. The full stdout/stderr also lands on disk per
@@ -99,7 +101,8 @@ def run_cell(args, share, pol, rep, port):
     os.makedirs(os.path.join(RESULTS, "cell_logs"), exist_ok=True)
     log_path = os.path.join(
         RESULTS, "cell_logs",
-        f"cell_s{share}_{pol}_r{rep}_b{args.budget_mb:g}.log")
+        f"cell_s{share}_{pol}_r{rep}_b{args.budget_mb:g}"
+        f"_p{args.repl_mem_price:g}.log")
     with open(log_path, "w", encoding="utf-8") as f:
         f.write("$ " + " ".join(cmd) + "\n\n--- stdout ---\n")
         f.write(out or "")
@@ -108,6 +111,7 @@ def run_cell(args, share, pol, rep, port):
     path = newest_json(t0 - 5, out)
     row = {"share": share, "policy": pol, "rep": rep,
            "budget_mb": args.budget_mb,
+           "repl_mem_price": args.repl_mem_price,
            "rc": rc, "cell_s": round(time.time() - t0, 1),
            "log": os.path.relpath(log_path, ROOT),
            "json": path,
@@ -133,17 +137,18 @@ def aggregate(rows, slo_s):
     groups = {}
     for r in rows:
         if r.get("json") and r.get("failed") == 0:
-            groups.setdefault((r.get("budget_mb", 0.0), r["share"],
-                               r["policy"]), []).append(r)
-    print(f"\n{'budget':>7} {'share':>6} {'policy':<7}{'runs':>5}{'rps':>8}"
-          f"{'hit':>7}"
+            groups.setdefault((r.get("budget_mb", 0.0),
+                               r.get("repl_mem_price", 0.0),
+                               r["share"], r["policy"]), []).append(r)
+    print(f"\n{'budget':>7} {'price':>7} {'share':>6} {'policy':<7}{'runs':>5}"
+          f"{'rps':>8}{'hit':>7}"
           f"{'new_tok':>9}{'xfer':>6}{'repl':>6}{'evict':>7}{'p50':>8}"
           f"{'p95':>8}"
           f"{'SLO@' + str(slo_s) + 's':>9}{'wall':>8}")
-    for (budget, share, pol), rs in sorted(groups.items()):
+    for (budget, price, share, pol), rs in sorted(groups.items()):
         def m(k):
             return statistics.mean(r[k] for r in rs)
-        print(f"{budget:>7.0f} {share:>6} {pol:<7}{len(rs):>5}"
+        print(f"{budget:>7.0f} {price:>7.2g} {share:>6} {pol:<7}{len(rs):>5}"
               f"{m('throughput_rps'):>8.4f}"
               f"{m('hit_rate'):>7.3f}{m('new_tokens_processed'):>9.0f}"
               f"{m('transfers'):>6.1f}{m('replications'):>6.1f}"
@@ -182,6 +187,9 @@ def main():
     ap.add_argument("--cell-timeout", type=float, default=900.0,
                     help="seconds before a cell is killed and marked BAD "
                          "(0 = wait forever)")
+    ap.add_argument("--repl-mem-price", type=float, default=0.0,
+                    help="per-byte memory price passed through to "
+                         "run_cluster --repl-mem-price (v3 pricing)")
     ap.add_argument("--manifest", default=os.path.join(
         RESULTS, "matrix_step5_manifest.json"))
     ap.add_argument("--drop-bad", action="store_true",
@@ -236,13 +244,13 @@ def main():
             print(f"resuming: {len(rows)} cell(s) already in manifest")
         except json.JSONDecodeError:
             pass
-    # budget is part of the cell key: a v2 (budget>0) run must not
-    # inherit v1 (budget=0) cells from the manifest
-    done = {(r.get("budget_mb", 0.0), r["share"], r["policy"], r["rep"])
-            for r in rows}
+    # budget (and memory price) are part of the cell key: a v2/v3 run
+    # must not inherit v1 (budget=0, price=0) cells from the manifest
+    done = {(r.get("budget_mb", 0.0), r.get("repl_mem_price", 0.0),
+             r["share"], r["policy"], r["rep"]) for r in rows}
 
     for i, (sh, pol, rep) in enumerate(cells):
-        if (args.budget_mb, sh, pol, rep) in done:
+        if (args.budget_mb, args.repl_mem_price, sh, pol, rep) in done:
             continue
         print(f"=== cell share={sh} policy={pol} rep={rep} "
               f"({len(done) + 1}/{len(cells)}) ===", flush=True)

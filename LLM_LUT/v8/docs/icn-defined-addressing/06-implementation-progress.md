@@ -1,4 +1,4 @@
-# 06 方法论、结果与进度（ICN-defined addressing，截至 2026-09-21）
+# 06 方法论、结果与进度（ICN-defined addressing，截至 2026-09-22）
 
 > 本文档回答四件事：**我们用什么方法验证**（§1–2）、**到底实现了什么目标**
 > （§3）、**目前的结果是什么**（§4）、**Step 5 矩阵要回答什么问题、怎么算赢**
@@ -78,11 +78,11 @@ ICN 式共享的前提是"**同内容 ⇒ 同结果**"。每次 run 用
 | RQ1：内容寻址块链在真实 35B hybrid 模型端到端成立 | **✅ 达成** | 块链 + per-block GDN checkpoint；E1 roundtrip + 全部 run `=> CONSISTENT`、failed=0 |
 | RQ2：收益可按能力层归因 | **✅ 达成** | 五档梯度完美单调（§4 表），73.9% 算力节省可拆到层 |
 | RQ3 的机制：经济触发的复制 + 对称判据的驱逐 | **✅ 机制就绪** | G_rep 复制/驱逐真机触发、`failed=0`、protection 语义生效（§6 Step 4） |
-| RQ3 的增量：Ours > B3 的 QPS/SLO | **⏳ 待矩阵** | flat workload 下控制器正确地静默（无冷目标）；分化需要偏斜+并发（§5） |
+| RQ3 的增量：Ours > B3 的 QPS/SLO | **⚠️ 部分成立，定价待修** | 矩阵（§4.3）：高偏斜下复制纯开销（b3 支配）；低偏斜下复制买到延迟鲁棒性（SLO 0.97 vs 0.55），但 `c_mem=0` 的 G_rep 引发驱逐 churn，算力反噬 2.6×（§5.3 预测核对） |
 
-一句话总结当前状态：**"ICN 式 KV 命名 + 能力阶梯"已被证明成立且可归因；
-"联合 placement 控制"的机制已就绪并单独验证，它与 B3 的差异价值是下一个
-实验的主题。**
+一句话总结当前状态：**"ICN 式 KV 命名 + 能力阶梯"已证明成立且可归因；
+联合 placement 控制的增量价值已测出双向信号——机制有效（延迟），定价错误
+（算力）。v3 用正的内存价格内部化驱逐外部性。**
 
 ## 4. 目前的结果
 
@@ -113,6 +113,57 @@ ICN 式共享的前提是"**同内容 ⇒ 同结果**"。每次 run 用
   worker 本地观测到的需求率评估——05 §3 "placement follows spatial
   demand, not global popularity" 的 v1 落地。
 
+### 4.3 Step 5 矩阵（16 sessions × 3 turns，4 workers，reps=3）
+
+**v1：预算全关**（隔离变量，看 routing 层的分化）：
+
+| share | policy | rps | hit | new_tok | xfer | SLO@2s |
+|---|---|---|---|---|---|---|
+| 2 | b0 | 0.99 | 0.000 | 93,384 | 0 | 0.109 |
+| 2 | b1 | 1.18 | 0.875 | 12,048 | 0 | 0.312 |
+| 2 | b2 | 1.43 | 0.922 | 7,840 | 0 | 0.911 |
+| 2 | b3 | 1.55 | 0.922 | 7,840 | 3.0 | 0.948 |
+| 2 | ours | 1.44 | 0.922 | 7,840 | 3.0 | 0.802 |
+| 8 | b0 | 1.37 | 0.000 | 68,590 | 0 | 0.776 |
+| 8 | b1 | 1.50 | 0.510 | 33,248 | 0 | 0.911 |
+| 8 | b2 | 1.07 | 0.859 | 9,769 | 0 | 0.427 |
+| 8 | b3 | 1.38 | 0.870 | 9,278 | 28.0 | 0.964 |
+| 8 | ours | 1.34 | 0.870 | 9,278 | 30.7 | 0.969 |
+
+**v2：全员驱逐，预算 48MB**（≈ 每 worker 工作集 74MB 的 65%，ours 的
+G 门复制 vs b3 的 reactive 裸奔——RQ3 的真正考场）：
+
+| share | policy | rps | hit | new_tok | xfer | repl | evict | SLO@2s |
+|---|---|---|---|---|---|---|---|---|
+| 2 | b3 | 1.62 | 0.922 | 7,840 | 3.3 | 0 | 0 | **0.990** |
+| 2 | ours | 1.39 | 0.922 | 7,842 | 23.0 | 13.3 | 23.0 | 0.969 |
+| 8 | b3 | 1.19 | 0.870 | 9,278 | 27.0 | 0 | 0 | 0.547 |
+| 8 | ours | 1.57 | 0.661 | 24,172 | 30.7 | 0* | 39.0 | **0.974** |
+
+\* share=8 的 ours 三次 run 复制计数为 0 但驱逐 39 次——复制送达的段立刻
+把 worker 推过预算，G 门此后评估的候选要么在冷却期、要么 holder 检查失败，
+**复制一次都没留**下来，只剩驱逐 churn。这是 `c_mem=0` 的直接后果。
+
+**头条发现（v2）：**
+
+1. **share=2：b3 全面支配 ours。** 不复制就不会超预算（b3 evict=0），
+   热段自然常驻；ours 白搬 20 次数据、多驱逐 23 次，new_tok 一分没省，
+   SLO 反而略低。**高偏斜下 reactive fetch 已经足够好， proactive
+   placement 没有正窗口。**
+2. **share=8：双向分化。** ours 的 SLO/rps/p50 全面好于 b3（0.974 vs
+   0.547）——复制/预摆放把热段摊开，turn 不再挤在少数 holder 后面排队，
+   **机制价值是真的**。但代价是 new_tok 反噬到 24,172（b3 的 2.6×）：
+   驱逐 churn → holder 丢失 → fetch 失败降级 → 整段 re-prefill。
+3. **噪声警告**：share=8 的 b1/b2/b3 在 v1→v2 间 SLO 摆动 0.4+
+   （0.911→0.474、0.964→0.547），而它们的代码路径在预算下完全等价
+   （evict=0）——这是 GPU 邻居噪声，不是预算效应。延迟类指标在
+   share=8 的绝对值可信度 ±0.2；new_tok / xfer / hit 是 workload
+   驱动的确定性量，可信。
+
+**结论（RQ3 当前答案）**：residency 控制的增量**存在但不免费**——它买的
+是延迟鲁棒性（排队免疫），当前定价（`c_mem=0`）让它在算力账上净亏。
+v3 实验：`--repl-mem-price > 0`，把驱逐风险内部化进 G_rep。
+
 ## 5. Step 5 矩阵是什么
 
 ### 5.1 要回答的问题
@@ -141,22 +192,32 @@ RQ3：**偏斜 + 并发下，Ours 比 B3 多赚多少，代价多少？**
 ~0.05s inject）。复制有界：max-in-flight=2、按 (tip,target) 冷却、
 demand 已在送达即跳过。
 
-### 5.3 预注册预测（跑之前写下，防事后讲故事）
+### 5.3 预注册预测 vs 实际（跑之前写下，防事后讲故事）
 
-1. **share=2**：`new_tok` 各策略与 flat 实验同序（b0 ≫ b1 > b2≈b3≈ours）；
-   差异出现在 **P95 与 SLO attainment**——ours > b3 > b2 > b1 > b0；
-   ours 的 `replicated_bytes` 有界（≈ 热点 doc 数 × 冷 worker 数 × 段大小）。
-2. **share=8**：偏斜减弱，ours 与 b3 的差距缩小但不消失（仍是 2/4 持有率）。
-3. **算力**：b3 与 ours 的 `new_tok` 应基本持平——复制的价值是延迟与吞吐，
-   不是再省算力（flat 实验已把可省的算力省完了）。
+1. **share=2**：预测 ours 在 P95/SLO 上 > b3，new_tok 持平。
+   **结果：部分证伪。** new_tok 确实持平（7,842 vs 7,840），但 SLO 反低
+   （0.969 vs 0.990）——高偏斜下热点天然 2/4 持有，b3 的 fetch 已覆盖
+   spill，复制的延迟价值为 0，只剩开销。
+2. **share=8**：预测差距缩小但不消失。
+   **结果：以出乎意料的方式成立。** ours 与 b3 在延迟上大幅分化
+   （0.974 vs 0.547，ours 免疫排队坍塌），但方向伴随算力反噬
+   （new_tok 2.6×）——不是"差距缩小"，是"各有所长、定价失衡"。
+3. **算力**：预测 b3 与 ours new_tok 持平。
+   **share=2 成立；share=8 严重违反**（24,172 vs 9,278）。机制：
+   `c_mem=0` → 复制塞爆预算 → 驱逐热段 → fetch 命中已驱逐 holder →
+   降级 re-prefill。**这是驱逐外部性没有被 G_rep 定价的后果，不是
+   residency 控制本身的罪。**
 
-### 5.4 证伪条件（什么结果会推翻我们的 claim）
+### 5.4 证伪条件核对（什么结果会推翻我们的 claim）
 
-- ours 的 QPS@SLO **≤** b3 且 `replicated_bytes` 显著 >0 → 经济触发器
-  在误触发，G_rep 判据或 λ̂ 估计有问题；
-- ours 出现 `failed>0` 或 CONSISTENT 破 → 机制性 bug，先于结论修复；
-- b3 与 ours 在所有指标上不可区分 → residency 控制在 closed-loop 场景
-  无增量价值，claim 需降级为"机制等价，价值在开放到达流"（→ §8 下一步 4）。
+- ~~ours 的 QPS@SLO ≤ b3 且 replicated_bytes 显著 >0~~ → **在 share=2
+  命中**：误触发成立，根因是内存价格为 0，λ̂ 估计本身工作正常（复制
+  都发生在真正热的段上）。
+- ours 出现 `failed>0` 或 CONSISTENT 破 → **未触发**（v2 全程
+  failed=0、CONSISTENT；两次崩溃都是 scheduler 侧 bug，修复后全绿）。
+- b3 与 ours 在所有指标上不可区分 → **未触发**：双向可分。claim 不能
+  降级为"机制等价"，应表述为"**机制有效、定价错误**"——这直接引出
+  v3（正内存价格）而不是 §8 的开放到达流 pivot。
 
 ### 5.5 分析计划与可信边界
 
@@ -198,10 +259,30 @@ zmq 玩具 data plane、block=16 token、decode=4 步——矩阵结论在这个
 `num_hidden_layers`）+ 加载自检。判别清单：device_map 两 worker 同形
 （43 条目）、`layout check OK`、resume turn 的 place_cache 全 accelerator。
 
-### 6.4 Step 4 修过的 4 个 bug（均有回归测试）
+### 6.4 修过的 bug（均有回归测试）
 
-复制 ack 被同名 demand fetch 吞掉；demand-delivered 不记账导致复制
-刚送达的 segment；`_chain_names` 祖先序反；planner 缺 policy 门控。
+**Step 4**：复制 ack 被同名 demand fetch 吞掉；demand-delivered 不记账
+导致复制刚送达的 segment；`_chain_names` 祖先序反；planner 缺 policy 门控。
+
+**Step 5（压力矩阵暴露的，全部是 v2 驱逐压力下的新路径）**：
+
+- **空 `need` 的 vacuous fetch（崩溃根因，两次）**：驱逐把 tip 从
+  `w.tips` 删掉但块作为共享基础设施幸存 → `match_local` 停在低位 →
+  fetch 候选的 `need` 为空 → `all(...)` 空集恒真 → 发出 0 块 fetch →
+  deliver 路径 `names[-1]` IndexError。修复：`choose()` 把空 `need` 当
+  免费本地延伸；deliver 路径兜底降级。（test_policy
+  `test_free_extension_no_fetch`）
+- **watchdog 只打印不干活**：worker 卡住 → 格子挂到地老天荒。修复：
+  300s 硬失败（turn 记 failed、推进 session、迟到 result 防双推进）。
+  （test_controller `test_watchdog_fail`）
+- **manifest 的 resume 键不含 budget**：v2 带 `--budget-mb` 重跑被
+  当成"30 格全跑过"直接退出。修复：键加 `budget_mb`，聚合表加
+  budget/evict 列。
+- **矩阵无超时无日志**：加 `--cell-timeout`（默认 900s，超时杀进程标
+  BAD 继续）+ 每格完整 stdout/stderr 落盘 `results/icn_proto/cell_logs/`。
+- 另：驱逐改为全员共享 substrate（`c_mem` 门控只留在复制侧）、
+  `_apply_evict` 乐观字节记账（消除 status 滞后导致的双驱逐）、
+  复制侧移除硬预算守卫（压力下驱逐会腾地方）。
 
 ## 7. 环境事实
 
@@ -212,9 +293,13 @@ zmq 玩具 data plane、block=16 token、decode=4 步——矩阵结论在这个
 
 ## 8. 下一步
 
-1. 跑完 30 格矩阵 → 按 §5.3 的预注册预测核对 → 出 RQ3 结论。
-2. 预算模式：resident_bytes 主动扣减记账；session-affine 驱逐保护
-   （pin 本 worker 下一 turn 要用的 tip，缓解人为预算下的 thrash）。
+1. **v3 定价实验（当前最高优先）**：`--repl-mem-price > 0`（flag 从
+   Step 4 就存在，一直是 0）——给复制的每字节一个正价格，把驱逐外部性
+   内部化进 G_rep。预期：share=8 保住 SLO 优势的同时 new_tok 回落到
+   b3 附近；share=2 复制直接不发（G≤0），与 b3 重合。只跑
+   ours × share{2,8} × reps3，一格改动。
+2. 若 v3 成功：把内存价格做成预算的函数（预算越紧价格越高），并考虑
+   session-affine 驱逐保护（pin 本 worker 下一 turn 要用的 tip）。
 3. Data plane：zmq → LMCache/NIXL（05 §5 已留口）。
 4. closed-loop → 泊松到达 + zipf popularity，把 λ̂/EWMA 的语义从轮内
    扩展到跨请求流——这是从"原型"到"论文实验"的最后一跳。
