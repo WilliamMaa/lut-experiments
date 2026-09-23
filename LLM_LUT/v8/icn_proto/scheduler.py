@@ -197,6 +197,13 @@ class Scheduler:
         self._last_worker = {}
         self.remote_resume_opportunities = 0
         self.repl_served_local = 0
+        # why the placement controller passed on a (tip, target) — the
+        # binding gate is a measured histogram, not a guess (E1 smoke
+        # 20260923: 0 replications with two different candidate causes)
+        self._repl_reject = {"min_lambda": 0, "hot": 0, "no_chain": 0,
+                             "unknown_block": 0, "no_missing": 0,
+                             "inflight": 0, "no_holder": 0,
+                             "cooldown": 0, "g_nonpos": 0}
         # tokens re-prefilled because a planned fetch degraded to the
         # local boundary (holder lost blocks / empty delivery / stalled
         # xfer) — absolute churn account, grows with prefix length
@@ -655,18 +662,23 @@ class Scheduler:
         pool = self._block_pool()
         inflight = self._inflight()
         actions = []
+        rej = self._repl_reject
         hot_first = sorted(
             self.tips,
             key=lambda n: -self.dir.get(n, {}).get("lambda", 0.0))
         for tip in hot_first:
             e = self.dir.get(tip)
             if not e or e["lambda"] < self.args.repl_min_lambda:
+                rej["min_lambda"] += 1
                 continue
+            rej["hot"] += 1
             chain = self._chain_names(tip, pool)
             if chain is None:
+                rej["no_chain"] += 1
                 continue
             names = chain + [tip]
             if any(n not in self.dir for n in names):
+                rej["unknown_block"] += 1
                 continue          # cannot price an unknown block
             for w in self.workers.values():
                 if len(self._repl) + len(actions) \
@@ -676,13 +688,16 @@ class Scheduler:
                 # the whole resume set needs nothing
                 missing = [n for n in names if n not in w.resident]
                 if not missing:
+                    rej["no_missing"] += 1
                     continue
                 if w.ident in {h for h, _, ns in inflight
                                if set(missing) <= set(ns)}:
+                    rej["inflight"] += 1
                     continue      # demand fetch already delivering it
                 holders = [x for x in self.workers.values()
                            if all(n in x.resident for n in missing)]
                 if not holders:
+                    rej["no_holder"] += 1
                     continue
                 holders.sort(key=lambda x: x.resident_bytes)
                 nbytes = sum(self.dir[n]["bytes"] for n in missing)
@@ -692,6 +707,7 @@ class Scheduler:
                 # frees space every cycle, so replication is how a hot
                 # segment survives eviction on the holder's worker.
                 if (tip, w.ident) in self._repl_cool:
+                    rej["cooldown"] += 1
                     continue
                 # G_rep evaluated with the demand OBSERVED AT THIS
                 # TARGET (spatial demand); unseen locators get a
@@ -701,6 +717,7 @@ class Scheduler:
                     lam = e["lambda"] / max(1, len(self.workers))
                 g = lam * delta_c - delta_c - c_mem
                 if g <= 0:
+                    rej["g_nonpos"] += 1
                     continue
                 actions.append({"tip": tip, "holder": holders[0].ident,
                                 "target": w.ident, "names": missing,
@@ -1282,6 +1299,7 @@ class Scheduler:
                 self.repl_served_local,
             "rederivation_tokens": rederiv,
             "degrade_rederiv_tokens": self.degrade_rederiv_tokens,
+            "repl_reject": dict(self._repl_reject),
             "c_recompute": c_recompute,
             "state_lifetime": state_lifetime,
             "avg_latency_s": round(sum(r["latency_s"] for r in ok)
