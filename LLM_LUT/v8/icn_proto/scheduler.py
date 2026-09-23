@@ -175,6 +175,8 @@ class Scheduler:
         self._repl_cool = {}        # (tip, target_ident) -> cooldown expiry
         self.replications = 0
         self.replicated_bytes = 0
+        self.repl_planned = 0       # actions the controller committed to
+                                    # (vs replications = completed acks)
         self.evictions = 0
         self.evicted_blocks = 0
         self.evicted_bytes = 0
@@ -654,7 +656,19 @@ class Scheduler:
         no complete holder exists and the controller degenerates to
         b3 without ever evaluating G_rep. When the target holds
         nothing the suffix IS the full chain (3-turn behaviour is
-        unchanged; 06 results stand)."""
+        unchanged; 06 results stand).
+
+        ΔC_future calibration (E1, pre-registered in 07 §4
+        "C_recompute(L) 校准不等式"): the step-4 placeholder priced a
+        hit's saving as the transfer time itself, making the
+        break-even λ̂* = 1 hit/s — unreachable for migratable state
+        (per-target demand ~0.1/s), so the feasible set was empty by
+        construction (smoke 20260923: 17,710 g_nonpos rejections vs 0
+        actions). A hit's actual worth is the re-derivation it
+        avoids, measured as missing_tokens / prefill_rate (the
+        c_recompute calibration), while C_copy stays nbytes/xfer_rate.
+        Both are the scheduler's own measured EWMAs; nothing is
+        assumed about demand (λ̂ stays observed-only)."""
         if len(self._repl) >= self.args.max_repl_inflight:
             return []
         if self.args.policy not in ("ours", "p2"):
@@ -701,7 +715,18 @@ class Scheduler:
                     continue
                 holders.sort(key=lambda x: x.resident_bytes)
                 nbytes = sum(self.dir[n]["bytes"] for n in missing)
-                delta_c = nbytes / self.xfer_rate
+                try:
+                    missing_tokens = sum(BlockName.parse(n).span_tokens
+                                         for n in missing)
+                except ValueError:
+                    rej["unknown_block"] += 1
+                    continue
+                # ΔC_future: avoided RE-DERIVATION of the missing
+                # tokens (measured c_recompute calibration, 07 §4);
+                # C_copy: the off-path transfer time
+                delta_c = missing_tokens / (self.prefill_rate
+                                            or self.PREFILL_RATE0)
+                c_copy = nbytes / self.xfer_rate
                 c_mem = nbytes * self.args.repl_mem_price
                 # No hard budget guard here: under pressure _plan_evict
                 # frees space every cycle, so replication is how a hot
@@ -715,7 +740,7 @@ class Scheduler:
                 lam = e["loc"].get(w.ident.decode())
                 if lam is None:
                     lam = e["lambda"] / max(1, len(self.workers))
-                g = lam * delta_c - delta_c - c_mem
+                g = lam * delta_c - c_copy - c_mem
                 if g <= 0:
                     rej["g_nonpos"] += 1
                     continue
@@ -728,6 +753,7 @@ class Scheduler:
         for a in actions:
             rid = f"repl:{self._repl_seq}"
             self._repl_seq += 1
+            self.repl_planned += 1
             self._repl[rid] = {"stage": "fetch", "holder": a["holder"],
                                "target": a["target"], "names": a["names"],
                                "tip": a["tip"], "t": time.time()}
@@ -1289,6 +1315,7 @@ class Scheduler:
             "transfer_bytes": self.transfer_bytes,
             "replications": self.replications,
             "replicated_bytes": self.replicated_bytes,
+            "repl_planned": self.repl_planned,
             "evictions": self.evictions,
             "evicted_blocks": self.evicted_blocks,
             "evicted_bytes": self.evicted_bytes,

@@ -339,9 +339,37 @@ def test_repl_missing_suffix():
     check("fully-warmed target skipped", s2._plan_repl() == [])
 
 
+def test_repl_recompute_pricing():
+    """E1 ΔC_future calibration (pre-registered 07 §4): a hit's worth
+    is the avoided RE-DERIVATION (missing_tokens/prefill_rate), not the
+    transfer time. With byte-heavy blocks (0.5MB/16tok) and lam=0.9/s
+    the step-4 placeholder (ΔC = C_copy, break-even 1 hit/s) rejects;
+    the calibrated formula accepts: 0.9 * 1024/2500 - 32MB/100MB/s > 0.
+    Fresh-sched rates are the EWMA initials (2500 tok/s, 100MB/s)."""
+    print("recompute-priced G_rep:")
+    turn = doc_turn()
+    s = make_sched("ours")
+    hold(s, s.workers[b"w0"], turn, N_TOK, mb=0.5, lam=0.9)
+    plan = s._plan_repl()
+    check("fires below the old 1/s break-even", len(plan) == 1,
+          f"n={len(plan)}")
+    if plan:
+        c_copy = 32 * MB / s.xfer_rate          # 64 blocks x 0.5 MiB
+        g_expect = 0.9 * (N_TOK / s.PREFILL_RATE0) - c_copy
+        check("g reflects recompute pricing",
+              abs(plan[0]["g"] - round(g_expect, 4)) < 1e-3,
+              f"G={plan[0]['g']} expected ~{round(g_expect, 4)}")
+    # sanity: truly cold demand still rejected under the new formula
+    s2 = make_sched("ours")
+    hold(s2, s2.workers[b"w0"], turn, N_TOK, mb=0.5, lam=0.5)
+    check("0.5/s below calibrated break-even (~0.78/s) too",
+          s2._plan_repl() == [])
+
+
 def main():
     test_repl_gating()
     test_repl_missing_suffix()
+    test_repl_recompute_pricing()
     test_eviction()
     test_eviction_shared_substrate()
     test_watchdog_fail()
