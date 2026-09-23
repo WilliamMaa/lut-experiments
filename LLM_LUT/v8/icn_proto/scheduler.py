@@ -633,10 +633,21 @@ class Scheduler:
         transfer time nbytes/xfer_rate in this prototype; C_memory is a
         per-byte price (--repl-mem-price, 0 by default); there is no
         hard residency-budget skip — under pressure _plan_evict frees
-        space for the copy. v1 of spatial demand:
-        any worker NOT holding the segment is a candidate (requests land
-        on whichever worker a turn is dispatched to), and the least
-        loaded holder is the copy source."""
+        space for the copy. Spatial demand: any worker NOT holding the
+        segment is a candidate (requests land on whichever worker a
+        turn is dispatched to), and the least loaded holder is the
+        copy source.
+
+        Copy granularity (E1 fix, 2026-09-23): the copy set is the
+        MISSING SUFFIX of the resume set relative to each target
+        (resume_set minus target_resident) — the same granularity the
+        demand fetch path uses. The full-segment copy of the 3-turn
+        era cannot fire at long horizons: a 40-turn session's whole
+        chain (~70-100MB) exceeds any realistic per-worker budget, so
+        no complete holder exists and the controller degenerates to
+        b3 without ever evaluating G_rep. When the target holds
+        nothing the suffix IS the full chain (3-turn behaviour is
+        unchanged; 06 results stand)."""
         if len(self._repl) >= self.args.max_repl_inflight:
             return []
         if self.args.policy not in ("ours", "p2"):
@@ -657,28 +668,31 @@ class Scheduler:
             names = chain + [tip]
             if any(n not in self.dir for n in names):
                 continue          # cannot price an unknown block
-            nbytes = sum(self.dir[n]["bytes"] for n in names)
-            holders = [w for w in self.workers.values()
-                       if all(n in w.resident for n in names)]
-            if not holders:
-                continue
-            holders.sort(key=lambda w: w.resident_bytes)
-            delta_c = nbytes / self.xfer_rate
-            c_mem = nbytes * self.args.repl_mem_price
             for w in self.workers.values():
                 if len(self._repl) + len(actions) \
                         >= self.args.max_repl_inflight:
                     return actions
-                if w in holders:
+                # copy only what this target lacks; a target holding
+                # the whole resume set needs nothing
+                missing = [n for n in names if n not in w.resident]
+                if not missing:
                     continue
+                if w.ident in {h for h, _, ns in inflight
+                               if set(missing) <= set(ns)}:
+                    continue      # demand fetch already delivering it
+                holders = [x for x in self.workers.values()
+                           if all(n in x.resident for n in missing)]
+                if not holders:
+                    continue
+                holders.sort(key=lambda x: x.resident_bytes)
+                nbytes = sum(self.dir[n]["bytes"] for n in missing)
+                delta_c = nbytes / self.xfer_rate
+                c_mem = nbytes * self.args.repl_mem_price
                 # No hard budget guard here: under pressure _plan_evict
                 # frees space every cycle, so replication is how a hot
                 # segment survives eviction on the holder's worker.
                 if (tip, w.ident) in self._repl_cool:
                     continue
-                if any(t == w.ident and set(names) <= set(ns)
-                       for _, t, ns in inflight):
-                    continue      # demand fetch already delivering it
                 # G_rep evaluated with the demand OBSERVED AT THIS
                 # TARGET (spatial demand); unseen locators get a
                 # uniform-routing prior share of the global rate
@@ -689,7 +703,7 @@ class Scheduler:
                 if g <= 0:
                     continue
                 actions.append({"tip": tip, "holder": holders[0].ident,
-                                "target": w.ident, "names": names,
+                                "target": w.ident, "names": missing,
                                 "bytes": nbytes, "g": round(g, 4)})
         return actions
 

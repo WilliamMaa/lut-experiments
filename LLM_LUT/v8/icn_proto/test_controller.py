@@ -307,8 +307,41 @@ def test_watchdog_fail():
           and s.records[0]["ok"] is False)
 
 
+def test_repl_missing_suffix():
+    """E1 (2026-09-23): the copy set is the MISSING SUFFIX of the
+    resume set relative to the target, not the whole chain. A 40-turn
+    session's full chain (~100MB) exceeds any per-worker budget, so
+    full-segment copies can never find a complete holder and the
+    controller degenerates to b3. When the target already holds the
+    lower chain, only the upper suffix is priced and copied."""
+    print("missing-suffix replication:")
+    turn = doc_turn()
+    s = make_sched("ours")
+    w0, w1 = s.workers[b"w0"], s.workers[b"w1"]
+    tip, names_full = hold(s, w0, turn, N_TOK)
+    # w1 already holds the lower half of the same chain
+    low = set(s.resume_names(turn, N_TOK // 2))
+    w1.resident |= low
+    plan = s._plan_repl()
+    check("one action", len(plan) == 1, f"n={len(plan)}")
+    a = plan[0]
+    expect = set(names_full) - low
+    check("only the missing suffix is copied",
+          set(a["names"]) == expect, f"{len(a['names'])} blocks "
+          f"vs expected {len(expect)}")
+    check("suffix bytes priced", a["bytes"] < sum(
+        s.dir[n]["bytes"] for n in names_full))
+    check("holder is w0 (holds the suffix)", a["holder"] == b"w0")
+    # a target holding the WHOLE chain needs nothing
+    s2 = make_sched("ours")
+    hold(s2, s2.workers[b"w0"], turn)
+    s2.workers[b"w1"].resident |= set(names_full)
+    check("fully-warmed target skipped", s2._plan_repl() == [])
+
+
 def main():
     test_repl_gating()
+    test_repl_missing_suffix()
     test_eviction()
     test_eviction_shared_substrate()
     test_watchdog_fail()
