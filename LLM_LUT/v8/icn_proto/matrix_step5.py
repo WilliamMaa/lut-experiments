@@ -36,16 +36,24 @@ METRICS = ("wall_s", "throughput_rps", "hit_rate", "resumed",
            "new_tokens_processed", "published_blocks", "transfers",
            "transfer_bytes", "replications", "replicated_bytes",
            "evictions", "avg_latency_s", "failed", "prefill_rate",
-           "xfer_rate", "p50_resp_s", "p95_resp_s")
+           "xfer_rate", "p50_resp_s", "p95_resp_s",
+           "session_turn_migration_rate", "remote_resume_opportunities",
+           "remote_resume_served_local_due_to_replication",
+           "rederivation_tokens", "degrade_rederiv_tokens")
 
 
 def wl_signature(args):
     """Workload-shape signature — part of the manifest cell key so
-    closed-loop and open-arrival cells never mix."""
+    closed-loop and open-arrival cells never mix. tps/qt pin the E1
+    horizon parameters (2026-09-23: without them a resumed matrix would
+    silently inherit cells from a different --turns-per-session)."""
+    tps = getattr(args, "turns_per_session", None)
+    qt = getattr(args, "q_tokens", None) or 0
+    tail = f"_tps{tps}_q{qt}"
     if args.arrival == "poisson":
         return (f"pp{args.arrival_rate:g}_z{args.zipf_n}s{args.zipf_s:g}"
-                f"_t{args.think_s:g}_sd{args.seed}")
-    return "cl"
+                f"_t{args.think_s:g}{tail}_sd{args.seed}")
+    return "cl" + tail
 
 
 def pctl(xs, q):
@@ -84,6 +92,8 @@ def run_cell(args, share, pol, rep, port):
            "--gpu-pool", args.gpu_pool,
            "--gpus-per-worker", str(args.gpus_per_worker),
            "--model-path", args.model_path]
+    if getattr(args, "q_tokens", None):
+        cmd += ["--q-tokens", str(args.q_tokens)]
     if args.budget_mb > 0:
         cmd += ["--worker-mem-budget-mb", str(args.budget_mb)]
     if args.repl_mem_price > 0:
@@ -165,7 +175,8 @@ def aggregate(rows, slo_s):
           f"{'SLO@' + str(slo_s) + 's':>9}{'wall':>8}")
     for (wl, budget, price, share, pol), rs in sorted(groups.items()):
         def m(k):
-            return statistics.mean(r[k] for r in rs)
+            vals = [r[k] for r in rs if r.get(k) is not None]
+            return statistics.mean(vals) if vals else float("nan")
         print(f"{wl:<18} {budget:>7.0f} {price:>7.2g} {share:>6} "
               f"{pol:<7}{len(rs):>5}"
               f"{m('throughput_rps'):>8.4f}"
@@ -189,6 +200,9 @@ def main():
     ap.add_argument("--gpus-per-worker", type=int, default=2)
     ap.add_argument("--sessions", type=int, default=16)
     ap.add_argument("--turns-per-session", type=int, default=3)
+    ap.add_argument("--q-tokens", type=int, default=None,
+                    help="E1: pin question-turn token deltas (passed "
+                         "through to run_cluster)")
     ap.add_argument("--doc-chars", type=int, default=4000)
     ap.add_argument("--doc-repeat", type=int, default=2)
     ap.add_argument("--doc-repeat-alt", type=int, default=2)

@@ -1,4 +1,4 @@
-# 06 方法论、结果与进度（ICN-defined addressing，截至 2026-09-22）
+# 06 方法论、结果与进度（ICN-defined addressing，截至 2026-09-23）
 
 > 本文档回答四件事：**我们用什么方法验证**（§1–2）、**到底实现了什么目标**
 > （§3）、**目前的结果是什么**（§4）、**Step 5 矩阵要回答什么问题、怎么算赢**
@@ -78,11 +78,11 @@ ICN 式共享的前提是"**同内容 ⇒ 同结果**"。每次 run 用
 | RQ1：内容寻址块链在真实 35B hybrid 模型端到端成立 | **✅ 达成** | 块链 + per-block GDN checkpoint；E1 roundtrip + 全部 run `=> CONSISTENT`、failed=0 |
 | RQ2：收益可按能力层归因 | **✅ 达成** | 五档梯度完美单调（§4 表），73.9% 算力节省可拆到层 |
 | RQ3 的机制：经济触发的复制 + 对称判据的驱逐 | **✅ 机制就绪** | G_rep 复制/驱逐真机触发、`failed=0`、protection 语义生效（§6 Step 4） |
-| RQ3 的增量：Ours > B3 的 QPS/SLO | **❌ closed-loop 下证伪** | 价格扫描 {0, 1e-8, 3e-9} × 偏斜 {2,8} 全谱：b3 算力账从不输（share=8 赢 3×）、share=2 上复制纯开销；负机制 = 复制填充预算 → 驱逐 churn → re-derivation（§4.3） |
+| RQ3 的增量：Ours > B3 的 QPS/SLO | **❌ 双场景证伪** | 价格扫描 {0, 1e-8, 3e-9} × 偏斜 {2,8}（closed-loop，§4.3）+ zipf {1.0, 1.6} × 泊松到达（open-loop，§4.4）：b3 算力账从不输（开放流赢 2.6×）、b3 的 evict 恒 0；负机制 = 复制填充预算 → 驱逐 churn → re-derivation |
 
 一句话总结当前状态：**"ICN 式 KV 命名 + 能力阶梯"已证明成立且可归因；
-residency 控制在 closed-loop 下的增量价值已被预注册实验证伪（负机制清楚）；
-科学战场转向开放到达流——λ̂ 在那里第一次有真实的跨请求语义。**
+residency 控制在请求级 KV serving（closed-loop 与开放到达流双双）无增量
+价值，负机制清楚、跨配置稳定；价值域收窄到跨会话长期驻留场景（§8）。**
 
 ## 4. 目前的结果
 
@@ -188,8 +188,33 @@ G 门复制 vs b3 的 reactive 裸奔——RQ3 的真正考场）：
 
 负机制（可发表的形式）：**在硬内存预算下，proactive 复制填充预算 → 对称
 驱逐判据清除热段 → 全网零副本 → 退化为分布式全重算**；reactive global
-fetch（b3）因为"只在需要时搬、搬的优先级的由调度关键路径决定"而天然免疫。
+fetch（b3）因为"只在需要时搬、搬运优先级由调度关键路径决定"而天然免疫。
 这正是 §5.4 预注册的降级路径 → 下一步开放到达流（§8）。
+
+### 4.4 Step 6 开放到达流（泊松 λ=1.0 session/s，zipf-16 目录，think 2s，
+4 workers，budget 48MB，reps=3）
+
+| zipf-s | policy | new_tok | hit | xfer | repl | evict |
+|---|---|---|---|---|---|---|
+| 1.0 | b3 | **11,337** | **0.859** | 17.7 | 0 | **0** |
+| 1.0 | ours | 25,724–36,138 | 0.53–0.69 | 18.7–20.7 | 4.3–7.3 | 38–46 |
+| 1.6 | b3 | **9,618** | **0.880** | 15.0–17.0 | 0 | **0** |
+| 1.6 | ours | 25,665–27,125 | 0.58–0.61 | 14.7 | 3.3–3.7 | 32–35 |
+
+（share 列在 zipf 模式下无效——b3 两格逐位相同证实了这点；ours 两格之差
+为计时噪声。latency 全程受邻居抢占污染，不作证据。）
+
+**开放流下 RQ3 同样阴性，且揭示了一个单调性**：偏斜越热，b3 越省
+（s=1.0→1.6 时 new_tok 11,337→9,618，hit 0.859→0.880）——热点 doc 的
+fetch 复用率随偏斜单调上升；而 ours 的 churn 成本（evict 32–46、hit 崩塌、
+new_tok 2.6×）不随偏斜缓解。"更热就能翻盘"的猜想被数据封死：b3 的
+reactive fetch 在开放流里工作得极好（evict 恒 0——fetch 只在需要时搬，
+天然把每卡常驻压在预算内），ours 的 proactive 复制反而把预算变成
+churn 的来源。
+
+**λ̂ 语义变好没有帮助**——问题从来不在 λ̂ 估计（复制确实都发生在真热点
+上），在 `c_mem=0` 时复制不付内存账、驱逐的外部性由 fetch 失败的
+re-derivation 支付。定价实验（v3，closed-loop）已证抬价修不好这个账。
 
 ## 5. Step 5 矩阵是什么
 
@@ -322,18 +347,16 @@ zmq 玩具 data plane、block=16 token、decode=4 步——矩阵结论在这个
 
 ## 8. 下一步
 
-1. **开放到达流（step 6，已实现待真机复测）**：closed-loop → 泊松到达 +
-   zipf popularity 目录。λ̂/EWMA 从"一轮内的计数"变成"跨请求流的到达率"，
-   G_rep 的复制触发第一次有真实的预测对象；同时自然制造"热点只住在
-   部分 worker"的持续状态，不再有 closed-loop 的自愈问题。实现：
-   `--arrival poisson --arrival-rate --zipf-n --zipf-s --think-s --seed`
-   （scheduler.py；session 按指数间隔到达、目录按 zipf 抽取、session 内
-   下一 turn 经思考时间重回到达流、主循环睡到下一个到达时刻）；
-   口径补 `p50_resp_s`/`p95_resp_s`（到达→完成）。矩阵 manifest 键加
-   workload 签名。复测设计：b3 vs ours × zipf-s {1.0, 1.6} × budget 48MB
-   × reps 3。
-2. 若开放流下仍阴性 → residency 控制的价值域进一步收窄到"跨会话长期
-   驻留"（超大上下文、多轮 agent），写进结论的边界条件。
+> **2026-09-23 更新：下一步已设计定稿，见 `07-regime-study.md`。**
+> 核心问题从"ICN controller 能不能赢 B3"升级为"什么 regime 下主动摆放
+> 可复用 inference state 才比缺了再取赚"，三个实验（长生命周期 agent /
+> DRAM spill tier / 合成拓扑成本）按证据强度排序、全部预注册。
+
+1. ~~开放到达流复测~~ **已完成（§4.4）：双 zipf 档位全阴性，RQ3 在请求级
+   serving 场景双场景证伪。** 预注册 pivot 路径走完，结论负而干净。
+2. **价值域收窄后的候选场景**：residency 控制的增量可能存在于"跨会话
+   长期驻留"——超大上下文（长 doc 生命周期 ≫ 请求间隔，re-derivation
+   代价极高，churn 账会反转）或多轮 agent（状态在 worker 上积累）。
 3. Data plane：zmq → LMCache/NIXL（05 §5 已留口）。
-4. 内存价格做成预算的函数（预算越紧价格越高）——closed-loop 已证伪其
-   修复力，留作开放流下复测的旋钮。
+4. 已证伪旋钮存档：`--repl-mem-price`（定价修不了 churn）、share 维度
+   （zipf 模式下无效）。

@@ -132,6 +132,10 @@ class WorkerState:
                                     # round-trip needed)
     resident_bytes: int = 0
     prefill_rate: float = 0.0       # per-worker EWMA, tok/s (0 = unknown)
+    via_repl: set = field(default_factory=set)
+    # names that reached this worker through a controller REPLICATION
+    # (not a demand fetch, not a local publish) — the E1 accounting of
+    # "remote resume served local because we placed it here proactively"
 
 
 class Scheduler:
@@ -184,6 +188,19 @@ class Scheduler:
         self.arrivals = []            # heap of (t_arrive, seq, Turn)
         self._arr_seq = 0
         self._think_rng = random.Random(getattr(args, "seed", 0) + 1)
+        # E1 (07-regime-study §4) residency-opportunity accounting:
+        # session -> worker id of its last ASSIGNED turn (== publisher of
+        # the session's latest state for successful turns). A question
+        # turn assigned to a different worker is a remote-resume
+        # opportunity — replication can serve it locally, recompute can
+        # only eat the cost.
+        self._last_worker = {}
+        self.remote_resume_opportunities = 0
+        self.repl_served_local = 0
+        # tokens re-prefilled because a planned fetch degraded to the
+        # local boundary (holder lost blocks / empty delivery / stalled
+        # xfer) — absolute churn account, grows with prefix length
+        self.degrade_rederiv_tokens = 0
 
     def dir_add(self, name, nbytes, t=None):
         e = self.dir.get(name)
@@ -259,9 +276,21 @@ class Scheduler:
                                 return_tensors="pt").input_ids[0].tolist()
             turns = [Turn(session, -1, list(doc_ids), list(doc_ids))]
             prefix = list(doc_ids)
-            for t, q in enumerate(sample["questions"][: self.args.turns_per_session]):
-                q_ids = tokenizer("\n\n" + q,
+            # E1 (07 §4): question turns CYCLE the sample's question list
+            # so --turns-per-session can exceed the ~7 questions in the
+            # trace; --q-tokens N pins every question turn's token delta
+            # to exactly N (tile short questions, truncate long ones) so
+            # the prefix grows linearly and the horizon is controlled.
+            qt = getattr(self.args, "q_tokens", None)
+            qs = sample["questions"]
+            for t in range(self.args.turns_per_session):
+                q_ids = tokenizer("\n\n" + qs[t % len(qs)],
                                   return_tensors="pt").input_ids[0].tolist()
+                if qt:
+                    if len(q_ids) >= qt:
+                        q_ids = q_ids[:qt]
+                    else:
+                        q_ids = (q_ids * (qt // max(1, len(q_ids)) + 1))[:qt]
                 prefix = prefix + q_ids
                 turns.append(Turn(session, t, list(q_ids), list(prefix)))
             self.turns_of[session] = turns
@@ -586,6 +615,7 @@ class Scheduler:
             for n in a["names"]:
                 w.resident.discard(n)
                 w.tips.discard(n)
+                w.via_repl.discard(n)
             # Optimistic accounting: the worker's status ack lags one
             # cycle, so without this the controller re-plans eviction
             # against a stale (still-full) byte count and the next
@@ -780,6 +810,8 @@ class Scheduler:
                     if x["target"] == w.ident:
                         print(f"[watchdog] xfer {xrid} stalled, degrade "
                               f"to E_loc={x['E_loc']}", flush=True)
+                        self.degrade_rederiv_tokens += max(
+                            0, len(x["turn"].prefix_ids) - x["E_loc"])
                         self._xfer.pop(xrid, None)
                         self.send_assign(sock, x["target"], x["turn"],
                                          x["E_loc"])
@@ -873,6 +905,28 @@ class Scheduler:
                              "transfer_bytes": xfer_bytes,
                              "xfer_s": round(xfer_s, 4),
                              "decision": decision})
+        rec = self.records[-1]
+        # ---- E1 residency-opportunity accounting (07 §4) ----
+        wid = w.ident.decode()
+        prev_worker = self._last_worker.get(turn.session)
+        rec["migrated"] = bool(prev_worker and prev_worker != wid)
+        self._last_worker[turn.session] = wid
+        if turn.turn >= 0 and prev_worker and prev_worker != wid:
+            # the session's latest state was published on another worker:
+            # a remote-resume opportunity. It is "served local due to
+            # replication" when the exact tip is resident HERE only
+            # because the controller placed it (via_repl) and the resume
+            # reaches it in full (a b3 demand fetch does NOT count — the
+            # tip arrives reactively, that is B3's own path)
+            self.remote_resume_opportunities += 1
+            rec["remote_opp"] = True
+            prev_turn = self.turns_of[turn.session][turn.turn]
+            prev_cum = prev_turn.cum_tokens
+            tip = prev_turn.tip_name_at(prev_cum, "bf16",
+                                        self.args.block_tokens)
+            if e_resume == prev_cum and tip in w.via_repl:
+                self.repl_served_local += 1
+                rec["repl_served"] = True
 
     def on_message(self, sock, ident, hdr, payload):
         w = self.workers.get(ident)
@@ -980,6 +1034,8 @@ class Scheduler:
                       f"{len(hdr.get('missing') or [])}), degrade to "
                       f"E_loc={xfer['E_loc']}", flush=True)
                 turn = xfer["turn"]
+                self.degrade_rederiv_tokens += max(
+                    0, len(turn.prefix_ids) - xfer["E_loc"])
                 self._xfer.pop(rid, None)
                 self.send_assign(sock, xfer["target"], turn, xfer["E_loc"])
             return
@@ -1009,6 +1065,7 @@ class Scheduler:
                                       + 0.3 * xfer["bytes"] / xfer_s)
                 w = self.workers[xfer["target"]]
                 w.resident |= set(xfer["names"])
+                w.via_repl |= set(xfer["names"])
                 w.tips.add(xfer["tip"])
                 print(f"[ctl  ] {rid} delivered to {ident.decode()} "
                       f"({xfer['bytes']/1e6:.1f}MB in {xfer_s:.2f}s), "
@@ -1030,6 +1087,8 @@ class Scheduler:
                     # boundary instead of indexing into an empty list
                     print(f"[xfer ] {rid} empty delivery, degrade to "
                           f"E_loc={xfer['E_loc']}", flush=True)
+                    self.degrade_rederiv_tokens += max(
+                        0, len(xfer["turn"].prefix_ids) - xfer["E_loc"])
                     self.send_assign(sock, xfer["target"], xfer["turn"],
                                      xfer["E_loc"])
                     return
@@ -1124,6 +1183,53 @@ class Scheduler:
             span = wall
         total_new = sum(r.get("prefill_tokens", 0) for r in ok)
         resumed = [r for r in ok if r.get("resumed")]
+        # ---- E1 (07 §4) summary metrics ----
+        q_recs = []
+        for r in ok:
+            session, t = r["request_id"].split(":")
+            if t == "-1":
+                continue
+            q_recs.append((session, int(t), r))
+        # rederivation: question-turn prefill beyond the turn's genuinely
+        # new tokens — the absolute churn account of "evicted/lost prefix
+        # re-computed" (per-token cost grows with prefix length)
+        rederiv = 0
+        for session, t, r in q_recs:
+            turns = self.turns_of.get(session) or []
+            if t + 1 >= len(turns):
+                continue
+            growth = turns[t + 1].cum_tokens - turns[t].cum_tokens
+            rederiv += max(0, r.get("prefill_tokens", 0) - growth)
+        migrated_q = [1 for _, _, r in q_recs if r.get("migrated")]
+        # C_recompute(L): measured prefill rate by prefix-length bucket —
+        # calibrates the re-derivation cost curve instead of assuming a
+        # growth order (hybrid arch + real kernels, 07 §4)
+        edges = [64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
+        buckets = {}
+        for r in ok:
+            pt, ps = r.get("prefill_tokens") or 0, r.get("prefill_s") or 0
+            if pt <= 0 or ps <= 0:
+                continue
+            b = next((e for e in edges if pt <= e), edges[-1] * 2)
+            agg = buckets.setdefault(b, [0, 0, 0])
+            agg[0] += 1
+            agg[1] += pt
+            agg[2] += ps
+        c_recompute = [
+            {"bucket_max": b, "n": agg[0],
+             "tok_per_s": round(agg[1] / agg[2], 1)}
+            for b, agg in sorted(buckets.items())]
+        # state lifetime: publish (dir first) -> last access, over blocks
+        # that were ever accessed
+        lifetimes = [m["last"] - m["first"] for m in self.dir.values()
+                     if m["count"] > 0 and m["last"] > 0 and m["first"] > 0]
+        state_lifetime = {
+            "n": len(lifetimes),
+            "p10": self._pctl(lifetimes, 0.1),
+            "p50": self._pctl(lifetimes, 0.5),
+            "p90": self._pctl(lifetimes, 0.9),
+            "max": round(max(lifetimes), 1) if lifetimes else None,
+        }
         published_blocks = sum(len(r.get("published") or []) for r in ok)
         published_bytes = sum(p["bytes"] for r in ok
                               for p in (r.get("published") or []))
@@ -1155,6 +1261,15 @@ class Scheduler:
             "evictions": self.evictions,
             "evicted_blocks": self.evicted_blocks,
             "evicted_bytes": self.evicted_bytes,
+            "session_turn_migration_rate": round(
+                len(migrated_q) / max(1, len(q_recs)), 4),
+            "remote_resume_opportunities": self.remote_resume_opportunities,
+            "remote_resume_served_local_due_to_replication":
+                self.repl_served_local,
+            "rederivation_tokens": rederiv,
+            "degrade_rederiv_tokens": self.degrade_rederiv_tokens,
+            "c_recompute": c_recompute,
+            "state_lifetime": state_lifetime,
             "avg_latency_s": round(sum(r["latency_s"] for r in ok)
                                    / max(1, len(ok)), 4),
             "p50_resp_s": self._pctl([r.get("queue_s", 0) + r["latency_s"]
@@ -1190,7 +1305,11 @@ class Scheduler:
                   "replications", "replicated_bytes",
                   "evictions", "evicted_blocks",
                   "avg_latency_s", "failed", "prefill_rate", "xfer_rate",
-                  "p50_resp_s", "p95_resp_s"):
+                  "p50_resp_s", "p95_resp_s",
+                  "session_turn_migration_rate",
+                  "remote_resume_opportunities",
+                  "remote_resume_served_local_due_to_replication",
+                  "rederivation_tokens", "degrade_rederiv_tokens"):
             print(f"  {k}: {out[k]}")
         for wid, ws in workers.items():
             print(f"  worker {wid}: {ws}")
@@ -1240,6 +1359,12 @@ def add_args(ap):
                     help="prefix block length b (05 v3 §1)")
     ap.add_argument("--sessions", type=int, default=4)
     ap.add_argument("--turns-per-session", type=int, default=4)
+    ap.add_argument("--q-tokens", type=int, default=None,
+                    help="E1 (07 §4): pin every question turn's token delta "
+                         "to exactly N (tile/truncate the cycled question "
+                         "text) so the session prefix grows linearly; "
+                         "default None = keep each question's natural "
+                         "length")
     ap.add_argument("--doc-chars", type=int, default=4000)
     ap.add_argument("--doc-repeat", type=int, default=1)
     ap.add_argument("--doc-repeat-alt", type=int, default=None)
