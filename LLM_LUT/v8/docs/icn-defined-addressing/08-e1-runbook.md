@@ -110,9 +110,34 @@ python -m icn_proto.e1_report
 
 读数重点：`transfers`（holder 可用性是否恢复）、`hot` 与 `g_nonpos`
 （session tip 的需求信号是否活过来）、`repl_planned`（经济门过线后
-控制器是否终于有活干）。三档结局：仍 0 ⇒ 饥饿不是主因，阴性更硬；
-开火 ⇒ 矩阵要加预算轴；中间态（fetch 恢复但 repl 仍 0）⇒ 抢跑机制
-仍是主因，按阴性走。
+控制器是否终于有活干）。
+
+### §4b 结果记录（2026-09-24，blkcluster_s8t40_20260924_125351.json）
+
+中间态结局，E1 阴性成立：
+
+| 门/指标 | 48MB（饥饿 regime） | 256MB（fetch-fest regime） |
+|---|---|---|
+| transfers | 7 | 136（1.85GB） |
+| hot | 2,765 | 32,856（λ 至 11/s） |
+| no_missing | 5,530 | **50,382（主导门）** |
+| g_nonpos / g_best | 0 / — | 14,573 / −0.0112 |
+| repl_planned / repl_served_local | 0 / 0 | **1 / 0** |
+
+判读：预算放宽后需求信号与 holder 可用性恢复，复制终于开火 1 次；
+但 b3 的 136 次临场搬运已把所有热 tip 送到需要它们的 worker
+（`no_missing` 5 万次），唯一落地的复制也没服务到任何迁移 resume。
+**跨两种 regime（饥饿 / fetch-fest），`repl_served_local` 恒为 0**
+（5 次冒烟累计 400+ 次机会）——抢跑机制 + 饥饿机制双层成立，阴性不是
+调参能救的。
+
+数据 caveat：该格 `prefill_rate` EWMA 被拖到 197.8 t/s（邻居负载 +
+254MB 注入变慢），p50 24.6s 不可与 48MB 格直接比；**计数类指标
+（hit/new_tok/xfer/repl）不受影响，latency 类只作参考**。
+
+**矩阵决策：不加预算轴**（48MB×4 次 + 256MB×1 次冒烟已覆盖预算轴
+的两个 regime），按预注册跑 §5 的 48MB 矩阵，重点补齐 b3 在 E1
+regime 的基线。
 
 ## 5. 确认矩阵（4 配置 × {b3, ours} × 2 reps = 16 格，~3.5 小时）
 
