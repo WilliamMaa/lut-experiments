@@ -205,7 +205,12 @@ class Scheduler:
         self._repl_reject = {"min_lambda": 0, "hot": 0, "no_chain": 0,
                              "unknown_block": 0, "no_missing": 0,
                              "inflight": 0, "no_holder": 0,
-                             "cooldown": 0, "g_nonpos": 0}
+                             "cooldown": 0, "g_nonpos": 0,
+                             # closest-to-zero rejected G: if deeply
+                             # negative the gate is decisively closed,
+                             # if within ~0.01s of firing the negative
+                             # verdict is a hair's breadth (E1 writeup)
+                             "g_best": None}
         # tokens re-prefilled because a planned fetch degraded to the
         # local boundary (holder lost blocks / empty delivery / stalled
         # xfer) — absolute churn account, grows with prefix length
@@ -743,6 +748,9 @@ class Scheduler:
                 g = lam * delta_c - c_copy - c_mem
                 if g <= 0:
                     rej["g_nonpos"] += 1
+                    rg = round(g, 4)
+                    if rej["g_best"] is None or rg > rej["g_best"]:
+                        rej["g_best"] = rg
                     continue
                 actions.append({"tip": tip, "holder": holders[0].ident,
                                 "target": w.ident, "names": missing,
