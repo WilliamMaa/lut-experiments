@@ -27,8 +27,7 @@ def main():
         path = sys.argv[1]
     else:
         cands = glob.glob(os.path.join(
-            os.path.dirname(os.path.dirname(os.path.dirname(
-                os.path.abspath(__file__)))),
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "results", "icn_proto", "blkcluster_*.json"))
         if not cands:
             sys.exit("no blkcluster_*.json under results/icn_proto/")
