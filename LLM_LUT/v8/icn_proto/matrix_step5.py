@@ -46,10 +46,15 @@ def wl_signature(args):
     """Workload-shape signature — part of the manifest cell key so
     closed-loop and open-arrival cells never mix. tps/qt pin the E1
     horizon parameters (2026-09-23: without them a resumed matrix would
-    silently inherit cells from a different --turns-per-session)."""
+    silently inherit cells from a different --turns-per-session). The
+    spill tier (E2) is part of the shape too: off (0) keeps legacy
+    signatures so s0 cells keep matching the E1 manifest."""
     tps = getattr(args, "turns_per_session", None)
     qt = getattr(args, "q_tokens", None) or 0
     tail = f"_tps{tps}_q{qt}"
+    sp = getattr(args, "spill_mb", 0.0)
+    if sp:
+        tail += f"_sp{sp:g}"
     if args.arrival == "poisson":
         return (f"pp{args.arrival_rate:g}_z{args.zipf_n}s{args.zipf_s:g}"
                 f"_t{args.think_s:g}{tail}_sd{args.seed}")
@@ -98,6 +103,8 @@ def run_cell(args, share, pol, rep, port):
         cmd += ["--worker-mem-budget-mb", str(args.budget_mb)]
     if args.repl_mem_price > 0:
         cmd += ["--repl-mem-price", str(args.repl_mem_price)]
+    if getattr(args, "spill_mb", 0.0) != 0:
+        cmd += ["--spill-mb", str(args.spill_mb)]
     if args.arrival == "poisson":
         cmd += ["--arrival", "poisson",
                 "--arrival-rate", str(args.arrival_rate),
@@ -149,6 +156,7 @@ def run_cell(args, share, pol, rep, port):
         d = json.load(open(path, encoding="utf-8"))
         for k in METRICS:
             row[k] = d.get(k)
+        row["spill"] = d.get("spill")   # E2 tier block (dict, not averaged)
         lat = [r["latency_s"] for r in d["records"] if r.get("latency_s")]
         row["p50_s"] = round(pctl(lat, 0.5), 4)
         row["p95_s"] = round(pctl(lat, 0.95), 4)
@@ -170,12 +178,18 @@ def aggregate(rows, slo_s):
     print(f"\n{'wl':<18} {'budget':>7} {'price':>7} {'share':>6} "
           f"{'policy':<7}{'runs':>5}"
           f"{'rps':>8}{'hit':>7}"
-          f"{'new_tok':>9}{'xfer':>6}{'repl':>6}{'evict':>7}{'p50':>8}"
+          f"{'new_tok':>9}{'xfer':>6}{'repl':>6}{'evict':>7}{'recall':>7}"
+          f"{'favoid':>7}{'p50':>8}"
           f"{'p95':>8}"
           f"{'SLO@' + str(slo_s) + 's':>9}{'wall':>8}")
     for (wl, budget, price, share, pol), rs in sorted(groups.items()):
         def m(k):
             vals = [r[k] for r in rs if r.get(k) is not None]
+            return statistics.mean(vals) if vals else float("nan")
+
+        def sp(k):
+            vals = [(r.get("spill") or {}).get(k) for r in rs]
+            vals = [v for v in vals if v is not None]
             return statistics.mean(vals) if vals else float("nan")
         print(f"{wl:<18} {budget:>7.0f} {price:>7.2g} {share:>6} "
               f"{pol:<7}{len(rs):>5}"
@@ -183,6 +197,7 @@ def aggregate(rows, slo_s):
               f"{m('hit_rate'):>7.3f}{m('new_tokens_processed'):>9.0f}"
               f"{m('transfers'):>6.1f}{m('replications'):>6.1f}"
               f"{m('evictions'):>7.1f}"
+              f"{sp('recall_blocks'):>7.1f}{sp('fetch_avoided_by_recall'):>7.1f}"
               f"{m('p50_s'):>8.3f}{m('p95_s'):>8.3f}{m('slo_att'):>9.3f}"
               f"{m('wall_s'):>8.1f}")
     bad = [r for r in rows if not r.get("json") or r.get("failed")]
@@ -223,6 +238,10 @@ def main():
     ap.add_argument("--repl-mem-price", type=float, default=0.0,
                     help="per-byte memory price passed through to "
                          "run_cluster --repl-mem-price (v3 pricing)")
+    ap.add_argument("--spill-mb", type=float, default=0.0,
+                    help="E2: host-DRAM spill tier capacity passed through "
+                         "to run_cluster (0 = off, -1 = unlimited); enters "
+                         "the workload signature")
     ap.add_argument("--arrival", choices=["none", "poisson"], default="none")
     ap.add_argument("--arrival-rate", type=float, default=1.0)
     ap.add_argument("--zipf-n", type=int, default=16)

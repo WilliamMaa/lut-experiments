@@ -179,6 +179,71 @@ python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-3
 每格约 13 分钟。最后一条跑完会打印聚合表（wl / rps / hit / new_tok /
 xfer / repl / evict / p50 / p95 / SLO）。
 
+### §5b 矩阵结果记录与 b3@s=1.6 超时诊断（2026-09-24）
+
+已入 manifest 的结果（λ=2.0，48MB）：
+
+| wl | policy | runs | rps | hit | new_tok | xfer | repl | evict | wall |
+|---|---|---|---|---|---|---|---|---|---|
+| pp2_z16s1_t2 | b3 | 2 | 1.20 | 0.976 | 22,188 | 155.5 | 0 | 0 | 279.6 |
+| pp2_z16s1_t2 | ours | 2 | 0.64 | 0.861 | 103,141 | 143.0 | **84.5** | 218.5 | 519.2 |
+| pp2_z16s1.6_t2 | b3 | 2 | 1.70 | 0.982 | 20,054 | 129.5 | 0 | 0 | 199.4 |
+| pp2_z16s1.6_t2 | ours | 2 | 1.84 | 0.439 | 416,313 | 30.0 | 7.5 | 482.5 | 182.7 |
+| pp1_z16s1_t2 | b3 | 2 | 1.83 | 0.979 | 20,970 | 150.5 | 0 | 0 | 184.4 |
+| pp1_z16s1_t2 | ours | 2 | 0.96 | 0.841 | 107,504 | 170.0 | 84.0 | 288.0 | 372.1 |
+| pp1_z16s1.6_t2 | b3 | 2 | 1.62 | 0.982 | 20,054 | 122.0 | 0 | 0 | 209.4 |
+| pp1_z16s1.6_t2 | ours | 2 | 0.73 | 0.752 | 145,019 | 112.5 | 76.0 | 362.5 | 454.5 |
+
+**E1 矩阵判决（2026-09-24 定稿，16 格全绿）**：ours 四格全败——
+劣化 4.6× / 5.1× / 7.2× / 20.8×，负载与偏斜轴均无翻案。
+机制：健康 regime 下 churn（repl 76–85 + evict 218–362 → 重算）；
+s=1.6/λ=2 落饥饿 regime（evict 482、hit 0.44）。详见
+`09-e1-results.md`。
+
+（b3 @ s=1.6 首次两格 1803s 超时，§5c 清格后错峰重跑干净通过
+（216s/185s）——偶发邻居争抢，非 bug。）
+
+**λ=2.0 初步判决：ours 全面显著劣于 b3（s=1.0 差 4.6×，s=1.6 差
+20.8×），且偏斜越大劣化越重**——churn 机制在 E1 尺度、4 worker 下
+复现并放大。λ=1.0 s=1.0 同构（b3 20,970 vs ours 107,504，5.1×，
+repl 84.0 / evict 288.0）。剩余 §5 第 4 条（λ=1.0 × s=1.6）跑完定稿。
+
+b3 超时诊断步骤：
+
+```bash
+ls results/icn_proto/cell_logs/ | grep s1.6
+tail -80 results/icn_proto/cell_logs/cell_pp2_z16s1.6_t2_tps40_q40_sd0_s2_b3_r0_b48_p0.log
+```
+
+看三件事：卡在模型加载（邻居 OOM）/ hello 握手 / 某个 turn 或 xfer
+的 watchdog 打印。若是邻居负载导致 GPU 争抢，错峰重跑即可；若是
+watchdog 打印后仍不退出，是真 bug，把日志贴回来。
+
+诊断完清坏格重跑（只补这两格）：
+
+```bash
+python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --gpu-pool 0,1,2,3,4,5,6,7 --sessions 8 --turns-per-session 40 --q-tokens 40 \
+  --shares 2 --policies b3 --reps 2 --budget-mb 48 --cell-timeout 1800 \
+  --arrival poisson --arrival-rate 2.0 --zipf-n 16 --zipf-s 1.6 --think-s 2.0 \
+  --manifest results/icn_proto/matrix_e1.json --drop-bad
+python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --gpu-pool 0,1,2,3,4,5,6,7 --sessions 8 --turns-per-session 40 --q-tokens 40 \
+  --shares 2 --policies b3 --reps 2 --budget-mb 48 --cell-timeout 1800 \
+  --arrival poisson --arrival-rate 2.0 --zipf-n 16 --zipf-s 1.6 --think-s 2.0 \
+  --manifest results/icn_proto/matrix_e1.json
+```
+
+### §5c 清坏格（随时可执行）
+
+```bash
+cd ~/lut-experiments/LLM_LUT/v8
+python -m icn_proto.matrix_step5 --manifest results/icn_proto/matrix_e1.json --drop-bad
+```
+
+只清坏格（rc≠0 / 无 JSON / failed>0 / JSON 重复占用的行），好格保留。
+清完重跑对应命令即只补坏格（manifest 键含 policy/rep/wl）。
+
 ## 6. 常见异常处置
 
 | 现象 | 处置 |

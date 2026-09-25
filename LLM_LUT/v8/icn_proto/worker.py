@@ -55,6 +55,57 @@ class Worker:
         self.resident = {}          # block name (str) -> KVBlockObj
         self._factories = {}
         self._install_done = False
+        # E2 (10-e2-backing-tier §3): host-DRAM backing tier. Evicted
+        # blocks land here instead of vanishing; recall pulls them back
+        # into residency. KVBlockObj tensors already live on CPU
+        # (kvcodec_blk.extract_blocks), so spill/recall are dict moves —
+        # the bytes are REAL DRAM residency either way.
+        cap_mb = getattr(args, "spill_mb", 0.0)
+        self.spill_enabled = cap_mb != 0
+        self.spill_cap = float("inf") if cap_mb < 0 else cap_mb * 1e6
+        self.spill = {}             # block name -> KVBlockObj (LRU order)
+        self.spill_bytes = 0
+        self.spill_stat = {"evicted_bytes": 0, "dropped_bytes": 0,
+                           "recall_count": 0, "recall_bytes": 0}
+
+    def _spill_put(self, name, obj):
+        """Eviction landing point: move a block into the tier. Capacity
+        pressure drops the oldest entries (LRU). Returns True if the
+        block is resident in the tier, False if dropped."""
+        if not self.spill_enabled:
+            return False
+        nb = obj.nbytes()
+        while self.spill and self.spill_bytes + nb > self.spill_cap:
+            old_name, old = next(iter(self.spill.items()))
+            del self.spill[old_name]
+            self.spill_bytes -= old.nbytes()
+            self.spill_stat["dropped_bytes"] += old.nbytes()
+        if nb > self.spill_cap:     # a single object larger than the tier
+            self.spill_stat["dropped_bytes"] += nb
+            return False
+        self.spill[name] = obj
+        self.spill_bytes += nb
+        self.spill_stat["evicted_bytes"] += nb
+        return True
+
+    def _recall(self, names):
+        """Pull blocks back from the tier into residency. Same shape as
+        a deliver landing — no wire traffic, no GPU involvement."""
+        recalled = []
+        for n in names:
+            obj = self.spill.pop(n, None)
+            if obj is None:
+                continue
+            self.resident[n] = obj
+            self.spill_bytes -= obj.nbytes()
+            self.spill_stat["recall_count"] += 1
+            self.spill_stat["recall_bytes"] += obj.nbytes()
+            recalled.append(obj.nbytes())
+        if recalled:
+            print(f"[{self.args.worker_id}] recalled {len(recalled)} "
+                  f"blocks from spill "
+                  f"({sum(recalled) / 1e6:.1f}MB)", flush=True)
+        return recalled
 
     # ---- setup ----------------------------------------------------------
 
@@ -170,6 +221,7 @@ class Worker:
               f"prefill={len(prefill_ids)} decode={decode_steps}", flush=True)
         cache = self._make_cache(repr_name)
         if resume_names:
+            self._recall([n for n in resume_names if n in self.spill])
             blocks = []
             for n in resume_names:
                 obj = self.resident.get(n)
@@ -244,11 +296,9 @@ class Worker:
         ctx = zmq.Context()
         sock = msg.dealer(ctx, self.args.scheduler,
                           identity=self.args.worker_id)
-        msg.send(sock, {"type": "hello", "worker_id": self.args.worker_id,
-                        "resident": list(self.resident),
-                        "tips": [n for n, o in self.resident.items()
-                                 if o.linear_checkpoint],
-                        "resident_bytes": 0})
+        msg.send(sock, dict({"type": "hello",
+                             "worker_id": self.args.worker_id},
+                            **self._status_hdr()))
         while True:
             _, hdr, payload = msg.recv(sock)
             mtype = hdr.get("type")
@@ -256,6 +306,9 @@ class Worker:
                 break
             if mtype == "fetch":
                 names = hdr.get("names", [])
+                # a spill holder recalls before sending — residency
+                # control may route copies through the tier (E2)
+                self._recall([n for n in names if n in self.spill])
                 objs, missing = [], []
                 for n in names:
                     obj = self.resident.get(n)
@@ -286,11 +339,20 @@ class Worker:
                 self.report_status(sock)
                 continue
             if mtype == "evict":
-                gone = [self.resident.pop(n) for n in hdr.get("names", [])
-                        if n in self.resident]
+                gone, spilled_b, dropped_b = [], 0, 0
+                for n in hdr.get("names", []):
+                    obj = self.resident.pop(n, None)
+                    if obj is None:
+                        continue
+                    gone.append(obj)
+                    if self._spill_put(n, obj):
+                        spilled_b += obj.nbytes()
+                    else:
+                        dropped_b += obj.nbytes()
                 print(f"[{self.args.worker_id}] evicted {len(gone)} blocks "
-                      f"({sum(o.nbytes() for o in gone) / 1e6:.1f}MB)",
-                      flush=True)
+                      f"({sum(o.nbytes() for o in gone) / 1e6:.1f}MB; "
+                      f"spill +{spilled_b / 1e6:.1f}MB, "
+                      f"dropped {dropped_b / 1e6:.1f}MB)", flush=True)
                 self.report_status(sock)
                 continue
             if mtype == "assign":
@@ -317,16 +379,28 @@ class Worker:
                 self.report_status(sock)
                 continue
 
+    def _status_hdr(self):
+        # tips = resident tips + spilled tips: a spilled tip still
+        # carries its GDN checkpoint and stays resumable (E2), so the
+        # scheduler must keep seeing it as a match candidate
+        return {
+            "resident": list(self.resident),
+            "tips": ([n for n, o in self.resident.items()
+                      if o.linear_checkpoint]
+                     + [n for n, o in self.spill.items()
+                        if o.linear_checkpoint]),
+            "resident_bytes": sum(o.nbytes()
+                                  for o in self.resident.values()),
+            "spilled": list(self.spill),
+            "spill_bytes": self.spill_bytes,
+            "spill": dict(self.spill_stat),
+        }
+
     def report_status(self, sock):
         # no busy field: the scheduler owns the busy flag (set on
         # assign/fetch, cleared on result). A worker-reported busy would
         # be stale by the time it arrives and caused double-booking.
-        msg.send(sock, {
-            "type": "status",
-            "resident": list(self.resident),
-            "tips": [n for n, o in self.resident.items()
-                     if o.linear_checkpoint],
-            "resident_bytes": sum(o.nbytes() for o in self.resident.values())})
+        msg.send(sock, dict({"type": "status"}, **self._status_hdr()))
 
 
 def main():
@@ -341,6 +415,10 @@ def main():
     ap.add_argument("--dtype", default="bfloat16")
     ap.add_argument("--repr", default="bf16")
     ap.add_argument("--worker-id", default="w0")
+    ap.add_argument("--spill-mb", type=float, default=0.0,
+                    help="E2 backing tier: host-DRAM spill capacity in MB; "
+                         "0 (default) = off (evict drops the block), "
+                         "-1 = unlimited; a full tier drops LRU-oldest")
     args = ap.parse_args()
     w = Worker(args)
     w.load_model()

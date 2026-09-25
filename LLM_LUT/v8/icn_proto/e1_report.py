@@ -37,6 +37,9 @@ def main():
     for k in KEYS:
         print(f"  {k}: {d.get(k)}")
     print(f"  repl_reject: {json.dumps(d.get('repl_reject'))}")
+    sp = d.get("spill")
+    if sp:
+        print(f"  spill: {json.dumps(sp)}")
     cr = d.get("c_recompute") or []
     if cr:
         print("  c_recompute: " + ", ".join(

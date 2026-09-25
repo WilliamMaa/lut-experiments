@@ -136,6 +136,12 @@ class WorkerState:
     # names that reached this worker through a controller REPLICATION
     # (not a demand fetch, not a local publish) — the E1 accounting of
     # "remote resume served local because we placed it here proactively"
+    spilled: set = field(default_factory=set)
+    # E2: names in the host-DRAM backing tier (evicted but not lost).
+    # Resume feasibility and holder checks are resident ∪ spilled;
+    # resident_bytes / budget accounting stay HBM-only.
+    spill_bytes: int = 0
+    spill_stat: dict = field(default_factory=dict)
 
 
 class Scheduler:
@@ -215,6 +221,15 @@ class Scheduler:
         # local boundary (holder lost blocks / empty delivery / stalled
         # xfer) — absolute churn account, grows with prefix length
         self.degrade_rederiv_tokens = 0
+        # E2 (10-e2-backing-tier §3) spill-tier accounting. Recall
+        # counters are scheduler-side (assign-time); the worker's own
+        # counters (evicted/dropped/recall bytes) arrive via status and
+        # are aggregated into summary's "spill" block.
+        self.spill_rate = getattr(args, "spill_rate", 20e9)
+        self.spill_recall_turns = 0
+        self.spill_recall_blocks = 0
+        self.spill_recall_bytes = 0
+        self.spill_fetch_avoided = 0
 
     def dir_add(self, name, nbytes, t=None):
         e = self.dir.get(name)
@@ -346,7 +361,9 @@ class Scheduler:
 
     def match_local(self, turn, w, tip_bound):
         """Longest resume position T on worker w: a tip position whose
-        full resume-name set (complete blocks + tip block) is resident."""
+        full resume-name set (complete blocks + tip block) is available
+        in the fast tier or the spill tier (E2: resident ∪ spilled —
+        eviction no longer destroys the resume path)."""
         bt = self.args.block_tokens
         best = 0
         for tip_name in w.tips:
@@ -355,7 +372,7 @@ class Scheduler:
                 continue
             if turn.tip_name_at(t_pos, "bf16", bt) != tip_name:
                 continue                      # not a tip of THIS turn's chain
-            if not all(n in w.resident
+            if not all(n in w.resident or n in w.spilled
                        for n in self.resume_names(turn, t_pos)):
                 continue
             best = max(best, t_pos)
@@ -443,19 +460,21 @@ class Scheduler:
                               if e_loc < self._tip_end(tn) <= tip_bound)
                 for t_pos in reversed(cand):
                     need = [n for n in self.resume_names(turn, t_pos)
-                            if n not in w.resident]
+                            if n not in w.resident
+                            and n not in w.spilled]
                     if not need:
                         # the whole resume set (tip block included) is
-                        # already resident — a FREE extension, not a
-                        # fetch. An empty `need` would also make the
-                        # all(...) holder check vacuous and ship a
+                        # already available locally — a FREE extension,
+                        # not a fetch. An empty `need` would also make
+                        # the all(...) holder check vacuous and ship a
                         # zero-block fetch that crashes the deliver
                         # path (share=8/ours/budget=48 crash, 20260922)
                         e_max = t_pos
                         break
                     holders = [x for x in self.workers.values()
-                               if x is not w and all(n in x.resident
-                                                     for n in need)]
+                               if x is not w and all(
+                                   n in x.resident or n in x.spilled
+                                   for n in need)]
                     if holders:
                         fetch = (holders[0].ident, need)
                         e_max = t_pos
@@ -463,12 +482,23 @@ class Scheduler:
             fresh = turn.cum_tokens - e_max
             fetch_bytes = sum(self.dir.get(bn, {}).get("bytes", 0)
                               for bn in (fetch[1] if fetch else []))
+            # E2 recall cost: the spilled part of the resume set is
+            # pulled host->device at spill_rate (PCIe, ~20GB/s), far
+            # below the cross-worker fetch price — local recall is
+            # therefore attributed ahead of a demand fetch.
+            recall_bytes = 0
+            if e_max > 0:
+                recall_bytes = sum(
+                    self.dir.get(bn, {}).get("bytes", 0)
+                    for bn in self.resume_names(turn, e_max)
+                    if bn in w.spilled)
             # queue wait: 0 for idle workers by construction (one in-flight
             # turn per worker); the term lands with pipelining in step 3
             rate = w.prefill_rate or self.prefill_rate
             cost = fresh / rate
             if fetch:
                 cost += fetch_bytes / self.xfer_rate
+            cost += recall_bytes / self.spill_rate
             eta = self.eta(w)   # expected finish of the in-flight turn
             cost += eta
             if e_max == e_loc and e_loc > 0:
@@ -482,6 +512,7 @@ class Scheduler:
             costs[w.ident.decode()] = {
                 "mode": mode, "E": e_max, "fresh": fresh,
                 "eta_s": round(eta, 4), "rate": round(rate, 1),
+                "recall_bytes": recall_bytes,
                 "cost_s": round(cost, 4)}
             # argmin cost; ties: prefer local resume, then larger E
             rank = (round(cost, 6), 0 if mode == "local" else 1, -e_max)
@@ -490,6 +521,7 @@ class Scheduler:
                         {"mode": mode, "E": e_max, "E_loc": e_loc,
                          "cost_s": round(cost, 4), "policy": pol,
                          "fresh": fresh, "fetch_bytes": fetch_bytes,
+                         "recall_bytes": recall_bytes,
                          "options": costs})
         if best is None:
             return None
@@ -575,7 +607,12 @@ class Scheduler:
                 continue
             excess = w.resident_bytes - budget
             pool = {}
-            for n in w.resident:
+            for n in w.resident | w.spilled:
+                # E2: spilled names join the walk — a tip living in the
+                # tier keeps its chain derivable (pre-E2 a resident tip
+                # implied a resident chain; eviction to the tier breaks
+                # that invariant). Non-resident hits are filtered from
+                # the action below, so accounting stays resident-only.
                 try:
                     pool.setdefault(BlockName.parse(n).block_hash, n)
                 except ValueError:
@@ -614,6 +651,11 @@ class Scheduler:
                 freed += sum(self.dir.get(n, {}).get("bytes", 0)
                              for n in names)
             names = list(dict.fromkeys(names))
+            # E2: only RESIDENT blocks can be evicted. A tip living in
+            # the spill tier keeps its chain protected above, but its
+            # own (non-resident) name must not ride the evict message —
+            # the worker would no-op it while evicted_bytes double-counts.
+            names = [n for n in names if n in w.resident]
             if names:
                 actions.append({"worker": w.ident, "names": names})
         return actions
@@ -704,8 +746,10 @@ class Scheduler:
                         >= self.args.max_repl_inflight:
                     return actions
                 # copy only what this target lacks; a target holding
-                # the whole resume set needs nothing
-                missing = [n for n in names if n not in w.resident]
+                # blocks in the spill tier (E2) has them addressable
+                # already — spill residency counts, nothing re-copied
+                missing = [n for n in names if n not in w.resident
+                           and n not in w.spilled]
                 if not missing:
                     rej["no_missing"] += 1
                     continue
@@ -714,7 +758,8 @@ class Scheduler:
                     rej["inflight"] += 1
                     continue      # demand fetch already delivering it
                 holders = [x for x in self.workers.values()
-                           if all(n in x.resident for n in missing)]
+                           if all(n in x.resident or n in x.spilled
+                                  for n in missing)]
                 if not holders:
                     rej["no_holder"] += 1
                     continue
@@ -811,6 +856,9 @@ class Scheduler:
                 if w is not None:
                     w.resident = set(hdr.get("resident", []))
                     w.tips = set(hdr.get("tips", []))
+                    w.spilled = set(hdr.get("spilled", []))
+                    w.spill_bytes = hdr.get("spill_bytes", 0)
+                    w.spill_stat = hdr.get("spill", {})
 
         try:
             while not self.finished():
@@ -910,6 +958,21 @@ class Scheduler:
             ident, e_resume, fetch, decision = chosen
             rid = f"{turn.session}:{turn.turn}"
             w = self.workers[ident]
+            if fetch is None and e_resume > 0:
+                # E2: local recall that replaces a cross-worker fetch.
+                # Without the tier this resume set was not resident on w
+                # and another worker could have served it — the demand
+                # fetch would have fired. Counted only when a holder
+                # actually exists (a fetch was the real alternative).
+                rn = self.resume_names(turn, e_resume)
+                need_ro = [n for n in rn if n not in w.resident]
+                if any(n in w.spilled for n in need_ro):
+                    holders = [x for x in self.workers.values()
+                               if x is not w and all(
+                                   n in x.resident or n in x.spilled
+                                   for n in need_ro)]
+                    if holders:
+                        self.spill_fetch_avoided += 1
             if fetch is not None:
                 holder_ident, names = fetch
                 self._xfer[rid] = {"stage": "fetch", "target": ident,
@@ -976,6 +1039,15 @@ class Scheduler:
         prev_worker = self._last_worker.get(turn.session)
         rec["migrated"] = bool(prev_worker and prev_worker != wid)
         self._last_worker[turn.session] = wid
+        # ---- E2 spill accounting (10 §3.2): blocks this turn pulls
+        # back from the backing tier into residency ----
+        recall = [n for n in resume_names if n in w.spilled]
+        if recall:
+            self.spill_recall_turns += 1
+            self.spill_recall_blocks += len(recall)
+            self.spill_recall_bytes += sum(
+                self.dir.get(n, {}).get("bytes", 0) for n in recall)
+            rec["spill_recall_blocks"] = len(recall)
         if turn.turn >= 0 and prev_worker and prev_worker != wid:
             # the session's latest state was published on another worker:
             # a remote-resume opportunity. It is "served local due to
@@ -1007,6 +1079,9 @@ class Scheduler:
             w.resident = set(hdr.get("resident", []))
             w.tips = set(hdr.get("tips", []))
             w.resident_bytes = hdr.get("resident_bytes", w.resident_bytes)
+            w.spilled = set(hdr.get("spilled", []))
+            w.spill_bytes = hdr.get("spill_bytes", w.spill_bytes)
+            w.spill_stat = hdr.get("spill", w.spill_stat)
             return
         if mtype == "result":
             rid = hdr["request_id"]
@@ -1306,6 +1381,17 @@ class Scheduler:
             "resident_bytes": w.resident_bytes,
             "prefill_rate": round(w.prefill_rate, 1),
         } for w in self.workers.values()}
+        # E2 spill-tier verdict block: scheduler-side recall accounting
+        # (assign-time) + worker-side tier counters (from status)
+        spill = {
+            "recall_turns": self.spill_recall_turns,
+            "recall_blocks": self.spill_recall_blocks,
+            "recall_bytes": self.spill_recall_bytes,
+            "fetch_avoided_by_recall": self.spill_fetch_avoided,
+            "workers": {w.ident.decode(): dict(w.spill_stat,
+                                               spill_bytes=w.spill_bytes)
+                        for w in self.workers.values()},
+        }
         out = {
             "config": {k: v for k, v in vars(self.args).items()},
             "prefill_rate": round(self.prefill_rate, 1),
@@ -1337,6 +1423,7 @@ class Scheduler:
             "repl_reject": dict(self._repl_reject),
             "c_recompute": c_recompute,
             "state_lifetime": state_lifetime,
+            "spill": spill,
             "avg_latency_s": round(sum(r["latency_s"] for r in ok)
                                    / max(1, len(ok)), 4),
             "p50_resp_s": self._pctl([r.get("queue_s", 0) + r["latency_s"]
@@ -1380,6 +1467,7 @@ class Scheduler:
             print(f"  {k}: {out[k]}")
         for wid, ws in workers.items():
             print(f"  worker {wid}: {ws}")
+        print(f"  spill: {json.dumps(out['spill'])}")
         d = out["directory"]
         print(f"  directory: {d['entries']} entries, "
               f"{d['total_bytes']/1e6:.1f}MB, {d['ever_accessed']} accessed")
@@ -1421,6 +1509,16 @@ def add_args(ap):
     ap.add_argument("--repl-mem-price", type=float, default=0.0,
                     help="placement controller: C_memory per byte-second in "
                          "G_rep; 0 = memory is free at prototype scale")
+    ap.add_argument("--spill-mb", type=float, default=0.0,
+                    help="E2 backing tier: per-worker host-DRAM spill "
+                         "capacity in MB, passed through to the workers; "
+                         "0 (default) = off (evict drops), -1 = unlimited, "
+                         "a full tier drops LRU-oldest")
+    ap.add_argument("--spill-rate", type=float, default=20e9,
+                    help="E2 cost model: spill-recall bandwidth host->device "
+                         "in B/s (PCIe gen4 ~20GB/s, ~200x the cross-worker "
+                         "xfer EWMA — local recall is priced well below a "
+                         "demand fetch)")
     ap.add_argument("--repr", default="bf16", choices=["bf16"])
     ap.add_argument("--block-tokens", type=int, default=16,
                     help="prefix block length b (05 v3 §1)")

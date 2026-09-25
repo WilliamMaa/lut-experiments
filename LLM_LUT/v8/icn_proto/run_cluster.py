@@ -38,7 +38,8 @@ def spawn_workers(pool, gpus_per_worker, scheduler_addr, args):
                "--device", args.device,
                "--dtype", args.dtype,
                "--repr", args.repr,
-               "--worker-id", f"w{wi}"]
+               "--worker-id", f"w{wi}",
+               "--spill-mb", str(getattr(args, "spill_mb", 0.0))]
         print(f"[launcher] w{wi} <- CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}")
         procs.append(subprocess.Popen(cmd, cwd=ROOT, env=env))
     return procs
