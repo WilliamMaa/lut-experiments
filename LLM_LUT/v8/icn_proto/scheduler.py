@@ -531,14 +531,21 @@ class Scheduler:
     # ---- Placement controller (slow path, 05 v3 §3) ------------------------
 
     def controller(self, sock):
-        """Event-driven slow path, runs after every result; 'ours' only
-        (b3 stays pure reactive — that contrast IS the step-4 claim).
+        """Event-driven slow path, runs after every result. EVICTION is
+        a shared substrate: under a memory budget EVERY policy must
+        respect it (b0-b3 degrade; ours additionally replicates) —
+        the budget fairness only holds if all policies actually evict.
+        The policy gate lives in _plan_repl only (2026-09-25 fix: the
+        old controller-level gate silently gave b3 an UNBOUNDED
+        residency — 800MB against a 48MB budget in the E2 b3 smoke —
+        which was an equal-budget violation (AGENTS red line 2) baked
+        into every E1 b3 baseline. E1 numbers stand as historical
+        runs; E2 re-baselines b3 under the shared substrate.)
         Plans are pure (_plan_*); _apply_* mutates scheduler state and,
         when sock is given, sends the corresponding messages."""
-        if self.args.policy not in ("ours", "p2"):
-            return
         self._apply_evict(sock, self._plan_evict())
-        # replication plans see post-eviction residency
+        # replication plans see post-eviction residency (repl itself
+        # is policy-gated: ours/p2 only)
         self._apply_repl(sock, self._plan_repl())
 
     @staticmethod

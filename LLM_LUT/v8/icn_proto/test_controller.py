@@ -177,6 +177,22 @@ def test_eviction_shared_substrate():
           w0.resident_bytes == 48e6, f"{w0.resident_bytes}")
     check("no double eviction next cycle", s._plan_evict() == [])
 
+    # E2 regression (2026-09-25): the slow path must RUN eviction for
+    # b3 too. The old controller-level policy gate gave b3 an
+    # unbounded residency (800MB vs the 48MB budget in the b3 smoke)
+    # while ours fought under the budget — an equal-budget violation.
+    s2 = make_sched("b3", worker_mem_budget_mb=48.0)
+    w0b = s2.workers[b"w0"]
+    _, names_b = hold(s2, w0b, doc_turn(seed=8))
+    w0b.resident_bytes = 48e6 + sum(s2.dir[n]["bytes"] for n in names_b)
+    s2.controller(None)           # the event-driven path, not _plan_*
+    check("controller evicts under b3",
+          s2.evictions == 1 and s2.evicted_blocks > 0,
+          f"evictions={s2.evictions}")
+    # and replication stays gated: b3 controller plans no copies
+    check("controller plans no repl under b3",
+          s2.repl_planned == 0 and s2._repl == {})
+
 
 def test_delivered_repl():
     print("replication delivery:")

@@ -48,6 +48,16 @@ git pull
 - **实现期修正**（单测暴露）：`_plan_evict` 的链推导 pool 原来只看
   resident，spill 后 tip 的链不可走会把整个 worker 跳过（驱逐停摆）；
   现 pool = resident ∪ spilled，最终过滤仍只驱逐 resident。
+- **2026-09-25 二次修正（公平性，重要）**：`controller()` 入口的
+  policy 门原来把**驱逐**也闸掉了——驱逐只在 ours 下运行，b3 实际
+  享有无限 residency（b3 冒烟实测 resident_bytes 800MB vs 预算
+  48MB），违反 AGENTS 红线 2 的同等预算原则，且该红利渗入了 E1 的
+  全部 b3 基线。修复：驱逐对全策略运行（`_plan_evict` 注释与
+  10 §3.2"策略无关共享基底"的本意），policy 门只留 `_plan_repl`。
+  **影响**：E1 的 b3 格保留为历史运行（其 hit 0.976 含"永不驱逐"
+  红利，写 12 号结果文档时必须标注）；E2 的所有 b3 格都在修复后的
+  共享预算下重跑（§5 新增 b3@s0 两条重基线命令）。ours 的 E1/E2
+  格不受影响（ours 本来就走驱逐路径）。
 
 ## 2. 远程验证（每次同步后必跑，<10 秒）
 
@@ -89,7 +99,12 @@ python -m icn_proto.run_cluster --policy ours --sessions 8 \
   --think-s 2.0 --worker-mem-budget-mb 48 --spill-mb -1 --seed 0
 ```
 
-### 4b. b3 @ spill∞（P1 对照纯净性）
+### 4b. b3 @ spill∞（共享基底下的对照——修 gate 后重跑）
+
+**注意**：`controller()` 驱逐门修复后，b3 也遵守 48MB 预算、被驱逐
+的块进 tier、recall 生效——**这正是 P1 该有的样子**：两策略同预算、
+同 tier，只差 proactive 复制。旧语义下的 b3 冒烟
+（20260925_153335）是最后一格"无限 residency"运行，仅作历史存档。
 
 ```bash
 python -m icn_proto.run_cluster --policy b3 --sessions 8 \
@@ -99,6 +114,13 @@ python -m icn_proto.run_cluster --policy b3 --sessions 8 \
   --arrival poisson --arrival-rate 2.0 --zipf-n 16 --zipf-s 1.0 \
   --think-s 2.0 --worker-mem-budget-mb 48 --spill-mb -1 --seed 0
 ```
+
+**P1 判读（修复后语义）**：b3 与 ours 在**计数质量指标上应同处一个
+区间**——hit 都 ~0.97、new_tok 都 ~2.2–2.4 万、rederivation 都千
+级（tier 吸收驱逐损失，两个策略都受益）；差别只在 `repl`（b3 恒 0）
+和各自 spill 口径的量。b3 的 `evicted_bytes`/`recall_count` 应 > 0
+（tier 是共享的，b3 也在用）、`resident_bytes` 应 ~48MB。若 b3 质量
+指标大幅偏离 ours 或预算又失控，才是泄漏/新 bug，贴日志回来。
 
 每格跑完读数：
 
@@ -110,11 +132,12 @@ python -m icn_proto.e1_report
 1. 两格均 `failed: 0`；
 2. ours 格的 `spill` 块：`spill_bytes` > 0 且某 worker 的
    `recall_count` > 0（tier 真的在收块、真的在召回）；
-3. **P1**：b3 格的计数类指标（hit / new_tok / xfer / transfers）
-   与 E1 基线同配置（matrix_e1.json 里
-   `pp2_z16s1_t2_tps40_q40_sd0` 的 b3 行：hit 0.976，new_tok
-   22,188，xfer 155.5）**无明显变化**——b3 在 E1 里 evict≈0，spill
-   不该改变它的行为；若显著变化说明实现有泄漏，先修再判。
+3. **P1（修复后语义）**：b3 格与 ours 格计数质量指标同区间——hit
+   都 ~0.97、new_tok 都 2.2–2.4 万、rederivation 都千级；差别只
+   在 `repl`（b3 恒 0）。b3 的 spill 口径 > 0（tier 共享，b3 也
+   在收块召回）、`resident_bytes` ~48MB。若 b3 质量大幅偏离或
+   预算失控 = 泄漏，先修再判。（旧语义 b3 基线 hit 0.976 /
+   new_tok 22,188 含无限 residency 红利，只作存档，见 §1。）
 4. ours 格的 `rederivation_tokens` 应明显低于 E1 同配置 ours 基线
    （103,141 new_tok 那格的重算部分）——tier 接住被驱逐的 state
    的直接证据。
@@ -147,7 +170,8 @@ w.tips 供 match/choose，但不保护链）；
 重跑 §4a 时期望：resident_bytes ≈ 45–50MB，spill 口径不变，
 rederivation 保持千级。
 
-## 5. 确认矩阵（2 spill 档 × 2 偏斜 × {b3, ours} × 2 reps = 16 格，~3.5 小时）
+## 5. 确认矩阵（2 spill 档 × 2 偏斜 × {b3, ours} × 2 reps = 16 格
+## + b3@s0 重基线 4 格 = 20 格，~4.5 小时）
 
 **逐条执行**，一条跑完再跑下一条（manifest 断点续跑，中断后重跑
 同一条即可）：
@@ -190,6 +214,33 @@ matrix_e1.json 的 s0 格（`_sp` 后缀缺省）互不串格。最后一条跑�
 打印聚合表，新增 `recall`（召回块数）与 `favoid`（召回替代的跨
 worker fetch 次数）两列。
 
+### §5a b3@s0 重基线（驱逐门修复后必须重跑，4 格）
+
+E1 的 b3@s0 格是在"驱逐被闸"的代码下跑的（无限 residency 红利），
+不能再用。ours@s0 的 E1 格不受影响（ours 本来就走驱逐路径），s0
+对比组 = E1 ours 格 + 下面重跑的 E3 b3 格：
+
+```bash
+cd ~/lut-experiments/LLM_LUT/v8
+python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --gpu-pool 0,1,2,3,4,5,6,7 --sessions 8 --turns-per-session 40 --q-tokens 40 \
+  --shares 2 --policies b3 --reps 2 --budget-mb 48 --cell-timeout 1800 \
+  --arrival poisson --arrival-rate 2.0 --zipf-n 16 --zipf-s 1.0 --think-s 2.0 \
+  --manifest results/icn_proto/matrix_e2.json
+```
+
+```bash
+python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --gpu-pool 0,1,2,3,4,5,6,7 --sessions 8 --turns-per-session 40 --q-tokens 40 \
+  --shares 2 --policies b3 --reps 2 --budget-mb 48 --cell-timeout 1800 \
+  --arrival poisson --arrival-rate 2.0 --zipf-n 16 --zipf-s 1.6 --think-s 2.0 \
+  --manifest results/icn_proto/matrix_e2.json
+```
+
+预期：b3@s0 进入饥饿 regime（与 E1 ours@s0 同构：transfers→0、
+rederivation 巨大、hit 塌）——这是 s0→s∞ 的 tier 效果对照里 b3
+一侧的必要基线。
+
 ### §5b 结果记录（跑完贴聚合表到这里）
 
 （待填）
@@ -203,12 +254,16 @@ worker fetch 次数）两列。
 | 想看重跑某格的完整日志 | `results/icn_proto/cell_logs/cell_<wl>_s2_<pol>_r<rep>_b48_p0.log`（wl 含 `_sp-1`/`_sp96`） |
 | 聚合表 spill 列全 0 | tier 没生效：确认命令带 `--spill-mb`、§2 五测试全过；再查该格日志里 `recalled` / `evicted ... spill +` 行 |
 | 96MB 档 `dropped_bytes` 恒 0 | LRU 没触发：tier 没满过，s=1.6 格应出现第二级 churn，若无则 P3 需要更大压力（记录即可，不回退） |
-| b3 的 spill 格指标显著偏离 E1 基线 | P1 违反：实现泄漏，停止矩阵，贴日志回来修 |
+| b3 的 spill 格质量指标大幅偏离 ours 同档 | 泄漏或新 bug，停止矩阵，贴日志回来修 |
 
 ## 7. 判决口径（10 §4 预注册，跑完对着读）
 
-**P1（对照纯净性）**：b3 在 spill 档与 E1 基线无显著差异。违反 =
-先修实现再判。
+**P1（对照纯净性，修复后语义）**：b3 与 ours 同预算同 tier，计数
+质量指标同区间（hit ~0.97、new_tok 2.2–2.4 万、rederivation 千
+级），b3 的 spill 口径 > 0（tier 共享）、`repl` 恒 0。若 b3 质量
+大幅偏离或预算失控 = 泄漏，先修再判。
+（历史注记：驱逐门修复前的 b3 基线 hit 0.976 含无限 residency
+红利，只作存档不作对照——§5a 重跑后的 b3@s0 才是合格基线。）
 
 **P2（design implication 成立）**：spill∞ 档 ours 同时满足
 ① `rederivation_tokens` 趋零；
