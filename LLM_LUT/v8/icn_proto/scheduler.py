@@ -617,13 +617,21 @@ class Scheduler:
                     pool.setdefault(BlockName.parse(n).block_hash, n)
                 except ValueError:
                     continue
-            # Protection is counted per BLOCK over every resident tip's
+            # Protection is counted per BLOCK over every RESIDENT tip's
             # FULL resume set (ancestors + tip): a tip block that is also
             # an interior chain block of a hotter tip (block-aligned
             # tips) is infrastructure and must survive.
+            # E2: only RESIDENT tips protect. Spilled tips stay in
+            # w.tips (matching/fetch must see them) but must not keep
+            # their chains alive — that is the pre-E2 semantics (10 §3.2
+            # "_plan_evict: 不变"; the tier changes the landing point,
+            # not the protection regime). Regression: E2 smoke
+            # 20260925 resident_bytes hit 669MB against the 48MB budget
+            # with ~197 spilled tips shielding everything.
+            resident_tips = [t for t in w.tips if t in w.resident]
             fulls, counts = {}, {}
             broken = False
-            for tip in w.tips:
+            for tip in resident_tips:
                 c = self._chain_names(tip, pool)
                 if c is None:
                     broken = True
@@ -641,6 +649,25 @@ class Scheduler:
                 return e.get("loc", {}).get(wid, e.get("lambda", 0.0))
 
             cold_first = sorted(fulls, key=_local_cold)
+            # Orphan sweep FIRST: resident blocks no RESIDENT tip covers
+            # — e.g. the resident remainder of a segment whose tip lives
+            # in the tier, or blocks delivered while their tip sat in
+            # another worker's status lag. Pre-E2 the resident-tips
+            # invariant made this a no-op; the tier breaks it, and
+            # without the sweep those blocks would pin the worker over
+            # budget forever (smoke 20260925: 669MB vs a 48MB budget).
+            # An orphan is by definition colder than any tip's chain,
+            # so it goes before the tip loop; precise byte accounting
+            # (no cumulative re-sum here).
+            covered = set(counts)
+            orphans = [n for n in w.resident if n not in covered]
+            orphans.sort(key=lambda n: self.dir.get(n, {}).get(
+                "lambda", 0.0))
+            for n in orphans:
+                if freed >= excess:
+                    break
+                names.append(n)
+                freed += self.dir.get(n, {}).get("bytes", 0)
             for tip in cold_first:
                 if freed >= excess:
                     break

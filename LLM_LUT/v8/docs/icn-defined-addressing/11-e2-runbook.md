@@ -118,8 +118,34 @@ python -m icn_proto.e1_report
 4. ours 格的 `rederivation_tokens` 应明显低于 E1 同配置 ours 基线
    （103,141 new_tok 那格的重算部分）——tier 接住被驱逐的 state
    的直接证据。
+5. **两格 e1_report 的 worker 行 `resident_bytes` 都应回到 ~48MB
+   量级**（HBM 预算内）。若冲到数百 MB，说明驱逐保护被 spilled
+   tip 撑住，驱逐基底停摆—— regime 无效，停止，贴输出回来
+   （首冒烟 20260925 就栽在这，见 §4c）。
 
 latency 类指标照旧只作参考（邻居噪声）。
+
+### §4c 首冒烟记录（2026-09-25，blkcluster_s8t40_20260925_095834.json，ours@spill∞）
+
+**作废重跑格**。P2 ①② 强烈向好：`rederivation_tokens` 仅 1,722
+（vs E1 同配置 ours 灾难格）、hit 0.973 ≈ b3 基线 0.976、
+new_tok 23,910 vs b3 22,188 = 1.08×（≤1.2× 以内）、
+recall_count 629/821、`fetch_avoided_by_recall` 20。
+
+**但 worker resident_bytes 669/681MB，预算 48MB——稀缺性 premise
+失效，整格作废**。根因：worker 把 spilled tip 报进 `tips`（为
+match 可见性，这部分对），而 `_plan_evict` 保护集取 `w.tips` 全
+部 → 197 个 spilled tip 的链把 resident 块全"保护"住，驱逐只清出
+1,837 块。修复（违反 10 §3.2"_plan_evict 不变"，已对齐）：
+① 保护与驱逐 Universe 只算 **resident tip**（spilled tip 留在
+w.tips 供 match/choose，但不保护链）；
+② 新增 **orphan 清扫**：不被任何 resident tip 链覆盖的 resident
+块（spilled 段的残留、状态滞后孤儿）按 λ 最冷先行驱逐——pre-E2
+该不变量成立时为空操作，tier 打破它后必须有这个清扫。
+回归测试 `test_evict_spilled_tip_chain_is_swept`。
+
+重跑 §4a 时期望：resident_bytes ≈ 45–50MB，spill 口径不变，
+rederivation 保持千级。
 
 ## 5. 确认矩阵（2 spill 档 × 2 偏斜 × {b3, ours} × 2 reps = 16 格，~3.5 小时）
 

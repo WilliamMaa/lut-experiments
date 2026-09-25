@@ -214,9 +214,10 @@ def test_evict_resident_only():
     print("eviction touches resident blocks only:")
     s = make_sched(worker_mem_budget_mb=48.0)
     w0 = s.workers[b"w0"]
-    # hot tip living in the tier (its whole segment evicted there — the
-    # realistic spill shape; its chain registered in the dir); a cold
-    # segment is resident
+    # hot tip living in the tier with its whole segment (the realistic
+    # spill shape); a cold segment is resident. Protection comes from
+    # RESIDENT tips only — the spilled tip must neither be re-evicted
+    # nor shield anything.
     hot_turn = session_turns(seed=7)[0]
     hot_tip, hot_names = register(s, hot_turn, lam=5.0)
     w0.tips.add(hot_tip)
@@ -238,6 +239,40 @@ def test_evict_resident_only():
     check("byte accounting covers resident only",
           s.evicted_bytes == sum(s.dir[n]["bytes"] for n in names),
           str(s.evicted_bytes))
+
+
+def test_evict_spilled_tip_chain_is_swept():
+    """Regression (E2 smoke 20260925: resident_bytes 669MB vs the 48MB
+    budget): a tip living in the tier must not keep its resident chain
+    protected. With resident-tip-only protection the chain becomes an
+    orphan and the sweep must evict it — otherwise spilled tips pin the
+    worker over budget forever."""
+    print("spilled tip's resident chain is swept:")
+    s = make_sched(worker_mem_budget_mb=48.0)
+    w0 = s.workers[b"w0"]
+    # session A: chain resident, tip evicted to the tier (still reported
+    # in w.tips — the worker reports spilled tips for matching)
+    t_a = session_turns(seed=55)[0]
+    tip_a, names_a = register(s, t_a, lam=0.0)
+    w0.tips.add(tip_a)
+    w0.resident |= set(names_a)
+    w0.spilled.add(tip_a)
+    w0.resident.discard(tip_a)         # the tip left residency for the tier
+    # the budget overflow equals exactly the resident (orphan) part of
+    # A's chain — the sweep alone must cover it, B's hot chain untouched
+    w0.resident_bytes = 48e6 + (len(names_a) - 1) * MB
+    # session B: active and hot on this worker — must be kept
+    t_b = session_turns(seed=66)[0]
+    tip_b, names_b = register(s, t_b, lam=5.0)
+    w0.tips.add(tip_b)
+    w0.resident |= set(names_b)
+    plan = s._plan_evict()
+    names = set(plan[0]["names"]) if plan else set()
+    check("orphan chain swept", set(names_a) - {tip_a} <= names,
+          f"{len(names)} blocks")
+    check("spilled tip itself untouched", tip_a not in names)
+    check("hot resident segment kept",
+          not (set(names_b) & names), f"{len(names)} blocks")
 
 
 def test_accounting():
@@ -285,6 +320,7 @@ def main():
     test_plan_repl_spill_holder()
     test_status_syncs_spilled()
     test_evict_resident_only()
+    test_evict_spilled_tip_chain_is_swept()
     test_accounting()
     print("test_e2: ALL PASS")
 
