@@ -134,15 +134,81 @@ python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-3
   --manifest results/icn_proto/matrix_e2.json
 ```
 
-## 6. 块生命周期追踪（机制观测用，可选）
+## 6. 块生命周期追踪（机制观测）
 
-任何 run_cluster / 矩阵命令加 `--trace-dir <目录>` 即开启（每格一个
-子目录，每进程一个 JSONL；不开则零开销）。重放某个块的完整一生：
+§5 的矩阵命令已带 `--trace-dir results/icn_proto/traces`，每格追踪写在
+子目录里，命名规则：
+
+```
+results/icn_proto/traces/cell_<wl>_s2_<policy>_r<rep>
+```
+
+当前已跑完的 16 格（E2 manifest 全部）：
+
+| wl | b3 目录 | ours 目录 |
+|---|---|---|
+| `pp2_z16s1_t2_tps40_q40_sp-1_sd0` | `cell_pp2_z16s1_t2_tps40_q40_sp-1_sd0_s2_b3_r0` / `_r1` | `..._s2_ours_r0` / `_r1` |
+| `pp2_z16s1.6_t2_tps40_q40_sp-1_sd0` | 同上换 wl | 同上换 wl |
+| `pp2_z16s1_t2_tps40_q40_sp96_sd0` | 同上换 wl | 同上换 wl |
+| `pp2_z16s1.6_t2_tps40_q40_sp96_sd0` | 同上换 wl | 同上换 wl |
+
+`cell_pp2_z16s1_t2_tps40_q40_sd0_s2_b3_r0` / `_r1` 和
+`cell_pp2_z16s1.6_t2_tps40_q40_sd0_s2_b3_r0` / `_r1`（无 `_sp` 段）。
+
+（格 → summary JSON 的对应关系在 manifest 里，下面命令直接查。）
+
+### 6a. 选一个热点块（以 sp96 × s1.6 延迟崩塌格为例）
 
 ```bash
-python -m icn_proto.trace_replay <trace_dir>/<cell_dir> "span/1840-1856"
-python -m icn_proto.trace_replay <trace_dir>/<cell_dir> --summary
+cd ~/lut-experiments/LLM_LUT/v8
+python -c "
+import json
+m = json.load(open('results/icn_proto/matrix_e2.json'))
+for r in m:
+    if 'z16s1.6' in r.get('wl','') and '_sp96_' in r.get('wl','') \
+       and r['policy']=='ours' and r['rep']==0:
+        print('JSON:', r['json'])
+        d = json.load(open(r['json']))
+        for e in d['directory']['top_lambda'][:10]:
+            print('  lambda=%-9s count=%-4s %s' % (e['lambda'], e['count'], e['name']))
+"
 ```
+
+输出每行末尾是块名（截断显示，但 `span/起点-终点` 部分完整）。记下
+要查的块的 span，如 `1968-1984`。把上面条件换成 `policy=='b3'`、
+`rep==1`、或 `z16s1_`/`_sp-1_` 可查其它格。
+
+### 6b. 先看仪器是否完整（每格必做）
+
+```bash
+python -m icn_proto.trace_replay \
+  results/icn_proto/traces/cell_pp2_z16s1.6_t2_tps40_q40_sp96_sd0_s2_ours_r0 \
+  --summary
+```
+
+应列出每个进程的事件计数（worker 的 publish/evict/recall，
+scheduler 的 demand/fetch_send/delivered 等），总数 > 0。全是 0
+说明该格没带追踪，重跑对应 §5 命令。
+
+### 6c. 重放单块完整一生
+
+```bash
+python -m icn_proto.trace_replay \
+  results/icn_proto/traces/cell_pp2_z16s1.6_t2_tps40_q40_sp96_sd0_s2_ours_r0 \
+  "span/1968-1984"
+```
+
+（第二参数是名字子串，用 6a 里记下的 span，加引号。）输出按时间
+归并了该块的所有事件：publish → demand → evict（落点 spilled 还是
+dropped）→ recall / fetch_send → delivered。同一 span 若匹配到多块
+会全部打出，正常。
+
+### 6d. 要贴回来的东西
+
+1. 6a 的 top-lambda 列表；
+2. 6b 的 `--summary` 输出；
+3. 6c 对 **sp96 × s1.6 的 ours 和 b3 各一格** 各重放 2–3 个高
+   lambda 块的完整输出。
 
 ## 7. 常见异常处置
 
