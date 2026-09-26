@@ -144,12 +144,16 @@ class WorkerState:
     spill_bytes: int = 0
     spill_stat: dict = field(default_factory=dict)
     evict_t: dict = field(default_factory=dict)
-    # names the scheduler evicted from this worker, name -> scheduler-side
-    # eviction time. A worker status is a FULL SNAPSHOT taken when the
-    # worker sends it; a snapshot generated before the worker processed
-    # our eviction would resurrect the evicted names on replace. The
-    # status handler subtracts entries newer than the snapshot's
-    # timestamp (regression 2026-09-27: s0-leg STALE_RESUME hard fails).
+    # names the scheduler evicted from this worker, name -> SEQ of the
+    # evict command. A worker status is a FULL SNAPSHOT tagged with the
+    # seq of the last command the worker PROCESSED; a snapshot whose
+    # seq predates our evict command would resurrect the evicted names
+    # on replace. The status handler subtracts entries with a greater
+    # seq (regression 2026-09-27: s0-leg STALE_RESUME hard fails; the
+    # first wall-clock-timestamp version missed in-flight evict/status
+    # crossings and was replaced by this causal seq).
+    cmd_sent: int = 0
+    # commands sent to this worker; the seq the next _send will carry
 
 
 class Scheduler:
@@ -710,20 +714,30 @@ class Scheduler:
                 actions.append({"worker": w.ident, "names": names})
         return actions
 
+    def _send(self, sock, hdr, ident, payload=None):
+        """Send a command to one worker, stamping it with a per-worker
+        causal seq. The worker echoes the seq of the last command it
+        processed in every status, so the scheduler can tell whether a
+        snapshot predates any of its own (optimistically applied)
+        commands."""
+        w = self.workers[ident]
+        w.cmd_sent += 1
+        msg.send(sock, hdr, ident=ident, payload=payload)
+        return w.cmd_sent
+
     def _apply_evict(self, sock, actions):
         for a in actions:
             w = self.workers[a["worker"]]
-            if sock is not None:
-                msg.send(sock, {"type": "evict", "names": a["names"]},
-                         ident=w.ident)
+            evict_seq = (self._send(sock, {"type": "evict",
+                                           "names": a["names"]}, w.ident)
+                         if sock is not None else w.cmd_sent + 1)
             nbytes = sum(self.dir.get(n, {}).get("bytes", 0)
                          for n in a["names"])
-            t_now = time.time()
             for n in a["names"]:
                 w.resident.discard(n)
                 w.tips.discard(n)
                 w.via_repl.discard(n)
-                w.evict_t[n] = t_now
+                w.evict_t[n] = evict_seq
                 self.trace.emit("evict_plan", n, worker=w.ident.decode())
             # Optimistic accounting: the worker's status ack lags one
             # cycle, so without this the controller re-plans eviction
@@ -866,8 +880,8 @@ class Scheduler:
             self._repl_cool[(a["tip"], a["target"])] = \
                 time.time() + self.args.repl_cooldown
             if sock is not None:
-                msg.send(sock, {"type": "fetch", "names": a["names"],
-                                "repl": rid}, ident=a["holder"])
+                self._send(sock, {"type": "fetch", "names": a["names"],
+                                  "repl": rid}, a["holder"])
             for n in a["names"]:
                 self.trace.emit("repl_send", n,
                                 holder=a["holder"].decode(),
@@ -1050,8 +1064,8 @@ class Scheduler:
                 print(f"[xfer ] {rid} fetch {len(names)} blocks from "
                       f"{holder_ident.decode()} -> {ident.decode()} "
                       f"(E target {decision['E']})", flush=True)
-                msg.send(sock, {"type": "fetch", "names": names},
-                         ident=holder_ident)
+                msg_fetch = {"type": "fetch", "names": names}
+                self._send(sock, msg_fetch, holder_ident)
                 for n in names:
                     self.trace.emit("fetch_send", n,
                                     holder=holder_ident.decode(),
@@ -1091,7 +1105,7 @@ class Scheduler:
               f"E={e_resume} resume_blocks={len(resume_names)} "
               f"publish_blocks={len(new_names)} "
               f"prefill_tokens={len(turn.prefix_ids) - e_resume}", flush=True)
-        msg.send(sock, {
+        self._send(sock, {
             "type": "assign", "request_id": rid,
             "session": turn.session, "turn": turn.turn,
             "resume_names": resume_names,
@@ -1099,7 +1113,7 @@ class Scheduler:
             "prefill_ids": turn.prefix_ids[e_resume:],
             "decode_steps": decode_steps,
             "repr": "bf16",
-        }, ident=ident)
+        }, ident)
         self.records.append({"request_id": rid, "worker": w.ident.decode(),
                              "t_assigned": time.time(),
                              "t_arrive": turn.t_arrive,
@@ -1154,19 +1168,19 @@ class Scheduler:
             # turns, but the scheduler may already have assigned/fetched
             # a new turn to this worker). Scheduler-side busy lifecycle:
             # set True on assign / fetch dispatch, cleared on result.
-            # A snapshot taken BEFORE the worker processed one of our
-            # evictions still lists the evicted names — blind replace
-            # would resurrect them (STALE_RESUME, s0 cells 2026-09-27).
-            # Subtract evictions newer than the snapshot; retire entries
-            # the snapshot confirms (name absent) or that are long past.
-            t_snap = hdr.get("t", 0.0)
-            ghost = {n for n, te in w.evict_t.items() if te > t_snap}
+            # A snapshot whose seq predates one of our evict commands was
+            # taken before the worker processed that eviction and still
+            # lists the evicted names — blind replace would resurrect
+            # them (STALE_RESUME, s0 cells 2026-09-27). Subtract
+            # evictions with a greater seq; retire entries the snapshot
+            # causally covers (its seq proves the worker processed the
+            # evict, so the name is genuinely gone or re-acquired).
+            seq_snap = hdr.get("seq", 0)
+            ghost = {n for n, s in w.evict_t.items() if s > seq_snap}
             snap_res = set(hdr.get("resident", []))
             w.resident = snap_res - ghost
             w.tips = set(hdr.get("tips", [])) - ghost
-            for n in [n for n, te in w.evict_t.items()
-                      if (te <= t_snap and n not in snap_res)
-                      or te < t_snap - 600.0]:
+            for n in [n for n, s in w.evict_t.items() if s <= seq_snap]:
                 del w.evict_t[n]
             w.resident_bytes = hdr.get("resident_bytes", w.resident_bytes)
             w.spilled = set(hdr.get("spilled", []))
@@ -1274,14 +1288,14 @@ class Scheduler:
                     print(f"[ctl  ] {rid} fetched {xfer['bytes']/1e6:.1f}MB "
                           f"from {ident.decode()} in {xfer_s:.2f}s",
                           flush=True)
-                    msg.send(sock, {"type": "deliver", "repl": rid},
-                             payload=payload, ident=xfer["target"])
+                    self._send(sock, {"type": "deliver", "repl": rid},
+                               xfer["target"], payload=payload)
                 else:
                     print(f"[xfer ] {rid} fetched {xfer['bytes']/1e6:.1f}MB "
                           f"from {ident.decode()} in "
                           f"{time.time() - xfer['t_fetch']:.2f}s", flush=True)
-                    msg.send(sock, {"type": "deliver"}, payload=payload,
-                             ident=xfer["target"])
+                    self._send(sock, {"type": "deliver"},
+                               xfer["target"], payload=payload)
             else:
                 # holder lost blocks: demand degrades to the local
                 # boundary; a failed replication just aborts (zero-replica

@@ -10,7 +10,17 @@ cd ~/lut-experiments/LLM_LUT/v8
 git pull
 ```
 
-## 2. 同步后验证（每次 git pull 后必跑，5 条测试命令，<10 秒）
+## 2. git pull 之后：确认拉下来的代码没坏（5 条命令，<10 秒）
+
+这 5 条是项目的单元测试，不碰 GPU、不加载模型，几秒钟跑完。作用：
+**抓代码错误，不针对操作人**。两类原因都会 FAIL——
+
+1. 我（改代码的一方）把别的东西改坏了——这是主要防范对象，
+   一次 FAIL 等于替所有下游实验挡了一个会作废全部结果的 bug；
+2. 你这边代码状态乱了（没拉全 / 拉错版本 / 本地改动冲突）——
+   真发生了重置一下就好，不是操作失误的问题。
+
+任何一条 FAIL = 不要开始跑实验。
 
 ```bash
 cd ~/lut-experiments/LLM_LUT/v8
@@ -21,8 +31,7 @@ python -m icn_proto.test_policy
 python -m icn_proto.test_openloop
 ```
 
-五行 `ALL PASS` 才继续（test_controller / test_e1 / test_e2 /
-test_policy / test_openloop）。任何 FAIL 停止，把输出贴回来。
+每条最后一行应打印 `ALL PASS`，5 条全过再继续往下走。
 
 ## 3. 跑前检查
 
@@ -135,21 +144,19 @@ python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-3
   --manifest results/icn_proto/matrix_e2.json
 ```
 
-## 5b. 事故二修复后的重跑流程（2026-09-27 快照 clobber 修复）
+## 5b. 修复后重跑（清受影响的格）
 
-修复改变了 scheduler 行为。已有格子**不是全删重跑**：每格 JSON
-的 `stale_resume_retries` 记录了修复前 bug 是否触发过——
+背景见 `12-e2-diag.md` 事故二。步骤：
 
-1. 同步代码后跑 §2 的 5 条测试命令（含新回归测试
-   `test_status_snapshot_clobber`），全过再继续；
-2. 扫描全部格子并清掉受影响的（retries>0 或 JSON 不可读）：
+1. 跑 §2 的 5 条测试命令，全过再继续；
+2. 清掉受影响的格（retries>0 或 JSON 不可读）：
 
 ```bash
 python -m icn_proto.matrix_report --drop-stale
 ```
 
-3. 重跑 §5 和 §5a 的命令（manifest 断点续跑，只补被清的格）。
-   新跑出的格 `stale_resume_retries` 应为 0；不为 0 贴回来。
+3. 重跑 §5 和 §5a 的命令（只补被清的格）。新格
+   `stale_resume_retries` 应为 0；不为 0 贴回来。
 
 ## 6. 块生命周期追踪（机制观测）
 

@@ -289,13 +289,17 @@ def test_repl_ack_not_swallowed():
 
 def test_status_snapshot_clobber():
     """Regression 2026-09-27 (s0-leg STALE_RESUME hard failures): a
-    worker status is a full snapshot taken when the worker SENDS it.
-    A snapshot generated before the worker processed one of our
-    evictions still lists the evicted names; the status handler's blind
-    full replace resurrected them into the scheduler's (optimistically
-    post-eviction) view, and the next dispatch planned a local resume
-    the worker could not serve. Fix: statuses carry a timestamp and the
-    handler subtracts scheduler-side evictions newer than it."""
+    worker status is a full snapshot tagged with the seq of the last
+    command the worker processed. A snapshot whose seq predates one of
+    our evict commands was taken before the worker processed that
+    eviction and still lists the evicted names — the status handler's
+    blind full replace resurrected them into the scheduler's
+    (optimistically post-eviction) view, and the next dispatch planned
+    a local resume the worker could not serve. Wall-clock timestamps
+    did NOT close the hole: a snapshot taken while our evict was still
+    in flight to the worker has a fresh timestamp but pre-eviction
+    content. Fix: per-worker causal seqs on both sides; the handler
+    subtracts evictions with a greater seq."""
     print("status snapshot clobber:")
     turn = doc_turn()
     s = make_sched("b3", worker_mem_budget_mb=48.0)
@@ -308,9 +312,11 @@ def test_status_snapshot_clobber():
     s._apply_evict(None, plan)
     check("optimistic view dropped", not (evicted & w0.resident))
 
-    # stale snapshot: taken half a second BEFORE the eviction was
-    # applied, still lists the evicted names as resident
-    stale = {"type": "status", "t": time.time() - 0.5,
+    # stale snapshot: seq 0 — taken BEFORE the worker processed the
+    # evict command (the seq-1 command). Covers both the late-queue
+    # case and the in-flight-crossing case (fresh wall time, stale
+    # causality).
+    stale = {"type": "status", "seq": 0,
              "resident": list(w0.resident | evicted),
              "tips": list(w0.tips | evicted),
              "resident_bytes": 1, "spilled": [],
@@ -321,9 +327,10 @@ def test_status_snapshot_clobber():
     check("stale snapshot cannot resurrect evicted tips",
           not (evicted & w0.tips))
 
-    # fresh snapshot (worker already processed the evict) confirms the
-    # drop and retires the log entries
-    fresh = {"type": "status", "t": time.time(), "resident": [],
+    # a snapshot with seq >= the evict command's seq proves the worker
+    # processed the eviction: the name is genuinely gone, the log
+    # entry retires
+    fresh = {"type": "status", "seq": 99, "resident": [],
              "tips": [], "resident_bytes": 0, "spilled": [],
              "spill_bytes": 0, "spill": {}}
     s.on_message(None, b"w0", fresh, payload=None)

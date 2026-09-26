@@ -121,21 +121,29 @@ sp-1 永不驱逐。只有 s0（虚空落点）无处兜底。
 
 ### 3. 修复（2026-09-27 实现，回归测试 `test_status_snapshot_clobber`）
 
-- worker `_status_hdr` 增加快照时间戳 `"t"`；
-- scheduler `WorkerState` 增加 `evict_t`（本端发起的驱逐
-  name→time 日志），`_apply_evict` 记录；
-- status handler：替换视图时减去"比快照时间新的本端驱逐"
-  （resident 和 tips 都减）；快照确认了丢失（名字不在快照里）
-  或超过 600s 的日志条目退役；
+- worker `_status_hdr` 携带因果序号 `"seq"`（每处理一条命令递增）；
+- scheduler `WorkerState` 增加 `evict_t`（驱逐 name→**驱逐命令的
+  seq**）与 `cmd_sent`（`_send` 统一发命令并编号）；
+- status handler：快照序号**小于**某条驱逐命令序号的快照，证明
+  拍于 worker 处理该驱逐之前，替换视图时减去这些驱逐名
+  （resident 和 tips 都减）；快照序号覆盖到的日志条目退役；
 - 复活路径（result 的 published、deliver 的 fetch/repl）把名字
-  从 `evict_t` 弹出，允许真复活；
-- 六测全绿（含新回归测试：旧快照不能复活已驱逐块、新快照正常
-  生效、日志正确退役）。
+  从 `evict_t` 弹出，允许真复活。
+
+**演进记录**：第一版用 wall-clock 时间戳（快照 `t` vs 驱逐时间），
+当晚补跑 sp96×s1.6 b3 仍出现 1 次 STALE_RESUME——时间戳防不住
+"驱逐命令还在飞行、worker 已按驱逐前状态拍了快照"的交叉窗口
+（快照时间比驱逐时间新，内容却是旧的）。第二版改为因果序：
+序号序比较的是"worker 到底处理到哪条命令"，与飞行延迟无关，
+从原理上闭住。
 
 **原拟的 pending-interest pin 方案未采用**：trace 显示驱逐全部发生
-在派工之前，pin 护不住已驱逐的块；clobber 修复才是对症的。
-pin（有 pending interest 的 content 不可选为驱逐 victim）作为
-PIT 语义的独立机制，留待 interest aggregation 实验时一并评估。
+在派工之前，pin 护不住已驱逐的块；pin（有 pending interest 的
+content 不可选为驱逐 victim）作为 PIT 语义的独立机制，留待
+interest aggregation 实验时一并评估。
+
+六测全绿（含回归测试：旧快照不能复活已驱逐块、新快照正常生效、
+日志正确退役）。
 
 ### 4. 备注
 

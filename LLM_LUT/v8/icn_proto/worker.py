@@ -71,6 +71,11 @@ class Worker:
         # lifecycle tracing (14): per-block event stream, enabled only
         # when the launcher sets ICN_TRACE_DIR
         self.trace = open_tracer(getattr(args, "worker_id", "worker"))
+        # causal position of this worker's command stream: incremented
+        # for every command processed, echoed in every status as "seq"
+        # so the scheduler can tell whether a full-snapshot status
+        # predates its own evictions (12-e2-diag incident 2)
+        self.cmd_seq = 0
 
     def _spill_put(self, name, obj):
         """Eviction landing point: move a block into the tier. Capacity
@@ -321,6 +326,7 @@ class Worker:
                             **self._status_hdr()))
         while True:
             _, hdr, payload = msg.recv(sock)
+            self.cmd_seq += 1
             mtype = hdr.get("type")
             if mtype == "shutdown":
                 break
@@ -409,9 +415,10 @@ class Worker:
         # carries its GDN checkpoint and stays resumable (E2), so the
         # scheduler must keep seeing it as a match candidate
         return {
-            # snapshot timestamp: the scheduler subtracts its own
-            # post-snapshot evictions on replace (2026-09-27 clobber fix)
-            "t": time.time(),
+            # causal position: the seq of the last command this worker
+            # processed — lets the scheduler discard snapshots that
+            # predate its own evictions (12-e2-diag incident 2)
+            "seq": self.cmd_seq,
             "resident": list(self.resident),
             "tips": ([n for n, o in self.resident.items()
                       if o.linear_checkpoint]
