@@ -215,9 +215,29 @@ dropped）→ recall / fetch_send → delivered。同一 span 若匹配到多块
 | 现象 | 处置 |
 |---|---|
 | 某格 `BAD` / 超时 | `python -m icn_proto.matrix_step5 --manifest results/icn_proto/matrix_e2.json --drop-bad`（清坏格），然后重跑那一条命令 |
+| 同一格清完重跑还 `BAD` | 先别重跑。跑 §7a 的命令看失败错误，贴回来再定处置 |
 | worker 起不来 / hello 超时 | 有孤儿进程：`pkill -9 -f icn_proto`，sleep 3，重跑 |
 | 想看重跑某格的完整日志 | `results/icn_proto/cell_logs/cell_<wl>_s2_<pol>_r<rep>_b48_p0.log`（wl 含 `_sp-1`/`_sp96`） |
 | 聚合表 spill 列全 0 | 确认命令带 `--spill-mb`、§2 五测试全过；再查该格日志里 `recalled` / `evicted ... spill +` 行 |
 | 96MB 档 `dropped_bytes` 恒 0 | LRU 没触发；s=1.6 格应出现第二级 churn，若无记录到结果文档即可 |
 | 格内 failed>0，错误含 `resume block not resident` / `STALE_RESUME` | 根因见 `12-e2-diag.md`：确认 `git pull` 拿到修复 → `--drop-bad` 清格重跑；修复后仍出现则贴日志 |
 | b3 的 spill 格质量指标大幅偏离 ours 同档 | 泄漏或新 bug，停止矩阵，贴日志回来修 |
+
+### 7a. 看格内失败错误（最近 4 个有 failed 的 JSON）
+
+```bash
+cd ~/lut-experiments/LLM_LUT/v8
+python - <<'EOF'
+import json, glob, os
+for p in sorted(glob.glob('results/icn_proto/blkcluster_*.json'),
+                key=os.path.getmtime)[-4:]:
+    d = json.load(open(p))
+    if not d.get('failed'):
+        continue
+    print('==', p, 'failed', d['failed'])
+    for r in d['records']:
+        if not r.get('ok'):
+            print(' ', r.get('request_id'), '->', r.get('worker'),
+                  repr(r.get('error'))[:200])
+EOF
+```
