@@ -128,7 +128,17 @@ python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-3
   --manifest results/icn_proto/matrix_e2.json
 ```
 
-## 6. 常见异常处置
+## 6. 块生命周期追踪（机制观测用，可选）
+
+任何 run_cluster / 矩阵命令加 `--trace-dir <目录>` 即开启（每格一个
+子目录，每进程一个 JSONL；不开则零开销）。重放某个块的完整一生：
+
+```bash
+python -m icn_proto.trace_replay <trace_dir>/<cell_dir> "span/1840-1856"
+python -m icn_proto.trace_replay <trace_dir>/<cell_dir> --summary
+```
+
+## 7. 常见异常处置
 
 | 现象 | 处置 |
 |---|---|

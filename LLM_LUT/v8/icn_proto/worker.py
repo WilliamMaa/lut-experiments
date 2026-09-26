@@ -44,6 +44,7 @@ from icn_proto import msg
 from icn_proto.blkchain import BlockName
 from icn_proto.kvcodec_blk import KVBlockObj, extract_blocks, inject_blocks
 from icn_proto.presets import cache_factory
+from icn_proto.trace import open_tracer
 
 
 class Worker:
@@ -67,6 +68,9 @@ class Worker:
         self.spill_bytes = 0
         self.spill_stat = {"evicted_bytes": 0, "dropped_bytes": 0,
                            "recall_count": 0, "recall_bytes": 0}
+        # lifecycle tracing (14): per-block event stream, enabled only
+        # when the launcher sets ICN_TRACE_DIR
+        self.trace = open_tracer(getattr(args, "worker_id", "worker"))
 
     def _spill_put(self, name, obj):
         """Eviction landing point: move a block into the tier. Capacity
@@ -80,8 +84,10 @@ class Worker:
             del self.spill[old_name]
             self.spill_bytes -= old.nbytes()
             self.spill_stat["dropped_bytes"] += old.nbytes()
+            self.trace.emit("spill_drop", old_name, reason="lru")
         if nb > self.spill_cap:     # a single object larger than the tier
             self.spill_stat["dropped_bytes"] += nb
+            self.trace.emit("spill_drop", name, reason="oversize")
             return False
         self.spill[name] = obj
         self.spill_bytes += nb
@@ -100,6 +106,7 @@ class Worker:
             self.spill_bytes -= obj.nbytes()
             self.spill_stat["recall_count"] += 1
             self.spill_stat["recall_bytes"] += obj.nbytes()
+            self.trace.emit("recall", n)
             recalled.append(obj.nbytes())
         if recalled:
             print(f"[{self.args.worker_id}] recalled {len(recalled)} "
@@ -236,6 +243,8 @@ class Worker:
                 # reflected). Name EVERY missing block so the scheduler
                 # can purge its view and re-plan the turn instead of
                 # hard-failing it.
+                for n in missing:
+                    self.trace.emit("stale_resume", n)
                 raise RuntimeError("STALE_RESUME: " + ",".join(missing))
             inject_blocks(cache, blocks)
             from icn_proto.kvcodec import place_cache
@@ -282,6 +291,8 @@ class Worker:
         objs = extract_blocks(cache, publish)
         for obj in objs:
             self.resident[str(obj.name)] = obj
+            self.trace.emit("resident_add", str(obj.name), via="publish",
+                            turn=f"{session}:{turn}")
         print(f"[{wid}] turn {session}:{turn} published "
               f"{len(objs)} blocks in {time.time() - t2 - decode_s:.2f}s "
               f"(total {time.time() - t0:.2f}s)", flush=True)
@@ -336,6 +347,9 @@ class Worker:
                 objs = torch.load(io.BytesIO(payload), weights_only=False)
                 for obj in objs:
                     self.resident[str(obj.name)] = obj
+                    self.trace.emit("resident_add", str(obj.name),
+                                    via="deliver",
+                                    repl=hdr.get("repl") or None)
                 print(f"[{self.args.worker_id}] delivered "
                       f"{len(objs)} blocks "
                       f"({sum(o.nbytes() for o in objs) / 1e6:.1f}MB)",
@@ -356,8 +370,10 @@ class Worker:
                     gone.append(obj)
                     if self._spill_put(n, obj):
                         spilled_b += obj.nbytes()
+                        self.trace.emit("evict", n, outcome="spilled")
                     else:
                         dropped_b += obj.nbytes()
+                        self.trace.emit("evict", n, outcome="dropped")
                 print(f"[{self.args.worker_id}] evicted {len(gone)} blocks "
                       f"({sum(o.nbytes() for o in gone) / 1e6:.1f}MB; "
                       f"spill +{spilled_b / 1e6:.1f}MB, "

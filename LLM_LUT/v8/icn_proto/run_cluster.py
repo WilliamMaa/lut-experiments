@@ -76,6 +76,10 @@ def main():
                          "matrix cells keep working; new experiments should "
                          "pass --policy directly.")
     sched_mod.add_args(ap)
+    ap.add_argument("--trace-dir", default=None,
+                    help="enable block-lifecycle tracing into this dir "
+                         "(one JSONL per process; replay with "
+                         "icn_proto.trace_replay). Off by default.")
     args = ap.parse_args()
 
     if args.no_share:
@@ -88,6 +92,9 @@ def main():
     if len(pool) % args.gpus_per_worker != 0:
         ap.error(f"gpu-pool ({len(pool)} cards) not divisible by "
                  f"--gpus-per-worker {args.gpus_per_worker}")
+    if args.trace_dir:
+        os.makedirs(args.trace_dir, exist_ok=True)
+        os.environ["ICN_TRACE_DIR"] = os.path.abspath(args.trace_dir)
     n_workers = len(pool) // args.gpus_per_worker
     args.bind = f"tcp://127.0.0.1:{args.port}"
     scheduler_addr = args.bind

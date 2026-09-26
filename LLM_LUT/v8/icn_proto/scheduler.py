@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from icn_proto import msg
 from icn_proto.blkchain import GENESIS, BlockName, chain_through, derive_chain
+from icn_proto.trace import open_tracer
 
 STALL_S = 300.0   # watchdog hard-fail: max seconds a worker may stall
 
@@ -234,8 +235,12 @@ class Scheduler:
         # resident/spilled view stale (STALE_RESUME) — must stay ~0;
         # every retry is a placement decision made on a stale view
         self.stale_resume_retries = 0
+        # lifecycle tracing (14): per-block event stream; no-op unless
+        # the launcher set ICN_TRACE_DIR
+        self.trace = open_tracer("sched")
 
     def dir_add(self, name, nbytes, t=None):
+        self.trace.emit("dir_add", name, bytes=int(nbytes))
         e = self.dir.get(name)
         if e is None:
             self.dir[name] = e = {"bytes": int(nbytes), "first": t or time.time(),
@@ -710,6 +715,7 @@ class Scheduler:
                 w.resident.discard(n)
                 w.tips.discard(n)
                 w.via_repl.discard(n)
+                self.trace.emit("evict_plan", n, worker=w.ident.decode())
             # Optimistic accounting: the worker's status ack lags one
             # cycle, so without this the controller re-plans eviction
             # against a stale (still-full) byte count and the next
@@ -853,6 +859,10 @@ class Scheduler:
             if sock is not None:
                 msg.send(sock, {"type": "fetch", "names": a["names"],
                                 "repl": rid}, ident=a["holder"])
+            for n in a["names"]:
+                self.trace.emit("repl_send", n,
+                                holder=a["holder"].decode(),
+                                target=a["target"].decode())
             print(f"[ctl  ] replicate {len(a['names'])} blocks "
                   f"{a['holder'].decode()} -> {a['target'].decode()} "
                   f"tip=...{a['tip'][-40:]} G={a['g']}", flush=True)
@@ -1033,6 +1043,10 @@ class Scheduler:
                       f"(E target {decision['E']})", flush=True)
                 msg.send(sock, {"type": "fetch", "names": names},
                          ident=holder_ident)
+                for n in names:
+                    self.trace.emit("fetch_send", n,
+                                    holder=holder_ident.decode(),
+                                    target=ident.decode(), rid=rid)
                 w.busy = True
                 w.t_assign = time.time()
                 self.ready.remove(turn)
@@ -1053,6 +1067,13 @@ class Scheduler:
         self._xfer.pop(rid, None)
         resume_names = self.resume_names(turn, e_resume)
         new_names = turn.publish_names("bf16", self.args.block_tokens)
+        for n in resume_names:
+            self.trace.emit("demand", n, rid=rid,
+                            worker=w.ident.decode(), E=e_resume)
+        if resume_names:
+            self.trace.emit("resume", resume_names[-1], rid=rid,
+                            worker=w.ident.decode(), E=e_resume,
+                            n_resume=len(resume_names))
         # demand accounting: every resumed block contributed to this turn;
         # the accessing worker id feeds the per-locator demand signal
         # (05 v3 §3: placement follows SPATIAL demand, not global popularity)
@@ -1176,6 +1197,8 @@ class Scheduler:
                         w.spilled.discard(n)
                         w.tips.discard(n)
                         w.via_repl.discard(n)
+                        self.trace.emit("stale_purge", n,
+                                        worker=w.ident.decode())
                     turn.stale_retries = getattr(turn, "stale_retries", 0) + 1
                     self.stale_resume_retries += 1
                     if rec is not None:
@@ -1241,6 +1264,9 @@ class Scheduler:
                 # holder lost blocks: demand degrades to the local
                 # boundary; a failed replication just aborts (zero-replica
                 # is legal — identity survives via re-derivation)
+                for n in hdr.get("missing") or []:
+                    self.trace.emit("fetch_missing", n,
+                                    holder=ident.decode(), kind=kind)
                 if kind == "repl":
                     print(f"[ctl  ] {rid} replication FAILED (missing "
                           f"{len(hdr.get('missing') or [])}), abort",
@@ -1284,6 +1310,9 @@ class Scheduler:
                 w.resident |= set(xfer["names"])
                 w.via_repl |= set(xfer["names"])
                 w.tips.add(xfer["tip"])
+                for n in xfer["names"]:
+                    self.trace.emit("delivered", n, via="repl",
+                                    target=w.ident.decode())
                 print(f"[ctl  ] {rid} delivered to {ident.decode()} "
                       f"({xfer['bytes']/1e6:.1f}MB in {xfer_s:.2f}s), "
                       f"tip now resident", flush=True)
@@ -1315,6 +1344,9 @@ class Scheduler:
                 # plan redundant copies of just-delivered segments
                 w = self.workers[xfer["target"]]
                 w.resident |= set(xfer["names"])
+                for n in xfer["names"]:
+                    self.trace.emit("delivered", n, via="fetch",
+                                    target=w.ident.decode())
                 tip = xfer["names"][-1]
                 if tip in self.tips:
                     w.tips.add(tip)

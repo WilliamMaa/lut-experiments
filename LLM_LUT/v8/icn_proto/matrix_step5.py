@@ -103,6 +103,10 @@ def run_cell(args, share, pol, rep, port):
         cmd += ["--worker-mem-budget-mb", str(args.budget_mb)]
     if args.repl_mem_price > 0:
         cmd += ["--repl-mem-price", str(args.repl_mem_price)]
+    if getattr(args, "trace_dir", None):
+        cell = f"cell_{wl_signature(args)}_s{share}_{pol}_r{rep}"
+        cmd += ["--trace-dir",
+                os.path.join(args.trace_dir, cell)]
     if getattr(args, "spill_mb", 0.0) != 0:
         cmd += ["--spill-mb", str(args.spill_mb)]
     if args.arrival == "poisson":
@@ -242,6 +246,9 @@ def main():
                     help="E2: host-DRAM spill tier capacity passed through "
                          "to run_cluster (0 = off, -1 = unlimited); enters "
                          "the workload signature")
+    ap.add_argument("--trace-dir", default=None,
+                    help="enable block-lifecycle tracing; each cell gets a "
+                         "sub-dir (cell_<wl>_s<share>_<pol>_r<rep>)")
     ap.add_argument("--arrival", choices=["none", "poisson"], default="none")
     ap.add_argument("--arrival-rate", type=float, default=1.0)
     ap.add_argument("--zipf-n", type=int, default=16)

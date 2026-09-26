@@ -43,7 +43,8 @@ locator 解析、驻留层级决策、复制放置、需求合并。不重复造
 
 1. **先收尾 E2 的基底分解**（b3 × {s0, sp-1, sp96}，控制器关闭）：
    这是行 4 的干净验证——同一驱逐压力，落点=虚空时重算、落点=DRAM
-   时 recall，**逐环过程证据**，不看比分。命令在 runbook 11 §5。
+   时 recall，**逐环过程证据**，不看比分。命令在 runbook 11 §5；
+   跑时加 `--trace-dir`，用 trace_replay 逐块重放链条（11 §6）。
 2. **Interest aggregation（行 7）**：当前 testbed 内价值最高的未做
    机制。scheduler 加 PIT 式 pending-object 表：一个 turn 正在
    fetch/prefill 某前缀时，后续同前缀需求挂为等待者，就绪后一并
