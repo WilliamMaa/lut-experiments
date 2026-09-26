@@ -83,7 +83,8 @@ python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-3
   --gpu-pool 0,1,2,3,4,5,6,7 --sessions 8 --turns-per-session 40 --q-tokens 40 \
   --shares 2 --policies b3,ours --reps 2 --budget-mb 48 --cell-timeout 1800 \
   --arrival poisson --arrival-rate 2.0 --zipf-n 16 --zipf-s 1.0 --think-s 2.0 \
-  --spill-mb -1 --manifest results/icn_proto/matrix_e2.json
+  --spill-mb -1 --trace-dir results/icn_proto/traces \
+  --manifest results/icn_proto/matrix_e2.json
 ```
 
 ```bash
@@ -91,7 +92,8 @@ python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-3
   --gpu-pool 0,1,2,3,4,5,6,7 --sessions 8 --turns-per-session 40 --q-tokens 40 \
   --shares 2 --policies b3,ours --reps 2 --budget-mb 48 --cell-timeout 1800 \
   --arrival poisson --arrival-rate 2.0 --zipf-n 16 --zipf-s 1.6 --think-s 2.0 \
-  --spill-mb -1 --manifest results/icn_proto/matrix_e2.json
+  --spill-mb -1 --trace-dir results/icn_proto/traces \
+  --manifest results/icn_proto/matrix_e2.json
 ```
 
 ```bash
@@ -99,7 +101,8 @@ python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-3
   --gpu-pool 0,1,2,3,4,5,6,7 --sessions 8 --turns-per-session 40 --q-tokens 40 \
   --shares 2 --policies b3,ours --reps 2 --budget-mb 48 --cell-timeout 1800 \
   --arrival poisson --arrival-rate 2.0 --zipf-n 16 --zipf-s 1.0 --think-s 2.0 \
-  --spill-mb 96 --manifest results/icn_proto/matrix_e2.json
+  --spill-mb 96 --trace-dir results/icn_proto/traces \
+  --manifest results/icn_proto/matrix_e2.json
 ```
 
 ```bash
@@ -107,7 +110,8 @@ python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-3
   --gpu-pool 0,1,2,3,4,5,6,7 --sessions 8 --turns-per-session 40 --q-tokens 40 \
   --shares 2 --policies b3,ours --reps 2 --budget-mb 48 --cell-timeout 1800 \
   --arrival poisson --arrival-rate 2.0 --zipf-n 16 --zipf-s 1.6 --think-s 2.0 \
-  --spill-mb 96 --manifest results/icn_proto/matrix_e2.json
+  --spill-mb 96 --trace-dir results/icn_proto/traces \
+  --manifest results/icn_proto/matrix_e2.json
 ```
 
 b3 重基线（2 条）：
@@ -117,6 +121,7 @@ python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-3
   --gpu-pool 0,1,2,3,4,5,6,7 --sessions 8 --turns-per-session 40 --q-tokens 40 \
   --shares 2 --policies b3 --reps 2 --budget-mb 48 --cell-timeout 1800 \
   --arrival poisson --arrival-rate 2.0 --zipf-n 16 --zipf-s 1.0 --think-s 2.0 \
+  --trace-dir results/icn_proto/traces \
   --manifest results/icn_proto/matrix_e2.json
 ```
 
@@ -125,6 +130,7 @@ python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-3
   --gpu-pool 0,1,2,3,4,5,6,7 --sessions 8 --turns-per-session 40 --q-tokens 40 \
   --shares 2 --policies b3 --reps 2 --budget-mb 48 --cell-timeout 1800 \
   --arrival poisson --arrival-rate 2.0 --zipf-n 16 --zipf-s 1.6 --think-s 2.0 \
+  --trace-dir results/icn_proto/traces \
   --manifest results/icn_proto/matrix_e2.json
 ```
 
