@@ -37,8 +37,9 @@ E2 验证：给被驱逐的块加一层便宜驻留层（主机 DRAM），这条
 
 ### 接下来该干什么
 
-1. b3@s0 重跑（**事故二修复已就绪**：同步代码 → runbook §2 五测
-   → `--drop-bad` 清 s=1.0 腿坏格 → runbook §5a 两条）。预期
+1. b3@s0 重跑 + 受影响格补跑（**事故二修复已就绪**，完整流程在
+   runbook §5b：同步代码 → §2 的 5 条测试命令 →
+   `matrix_report --drop-stale` → 重跑 §5/§5a 被清的格）。预期
    `stale_resume_retries` 从 ~5 降到 0；
 2. 用 trace_replay 重放 sp96 × s=1.6 格的热点块链条（runbook §6a/6c），
    看延迟崩塌发生在哪一环（召回风暴？fetch 排队？）；

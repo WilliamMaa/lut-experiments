@@ -140,6 +140,6 @@ PIT 语义的独立机制，留待 interest aggregation 实验时一并评估。
 ### 4. 备注
 
 - s=1.0 腿 rep0 绿格（hit 0.415 / new_tok 41 万）数值与 E1 基线
-  一致，保留有效；rep1 两格坏 JSON 待 `--drop-bad` 清掉后随修复
-  一起重跑。
+  一致，是否保留由 `matrix_report` 的 retries 扫描判决（runbook
+  §5b）；rep1 两格坏 JSON 随 §5b 流程清掉重跑。
 - b3@s0 × s=1.6 一条未跑，同样等修复后一起跑。

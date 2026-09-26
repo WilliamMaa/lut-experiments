@@ -10,7 +10,7 @@ cd ~/lut-experiments/LLM_LUT/v8
 git pull
 ```
 
-## 2. 远程验证（每次同步后必跑，<10 秒）
+## 2. 同步后验证（每次 git pull 后必跑，5 条测试命令，<10 秒）
 
 ```bash
 cd ~/lut-experiments/LLM_LUT/v8
@@ -21,7 +21,8 @@ python -m icn_proto.test_policy
 python -m icn_proto.test_openloop
 ```
 
-五行 `ALL PASS` 才继续。任何 FAIL 停止，把输出贴回来。
+五行 `ALL PASS` 才继续（test_controller / test_e1 / test_e2 /
+test_policy / test_openloop）。任何 FAIL 停止，把输出贴回来。
 
 ## 3. 跑前检查
 
@@ -134,6 +135,22 @@ python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-3
   --manifest results/icn_proto/matrix_e2.json
 ```
 
+## 5b. 事故二修复后的重跑流程（2026-09-27 快照 clobber 修复）
+
+修复改变了 scheduler 行为。已有格子**不是全删重跑**：每格 JSON
+的 `stale_resume_retries` 记录了修复前 bug 是否触发过——
+
+1. 同步代码后跑 §2 的 5 条测试命令（含新回归测试
+   `test_status_snapshot_clobber`），全过再继续；
+2. 扫描全部格子并清掉受影响的（retries>0 或 JSON 不可读）：
+
+```bash
+python -m icn_proto.matrix_report --drop-stale
+```
+
+3. 重跑 §5 和 §5a 的命令（manifest 断点续跑，只补被清的格）。
+   新跑出的格 `stale_resume_retries` 应为 0；不为 0 贴回来。
+
 ## 6. 块生命周期追踪（机制观测）
 
 §5 的矩阵命令已带 `--trace-dir results/icn_proto/traces`，每格追踪写在
@@ -218,7 +235,7 @@ dropped）→ recall / fetch_send → delivered。同一 span 若匹配到多块
 | 同一格清完重跑还 `BAD` | 先别重跑。跑 §7a 的命令看失败错误，贴回来再定处置 |
 | worker 起不来 / hello 超时 | 有孤儿进程：`pkill -9 -f icn_proto`，sleep 3，重跑 |
 | 想看重跑某格的完整日志 | `results/icn_proto/cell_logs/cell_<wl>_s2_<pol>_r<rep>_b48_p0.log`（wl 含 `_sp-1`/`_sp96`） |
-| 聚合表 spill 列全 0 | 确认命令带 `--spill-mb`、§2 五测试全过；再查该格日志里 `recalled` / `evicted ... spill +` 行 |
+| 聚合表 spill 列全 0 | 确认命令带 `--spill-mb`、§2 的 5 条测试命令全过；再查该格日志里 `recalled` / `evicted ... spill +` 行 |
 | 96MB 档 `dropped_bytes` 恒 0 | LRU 没触发；s=1.6 格应出现第二级 churn，若无记录到结果文档即可 |
 | 格内 failed>0，错误含 `resume block not resident` / `STALE_RESUME` | 根因见 `12-e2-diag.md`：确认 `git pull` 拿到修复 → `--drop-bad` 清格重跑；修复后仍出现则贴日志 |
 | b3 的 spill 格质量指标大幅偏离 ours 同档 | 泄漏或新 bug，停止矩阵，贴日志回来修 |
