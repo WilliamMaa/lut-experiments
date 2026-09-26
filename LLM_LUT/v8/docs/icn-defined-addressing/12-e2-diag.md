@@ -1,70 +1,64 @@
-# 12 — E2 矩阵命令 2 (sp-1 × s=1.6) 失败诊断
+# 12 — E2 sp96 首跑事故：根因与修复记录
 
 日期：2026-09-25
-状态：进行中 — 四格 rc=1，部分 turn 失败（failed=3/8/5/8），全部报
-`RuntimeError: resume block not resident: <块名>`。
+状态：**已修复，待重跑**（重跑指令见 runbook §5c）
 
-## 1. 一键执行
+## 1. 现象
 
-在 `~/lut-experiments/LLM_LUT/v8` 下运行（git pull 后）：
+§5 命令 4（sp96 × s=1.6）四格全部 rc=1、failed=3/8/5/8（b3 与 ours
+同炸），错误一律：
 
-```bash
-bash icn_proto/e2_diag.sh
+```
+RuntimeError: resume block not resident: <块名>
 ```
 
-脚本内容见 `icn_proto/e2_diag.sh`，与本文件 §2 逐条等价。
+失败 JSON：
+`blkcluster_s8t40_20260925_{175925(b3 r0), 180218(b3 r1), 180523(ours r0), 180816(ours r1)}.json`
 
-## 2. 分步指令（与脚本等价，供审计）
+**关键判别**：出事的是 **sp96 档，不是 sp-1**——各 worker
+`dropped_bytes` 0.3–1.9GB 只可能来自 `_spill_put` 的 LRU 级联丢弃，
+而 spill∞（cap=inf）永不触发 LRU。
 
-```bash
-cd ~/lut-experiments/LLM_LUT/v8
+## 2. 根因（两个叠加）
 
-# (1) 失败 JSON 汇总：spill dropped、resident 块数、每个失败 record 的 worker/E/mode/xfer
-cat > /tmp/e2_diag.py <<'EOF'
-import json, os
+1. **spill LRU 丢弃对 scheduler 不可见 + 决策窗口滞后**。worker 处理
+   evict 时 `_spill_put` 级联丢块，随后 `report_status` 带全量
+   `spilled` 列表排队发往 scheduler；但主循环每轮 **先 dispatch 后
+   只 recv 一条消息**——dispatch 内 `choose()` 用上一周期的
+   `w.spilled`（含已丢块）做 placement 决策，assign 的 resume 集
+   超出 worker 实际持有。worker 端 `run_turn` recall 缺失 → raise。
+   竞争窗口 = 一次 dispatch，open-loop Poisson 突发释放多个 turn 时
+   可连击（与 3–8/320 的失败率吻合）。
+2. **无重试路径**。旧 raise 只报第一个缺失块，scheduler 把它当硬
+   失败记 failed——一次视图竞争直接毁掉一格。
 
-base = "results/icn_proto"
-fails = ["blkcluster_s8t40_20260925_175925", "blkcluster_s8t40_20260925_180218",
-         "blkcluster_s8t40_20260925_180523", "blkcluster_s8t40_20260925_180816"]
-for p in fails:
-    fp = os.path.join(base, p + ".json")
-    if not os.path.exists(fp):
-        print("== MISSING", fp)
-        continue
-    d = json.load(open(fp))
-    print("==", p)
-    print("   spill dropped:", {w: s.get("dropped_bytes") for w, s in d["spill"]["workers"].items()})
-    print("   resident_blocks:", {w: s["resident_blocks"] for w, s in d["workers"].items()})
-    print("   failed:", d["failed"])
-    for r in d["records"]:
-        if not r.get("ok"):
-            dec = r.get("decision") or {}
-            xfer = r.get("xfer_blocks") or []
-            print("   FAIL", r["request_id"], "->", r.get("worker"), "E=", r.get("E"),
-                  "mode=", dec.get("mode"), "xfer_n=", len(xfer))
-            print("        err:", str(r.get("error"))[:160])
-EOF
-python /tmp/e2_diag.py
+排除的假设：fetch-deliver 用 `xfer["names"][-1]` 反推 tip end
+（原主嫌疑）——fetch 路径 holder 端 recall-then-send + fetched
+ok=False 降级已覆盖，不是本次根因。
 
-# (2) 失败块全生命周期 + worker traceback（cell 日志）
-for LOG in results/icn_proto/cell_logs/cell_pp2_z16s1.6_*_sp-1_s2_*.log; do
-  echo "---- $LOG : block 1840-1856 ----"
-  grep -n "1840-1856" "$LOG" | head -30
-  echo "---- $LOG : worker traceback ----"
-  grep -n -B5 -A10 "resume block not resident" "$LOG" | head -80
-done
-```
+## 3. 修复（回归测试 `test_stale_resume_retry`，五测全绿）
 
-## 3. 待查假设
+- `scheduler.py` 主循环：dispatch **前** `sock.poll(0)` drain 全部
+  排队消息，消除决策窗口的视图滞后；
+- `worker.py` `run_turn`：收集**全部**缺失块，
+  raise `STALE_RESUME: <逗号分隔名单>`；
+- `scheduler.py` result 处理：识别 STALE_RESUME → 从该 worker 的
+  `resident/spilled/tips/via_repl` 清除缺失块（result 后的 status
+  尚未处理，必须主动清）→ 删除失败 record → turn 重新入队、
+  `choose()` 重决策（降级为更低 E 或全量重算，语义正确）；
+  每 turn 最多重试一次，第二次硬失败（真不变量破坏）；
+- summary spill 块新增 `stale_resume_retries`（健康格 ≈0；>0 表示
+  重试在工作，turn 不再失败）。
 
-1. fetch-deliver 路径 `on_message` "delivered" 分支用
-   `e = self._tip_end(xfer["names"][-1])` 反推 E —— 目标 worker 分散持有
-   （resident∪spilled 交错）时 need 可能是中段，`names[-1]` 未必是 tip。
-2. 调度器 `w.resident`/`w.spiled` 视图被 status 滞后或驱逐/清扫消息交错污染，
-   导致 assign 的 E 超出 worker 实际持有。
+## 4. 重跑指令
 
-## 4. 输出回来后
+见 runbook `11-e2-runbook.md` **§5c**（git pull → 冒烟 §4a/4b →
+--drop-bad → 重跑命令 4 → e1_report + stale_resume_retries 确认）。
 
-- 定罪于 scheduler.py 具体路径 → 修复 + test_e2.py 回归测试 + 本地五测全绿
-- 让用户 `--drop-bad` 清 4 格，重跑 runbook §4 矩阵命令 2
-- 根因补进本文件 §4c 与 runbook §6 异常表
+## 5. 备注
+
+- 命令 1（sp-1 × s=1.0）绿格跑在修复前代码，但竞争只在 spill 丢块
+  时出现，sp-1 格**保留有效**（runbook §5c 有同样注记）。
+- 本事故的 system 含义：tier 有限容量引入第二级 churn（P3 要量的
+  东西）时，控制器视图必须与 tier 内容强一致——96MB 档的
+  dropped_bytes 本身就是 P3 的 regime 信号，不是纯噪声。

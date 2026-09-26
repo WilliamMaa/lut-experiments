@@ -223,11 +223,20 @@ class Worker:
         if resume_names:
             self._recall([n for n in resume_names if n in self.spill])
             blocks = []
+            missing = []
             for n in resume_names:
                 obj = self.resident.get(n)
                 if obj is None:
-                    raise RuntimeError(f"resume block not resident: {n}")
-                blocks.append(obj)
+                    missing.append(n)
+                else:
+                    blocks.append(obj)
+            if missing:
+                # The scheduler's resident/spilled view was stale when it
+                # planned this resume (spill-tier LRU drop not yet
+                # reflected). Name EVERY missing block so the scheduler
+                # can purge its view and re-plan the turn instead of
+                # hard-failing it.
+                raise RuntimeError("STALE_RESUME: " + ",".join(missing))
             inject_blocks(cache, blocks)
             from icn_proto.kvcodec import place_cache
             place_cache(cache, self.model)

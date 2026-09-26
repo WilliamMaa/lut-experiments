@@ -17,6 +17,9 @@ Covered:
                 never evicted (or byte-counted) twice
   accounting    dispatch counts fetch_avoided_by_recall; send_assign
                 counts per-turn spill recall blocks
+  stale_resume  a resume failure from a stale resident/spilled view
+                (STALE_RESUME) purges the view and re-queues the turn
+                once; a second failure hard-fails
 
 Run:  python -m icn_proto.test_e2
 """
@@ -314,6 +317,51 @@ def test_accounting():
               and "workers" in sp, str(sp))
 
 
+def test_stale_resume_retry():
+    """Regression (sp96 cells 20260925: 3-8 turns/cell hard-failed with
+    'resume block not resident'): the scheduler's spilled view can lag
+    one cycle behind a spill-tier LRU drop when a status sits in the
+    socket queue across a dispatch. The worker now names every missing
+    block (STALE_RESUME) and the scheduler must purge its view and
+    re-queue the turn — a stale placement decision must never surface
+    as a failed turn. Retried at most once."""
+    print("stale-view resume failure re-queues the turn:")
+    s = make_sched()
+    turns = session_turns()
+    s.turns_of = {"doc5": turns}
+    doc, q0 = turns[0], turns[1]
+    tip, names = register(s, doc)
+    w0 = s.workers[b"w0"]
+    w0.spilled |= set(names)
+    w0.tips.add(tip)
+    q0.t_ready = q0.t_arrive = time.time()
+    s.ready.append(q0)
+    s.dispatch(FakeSock())
+    check("turn dispatched", q0 not in s.ready and len(s.records) == 1)
+    gone = [names[3], names[7]]          # the tier LRU-dropped these
+    err = "RuntimeError: STALE_RESUME: " + ",".join(gone)
+    s.on_message(None, b"w0",
+                 {"type": "result", "request_id": "doc5:0", "ok": False,
+                  "error": err, "resident_bytes": 0}, None)
+    check("turn re-queued", q0 in s.ready)
+    check("missing purged from spilled view",
+          not (set(gone) & w0.spilled))
+    check("retry counter", s.stale_resume_retries == 1)
+    check("failed record dropped", len(s.records) == 0)
+    check("session not advanced", s.pending_next.get("doc5") is None)
+
+    # second stale failure on the same turn = real invariant break:
+    # hard-fail and advance the session
+    s.dispatch(FakeSock())
+    s.on_message(None, b"w0",
+                 {"type": "result", "request_id": "doc5:0", "ok": False,
+                  "error": err, "resident_bytes": 0}, None)
+    check("no second retry", s.stale_resume_retries == 1)
+    check("failure recorded", len(s.records) == 1
+          and s.records[0].get("ok") is False)
+    check("session advanced", s.pending_next.get("doc5") == 2)
+
+
 def main():
     test_match_spilled_tip()
     test_choose_recall_beats_fetch()
@@ -322,6 +370,7 @@ def main():
     test_evict_resident_only()
     test_evict_spilled_tip_chain_is_swept()
     test_accounting()
+    test_stale_resume_retry()
     print("test_e2: ALL PASS")
 
 

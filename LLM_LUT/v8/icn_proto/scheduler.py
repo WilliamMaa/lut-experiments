@@ -230,6 +230,10 @@ class Scheduler:
         self.spill_recall_blocks = 0
         self.spill_recall_bytes = 0
         self.spill_fetch_avoided = 0
+        # turns re-queued after a worker proved the scheduler's
+        # resident/spilled view stale (STALE_RESUME) — must stay ~0;
+        # every retry is a placement decision made on a stale view
+        self.stale_resume_retries = 0
 
     def dir_add(self, name, nbytes, t=None):
         e = self.dir.get(name)
@@ -897,6 +901,16 @@ class Scheduler:
         try:
             while not self.finished():
                 self._release_arrivals(time.time())
+                # Drain every queued worker message BEFORE making
+                # placement decisions. Without this, choose() can run
+                # one cycle behind a status that removed spill-tier
+                # drops from w.spilled, and dispatch a resume set the
+                # target no longer holds (STALE_RESUME crash, sp96
+                # cells 20260925). The post-dispatch recv below only
+                # processes one message per loop.
+                while sock.poll(0):
+                    ident, hdr, payload = msg.recv(sock)
+                    self.on_message(sock, ident, hdr, payload)
                 self.dispatch(sock)
                 # sleep until the next interesting event: an arriving
                 # turn (open loop) or the 1s housekeeping tick, whichever
@@ -1143,6 +1157,35 @@ class Scheduler:
             w.current = None
             w.cur_plan = None
             w.resident_bytes = hdr.get("resident_bytes", w.resident_bytes)
+            # Stale-view resume failure (worker raised STALE_RESUME):
+            # purge the blocks the worker proved missing from our view
+            # (its post-result status has not been processed yet) and
+            # re-queue the turn for a fresh decision. The failed record
+            # never produced a result — drop it; the retry appends a
+            # fresh one. Retried at most once per turn; a second stale
+            # failure means a real invariant break, not a race.
+            err = hdr.get("error") or ""
+            if not hdr.get("ok") and "STALE_RESUME: " in err:
+                session, t = rid.split(":")
+                chain_idx = 0 if t == "-1" else int(t) + 1
+                turn = self.turns_of[session][chain_idx]
+                if getattr(turn, "stale_retries", 0) < 1:
+                    missing = err.split("STALE_RESUME: ", 1)[1].split(",")
+                    for n in missing:
+                        w.resident.discard(n)
+                        w.spilled.discard(n)
+                        w.tips.discard(n)
+                        w.via_repl.discard(n)
+                    turn.stale_retries = getattr(turn, "stale_retries", 0) + 1
+                    self.stale_resume_retries += 1
+                    if rec is not None:
+                        self.records.remove(rec)
+                    turn.t_ready = time.time()
+                    self.ready.append(turn)
+                    print(f"[assign] {rid} STALE_RESUME "
+                          f"({len(missing)} blocks), purged view and "
+                          f"re-queued", flush=True)
+                    return
             # per-worker prefill-rate EWMA (resumed turns carry tiny
             # prefills and would pollute the estimate)
             if hdr.get("ok") and hdr.get("prefill_s") \
@@ -1422,6 +1465,7 @@ class Scheduler:
             "recall_blocks": self.spill_recall_blocks,
             "recall_bytes": self.spill_recall_bytes,
             "fetch_avoided_by_recall": self.spill_fetch_avoided,
+            "stale_resume_retries": self.stale_resume_retries,
             "workers": {w.ident.decode(): dict(w.spill_stat,
                                                spill_bytes=w.spill_bytes)
                         for w in self.workers.values()},

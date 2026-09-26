@@ -245,6 +245,77 @@ rederivation 巨大、hit 塌）——这是 s0→s∞ 的 tier 效果对照里 
 
 （待填）
 
+### §5c sp96 首跑事故（2026-09-25，已修复，重跑指令在此）
+
+**现象**：§5 命令 4（sp96 × s=1.6）四格全部 rc=1、failed=3/8/5/8，
+错误一律 `RuntimeError: resume block not resident`（b3 和 ours 都炸）。
+**注意：出事的是 sp96 档，不是 sp-1**——`dropped_bytes` 0.3–1.9GB/格
+只可能在有限容量档出现（spill∞ 的 cap 是 inf，LRU 永不触发）。
+
+**根因**（两个叠加）：
+1. `_spill_put` 的 LRU 级联丢弃对 scheduler 不可见——status 虽然带全
+   量 `spilled` 列表，但主循环每轮 dispatch 前只 recv 一条消息：
+   worker 处理 evict（级联丢块）→ 发 status 排队 → scheduler 下一轮
+   先 dispatch（用旧视图做 placement 决策）→ 才 recv status。
+   决策窗口内 `w.spilled` 含已被丢的块 → assign 的 resume 集超出
+   worker 实际持有 → `run_turn` recall 缺失 → raise。
+2. worker raise 时只报第一个缺失块、scheduler 也没有重试路径，
+   一次视图竞争直接变成 failed turn。
+
+**修复**（提交见 git log，回归测试 `test_stale_resume_retry`）：
+- scheduler 主循环 dispatch **前** drain 全部排队消息（`sock.poll(0)`），
+  消除决策窗口的视图滞后；
+- worker `run_turn` 收集**全部**缺失块，raise `STALE_RESUME: <名单>`；
+- scheduler result 处理识别该错误：从 `w.resident/spilled/tips/via_repl`
+  清除缺失块（worker _result 后的 status 尚未处理，必须主动清）、
+  删除失败 record、turn 重新入队重决策（最多一次；第二次视为真
+  不变量破坏，硬失败）；
+- summary spill 块新增 `stale_resume_retries`（健康格应 ≈ 0；
+  >0 说明仍有视图竞争，drain 后应极少）。
+
+**重跑指令**（按顺序）：
+
+```bash
+# 0. 远程同步修复
+cd ~/lut-experiments/LLM_LUT/v8 && git pull
+
+# 1. 冒烟回归（§4a + §4b，各 ~13 分钟；通过标准照旧）
+#    ——修的是 dispatch 主循环，必须先确认 E2 主面没退化
+
+# 2. 清掉 4 格坏数据（failed>0 的行会被 --drop-bad 删掉）
+python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --gpu-pool 0,1,2,3,4,5,6,7 --sessions 8 --turns-per-session 40 --q-tokens 40 \
+  --shares 2 --policies b3,ours --reps 2 --budget-mb 48 --cell-timeout 1800 \
+  --arrival poisson --arrival-rate 2.0 --zipf-n 16 --zipf-s 1.6 --think-s 2.0 \
+  --spill-mb 96 --manifest results/icn_proto/matrix_e2.json --drop-bad
+
+# 3. 重跑 §5 命令 4（sp96 × s=1.6；manifest 断点续跑，已完成格自动跳过）
+python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --gpu-pool 0,1,2,3,4,5,6,7 --sessions 8 --turns-per-session 40 --q-tokens 40 \
+  --shares 2 --policies b3,ours --reps 2 --budget-mb 48 --cell-timeout 1800 \
+  --arrival poisson --arrival-rate 2.0 --zipf-n 16 --zipf-s 1.6 --think-s 2.0 \
+  --spill-mb 96 --manifest results/icn_proto/matrix_e2.json
+```
+
+**有效性确认**（命令 3 跑完逐格查）：
+
+```bash
+python -m icn_proto.e1_report    # failed 必须全 0
+python -c "
+import json
+d = json.load(open(sorted(__import__('glob').glob('results/icn_proto/blkcluster_s8t40_*.json'), key=__import__('os').path.getmtime)[-1]))
+print('stale_resume_retries:', d['spill'].get('stale_resume_retries'), 'failed:', d['failed'])"
+```
+
+判读：`stale_resume_retries` 可以 >0（重试在工作，turn 不再失败），
+但 `failed` 必须为 0；若某格 failed>0 且报错含 `STALE_RESUME`，说明
+同一 turn 连续两次视图竞争——停下来贴日志，别再重跑。
+
+**已完成格的有效性**：命令 1（sp-1 × s=1.0，20260925 绿）跑在修复前
+代码。该竞争只在 spill 丢块时出现（spill∞ 无丢块），且 drain/重试
+不改变 sp-1 格的决策语义，**格数据保留有效**。若之后发现
+`stale_resume_retries` 在 sp-1 格也频繁 >0，再回来重跑命令 1–2。
+
 ## 6. 常见异常处置
 
 | 现象 | 处置 |
@@ -254,6 +325,7 @@ rederivation 巨大、hit 塌）——这是 s0→s∞ 的 tier 效果对照里 
 | 想看重跑某格的完整日志 | `results/icn_proto/cell_logs/cell_<wl>_s2_<pol>_r<rep>_b48_p0.log`（wl 含 `_sp-1`/`_sp96`） |
 | 聚合表 spill 列全 0 | tier 没生效：确认命令带 `--spill-mb`、§2 五测试全过；再查该格日志里 `recalled` / `evicted ... spill +` 行 |
 | 96MB 档 `dropped_bytes` 恒 0 | LRU 没触发：tier 没满过，s=1.6 格应出现第二级 churn，若无则 P3 需要更大压力（记录即可，不回退） |
+| 格内 failed>0，错误含 `resume block not resident` / `STALE_RESUME` | 调度器 spilled 视图滞后（sp96 事故，§5c）：确认 `git pull` 拿到修复 → §5c 重跑指令；修复后仍出现则贴日志 |
 | b3 的 spill 格质量指标大幅偏离 ours 同档 | 泄漏或新 bug，停止矩阵，贴日志回来修 |
 
 ## 7. 判决口径（10 §4 预注册，跑完对着读）
