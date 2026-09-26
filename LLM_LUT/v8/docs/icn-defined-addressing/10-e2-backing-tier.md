@@ -100,7 +100,7 @@ scheduler.py:
 **P1（对照纯净性）**：spill 对 b3 几乎无影响（E1 实测 b3 evict 恒 0）。
 若 b3 在 spill 档显著变化，说明实现有泄漏，先修再判。
 
-**P2（design implication 成立的情形）**：spill∞ 下 ours 出现
+**P2（design implication 成立的情形）**：sp-1 下 ours 出现
 ① `rederivation_tokens` 趋零；② new_tok 差收窄至 ≤1.2×；
 ③ `repl` 上升（复制不再怕驱逐）且 `repl_served_local` > 0
 （E1 恒 0 的量首次变正，即 proactive 第一次有正经济学）。
@@ -110,7 +110,7 @@ scheduler.py:
 **P3（tier 稀缺边界）**：spill 96MB 档，s=1.6 出现第二级 churn
 （spill 也满 → 丢弃 → 重算回潮），给出 tier 容量的 regime 边界。
 
-**证伪条件**：spill∞ 下 ours 仍 ≥ b3 × 1.5 ⇒ design implication
+**证伪条件**：sp-1 下 ours 仍 ≥ b3 × 1.5 ⇒ design implication
 在该层级不成立，06+E1 结论适用范围比预期更广（同样是有用信息，
 写作时作为"backing tier 也不救 proactive"的强阴性）。
 
@@ -147,6 +147,6 @@ worker 侧 torch 逻辑本地不可测，全部走远程冒烟验证；scheduler
 ## 7. 里程碑
 
 1. 本文档评审通过 → 实现（§5）→ 本地单测全绿。
-2. 远程冒烟（ours + b3 各一格 spill∞）→ P1 检查 → 16 格矩阵。
+2. 远程冒烟（ours + b3 各一格 sp-1）→ P1 检查 → 16 格矩阵。
 3. 判决对照 §4 → 写 `12-e2-results.md`，regime map 补上层级轴
    （E1 时间轴 + E2 层级轴；E3 拓扑轴成本回放可并行或随后）。

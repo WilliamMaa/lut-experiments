@@ -1,7 +1,8 @@
 # 12 — E2 sp96 首跑事故：根因与修复记录
 
 日期：2026-09-25
-状态：**已修复，待重跑**（重跑指令见 runbook §5c）
+状态：**已修复、已重跑通过**（2026-09-26 四格全绿；结果在
+`13-e2-results.md`）
 
 ## 1. 现象
 
@@ -17,7 +18,7 @@ RuntimeError: resume block not resident: <块名>
 
 **关键判别**：出事的是 **sp96 档，不是 sp-1**——各 worker
 `dropped_bytes` 0.3–1.9GB 只可能来自 `_spill_put` 的 LRU 级联丢弃，
-而 spill∞（cap=inf）永不触发 LRU。
+而 sp-1 档（cap=inf）永不触发 LRU。
 
 ## 2. 根因（两个叠加）
 
@@ -50,15 +51,16 @@ ok=False 降级已覆盖，不是本次根因。
 - summary spill 块新增 `stale_resume_retries`（健康格 ≈0；>0 表示
   重试在工作，turn 不再失败）。
 
-## 4. 重跑指令
+## 4. 处置结果
 
-见 runbook `11-e2-runbook.md` **§5c**（git pull → 冒烟 §4a/4b →
---drop-bad → 重跑命令 4 → e1_report + stale_resume_retries 确认）。
+2026-09-26 `--drop-bad` 清 4 格后重跑命令 4：四格全绿、
+`failed=0`、`stale_resume_retries=0`。结果与读数在
+`13-e2-results.md`。
 
 ## 5. 备注
 
 - 命令 1（sp-1 × s=1.0）绿格跑在修复前代码，但竞争只在 spill 丢块
-  时出现，sp-1 格**保留有效**（runbook §5c 有同样注记）。
+  时出现，sp-1 格**保留有效**。
 - 本事故的 system 含义：tier 有限容量引入第二级 churn（P3 要量的
   东西）时，控制器视图必须与 tier 内容强一致——96MB 档的
   dropped_bytes 本身就是 P3 的 regime 信号，不是纯噪声。
