@@ -143,6 +143,13 @@ class WorkerState:
     # resident_bytes / budget accounting stay HBM-only.
     spill_bytes: int = 0
     spill_stat: dict = field(default_factory=dict)
+    evict_t: dict = field(default_factory=dict)
+    # names the scheduler evicted from this worker, name -> scheduler-side
+    # eviction time. A worker status is a FULL SNAPSHOT taken when the
+    # worker sends it; a snapshot generated before the worker processed
+    # our eviction would resurrect the evicted names on replace. The
+    # status handler subtracts entries newer than the snapshot's
+    # timestamp (regression 2026-09-27: s0-leg STALE_RESUME hard fails).
 
 
 class Scheduler:
@@ -711,10 +718,12 @@ class Scheduler:
                          ident=w.ident)
             nbytes = sum(self.dir.get(n, {}).get("bytes", 0)
                          for n in a["names"])
+            t_now = time.time()
             for n in a["names"]:
                 w.resident.discard(n)
                 w.tips.discard(n)
                 w.via_repl.discard(n)
+                w.evict_t[n] = t_now
                 self.trace.emit("evict_plan", n, worker=w.ident.decode())
             # Optimistic accounting: the worker's status ack lags one
             # cycle, so without this the controller re-plans eviction
@@ -1145,8 +1154,20 @@ class Scheduler:
             # turns, but the scheduler may already have assigned/fetched
             # a new turn to this worker). Scheduler-side busy lifecycle:
             # set True on assign / fetch dispatch, cleared on result.
-            w.resident = set(hdr.get("resident", []))
-            w.tips = set(hdr.get("tips", []))
+            # A snapshot taken BEFORE the worker processed one of our
+            # evictions still lists the evicted names — blind replace
+            # would resurrect them (STALE_RESUME, s0 cells 2026-09-27).
+            # Subtract evictions newer than the snapshot; retire entries
+            # the snapshot confirms (name absent) or that are long past.
+            t_snap = hdr.get("t", 0.0)
+            ghost = {n for n, te in w.evict_t.items() if te > t_snap}
+            snap_res = set(hdr.get("resident", []))
+            w.resident = snap_res - ghost
+            w.tips = set(hdr.get("tips", [])) - ghost
+            for n in [n for n, te in w.evict_t.items()
+                      if (te <= t_snap and n not in snap_res)
+                      or te < t_snap - 600.0]:
+                del w.evict_t[n]
             w.resident_bytes = hdr.get("resident_bytes", w.resident_bytes)
             w.spilled = set(hdr.get("spilled", []))
             w.spill_bytes = hdr.get("spill_bytes", w.spill_bytes)
@@ -1224,6 +1245,7 @@ class Scheduler:
                 if hdr.get("published"):
                     for p in hdr["published"]:
                         w.resident.add(p["name"])
+                        w.evict_t.pop(p["name"], None)
                         self.dir_add(p["name"], p["bytes"])
                     # this turn's chain tip (last of publish_names) carries
                     # the GDN checkpoint (worker.extract_blocks contract)
@@ -1311,6 +1333,7 @@ class Scheduler:
                 w.via_repl |= set(xfer["names"])
                 w.tips.add(xfer["tip"])
                 for n in xfer["names"]:
+                    w.evict_t.pop(n, None)
                     self.trace.emit("delivered", n, via="repl",
                                     target=w.ident.decode())
                 print(f"[ctl  ] {rid} delivered to {ident.decode()} "
@@ -1345,6 +1368,7 @@ class Scheduler:
                 w = self.workers[xfer["target"]]
                 w.resident |= set(xfer["names"])
                 for n in xfer["names"]:
+                    w.evict_t.pop(n, None)
                     self.trace.emit("delivered", n, via="fetch",
                                     target=w.ident.decode())
                 tip = xfer["names"][-1]

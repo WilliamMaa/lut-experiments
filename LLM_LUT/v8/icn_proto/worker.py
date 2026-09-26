@@ -409,6 +409,9 @@ class Worker:
         # carries its GDN checkpoint and stays resumable (E2), so the
         # scheduler must keep seeing it as a match candidate
         return {
+            # snapshot timestamp: the scheduler subtracts its own
+            # post-snapshot evictions on replace (2026-09-27 clobber fix)
+            "t": time.time(),
             "resident": list(self.resident),
             "tips": ([n for n, o in self.resident.items()
                       if o.linear_checkpoint]

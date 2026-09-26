@@ -37,9 +37,10 @@ E2 验证：给被驱逐的块加一层便宜驻留层（主机 DRAM），这条
 
 ### 接下来该干什么
 
-1. 跑 runbook §5a 两条 **b3@s0**（虚空落点对照腿，跑完落点三档
-   齐全）；
-2. 用 trace_replay 重放 sp96 × s=1.6 格的热点块链条（runbook §6），
+1. b3@s0 重跑（**事故二修复已就绪**：同步代码 → runbook §2 五测
+   → `--drop-bad` 清 s=1.0 腿坏格 → runbook §5a 两条）。预期
+   `stale_resume_retries` 从 ~5 降到 0；
+2. 用 trace_replay 重放 sp96 × s=1.6 格的热点块链条（runbook §6a/6c），
    看延迟崩塌发生在哪一环（召回风暴？fetch 排队？）；
 3. 判 P1/P2/P3（口径在 10 §4），结论我来写。
 
@@ -72,6 +73,37 @@ trace 目录：`results/icn_proto/traces/cell_<wl>_s2_<b3|ours>_r<rep>/`
 ## 3. 缺口（事实清单）
 
 - b3@s0 两条未跑（runbook §5a，跑完落点三档对照齐全）。
+  **更新（2026-09-27）**：s=1.0 腿 rep0 ✅（hit 0.415 / new_tok 41 万，
+  与 E1 时代 b3 基线一致，虚空落点对照成立）；rep1 两次跑均
+  `STALE_RESUME` 硬失败（1 次 → 2 次）。注意：报错带**完整缺失块
+  名单**（修复后的新路径），且进了 failed 记录 = **每 turn 一次的重试
+  已经跑过、第二次仍旧缺块**。只剩 s=1.6 一条未跑。
+- **s0 腿 STALE_RESUME 根因：已证实并已修复**（trace 重放 + 修复
+  详情见 `12-e2-diag.md` 事故二）。一句话：worker 的 status 是
+  发送时现取的全量快照，**在 worker 执行 scheduler 的驱逐之前生成
+  的晚到快照**会把乐观驱逐掉的块复活回视图（盲替换不认快照时间），
+  下一轮派工据此选了 local 模式 → worker 已真删 → stale。修复 =
+  快照带时间戳 + scheduler 减去比快照新的本端驱逐。同一 bug 全
+  档位存在（sp96 格 stale_purge 10），sp96 被 recall 兜住、
+  sp-1 不驱逐，只有 s0 暴露。
+- **已确认的事实（2026-09-27）**：
+  1. 失败格 `..._211638` 的 `stale_resume_retries = 5`、`failed = 2`
+     —— 重试路径确实工作；5 次竞态里 2 个 turn 第二次又撞上 →
+     硬失败。竞态率 ~5 次/格，不是零星。
+  2. sp96 × s1.6 ours r0 格的 trace `--summary` 显示 `stale_purge 10`
+     且该格 `failed = 0` —— **同一竞态在 sp96 格同样发生**，只是
+     重试+召回全部吸收（evict 数 ~2 万/格、每 worker spill_drop
+     1.4–3.8 千，也印证了 tier 层自身在二级 churn）。
+  3. 定位过程留档：
+- **定位指令**（s0 两格都带 trace）：
+  1. 先确认重试计数：`python -m icn_proto.e1_report results/icn_proto/blkcluster_s8t40_20260926_211638.json`，
+     看 `spill` 里的 `stale_resume_retries`（应 >0，证明重试路径
+     工作）；
+  2. 重放失败块一生（完整命令，直接复制）：
+     `python -m icn_proto.trace_replay results/icn_proto/traces/cell_pp2_z16s1_t2_tps40_q40_sd0_s2_b3_r1 "parent/4add2dcf28508bf7"`
+     —— 收窄到失败所在的文档根链，避免 `span/0-16` 匹配到其它
+     文档的同名 span。注意第二参数里的斜杠不可省。要看的是：
+     该块 demand 之后、resume 之前有没有同 worker 的 evict 事件。
 - sp96 × s=1.6 两格 SLO 崩塌（0.613 / 0.233），链条未重放定位。
 - sp96 × s=1.6 ours rep0 格 `rc=2`（run_cluster 看门狗：某 worker
   进程异常死亡退出码）；JSON 正常、数值与 rep1 一致。死因待查，

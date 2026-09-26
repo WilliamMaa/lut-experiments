@@ -287,6 +287,50 @@ def test_repl_ack_not_swallowed():
     check("repl table drained", s._repl == {})
 
 
+def test_status_snapshot_clobber():
+    """Regression 2026-09-27 (s0-leg STALE_RESUME hard failures): a
+    worker status is a full snapshot taken when the worker SENDS it.
+    A snapshot generated before the worker processed one of our
+    evictions still lists the evicted names; the status handler's blind
+    full replace resurrected them into the scheduler's (optimistically
+    post-eviction) view, and the next dispatch planned a local resume
+    the worker could not serve. Fix: statuses carry a timestamp and the
+    handler subtracts scheduler-side evictions newer than it."""
+    print("status snapshot clobber:")
+    turn = doc_turn()
+    s = make_sched("b3", worker_mem_budget_mb=48.0)
+    w0 = s.workers[b"w0"]
+    _, names = hold(s, w0, turn)
+    w0.resident_bytes = 48e6 + sum(s.dir[n]["bytes"] for n in names)
+    plan = s._plan_evict()
+    check("eviction planned", len(plan) == 1, f"n={len(plan)}")
+    evicted = set(plan[0]["names"])
+    s._apply_evict(None, plan)
+    check("optimistic view dropped", not (evicted & w0.resident))
+
+    # stale snapshot: taken half a second BEFORE the eviction was
+    # applied, still lists the evicted names as resident
+    stale = {"type": "status", "t": time.time() - 0.5,
+             "resident": list(w0.resident | evicted),
+             "tips": list(w0.tips | evicted),
+             "resident_bytes": 1, "spilled": [],
+             "spill_bytes": 0, "spill": {}}
+    s.on_message(None, b"w0", stale, payload=None)
+    check("stale snapshot cannot resurrect evicted names",
+          not (evicted & w0.resident))
+    check("stale snapshot cannot resurrect evicted tips",
+          not (evicted & w0.tips))
+
+    # fresh snapshot (worker already processed the evict) confirms the
+    # drop and retires the log entries
+    fresh = {"type": "status", "t": time.time(), "resident": [],
+             "tips": [], "resident_bytes": 0, "spilled": [],
+             "spill_bytes": 0, "spill": {}}
+    s.on_message(None, b"w0", fresh, payload=None)
+    check("fresh snapshot applied", w0.resident == set())
+    check("evict log retired", w0.evict_t == {})
+
+
 def test_watchdog_fail():
     """A worker stall must fail the turn and advance the session (the
     share=8/ours/budget=48 cell of the 20260921 v2 run hung forever on
@@ -388,6 +432,7 @@ def main():
     test_repl_recompute_pricing()
     test_eviction()
     test_eviction_shared_substrate()
+    test_status_snapshot_clobber()
     test_watchdog_fail()
     test_delivered_repl()
     test_delivered_updates_residency()
