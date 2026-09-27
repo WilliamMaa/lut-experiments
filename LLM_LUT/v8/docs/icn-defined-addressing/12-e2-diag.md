@@ -220,3 +220,280 @@ trace 确认（runbook §7b 重放 r1 格失败块 span/848-864）：该块一�
 - 事故二/三的共同教训：scheduler 的每个"可用性判断"都必须问
   "这条信息最后由谁、经哪条消息确认"——resident 轴和 spilled 轴
   各栽一次。
+
+
+## 事故四（2026-09-27，活性检测设计缺陷：心跳缺失 + teardown 竞态）
+
+### 1. 现象
+
+两案并查：
+
+- **案 A**（b3 sp96×s1.6 r0）：`xfer doc6:31 stuck in stage fetch`
+  持续 300s，`STALL_S=300s` 看门狗降级兜住（failed=0，代价 160
+  rederiv tokens + wall 虚高 310s）。
+- **案 B**（ours sp96×s1.6 rep0）：格 `rc=2` 但 JSON 正常、
+  failed=0、数值与 rep1 一致。
+
+### 2. 根因
+
+不是协议行为，是活性检测的设计缺陷：系统把"死亡"和"卡死"两种
+本质不同的事件统一用超时糊住（STALL_S=300s），且细查后两种都
+没有及时检测路径。
+
+1. **死亡**：launcher（`run_cluster.py` watchdog 线程）每 2s
+   `poll()` 子进程——事件检测本来就有。案 A 不是死亡（死亡的
+   话 launcher 会 abort，格不会有 JSON；该案有 JSON、正常出
+   summary）。案 B 的 rc=2 才是 launcher 看门狗触发的，但它是
+   **误炸**：`scheduler.run()` 的 finally 先向 worker 发
+   shutdown、worker 收到即退出；而主线程要等 run() 返回才进
+   finally 调 `stop.set()`——run() 的 finally 在发完 shutdown 后
+   还 sleep 0.5s、关 socket，且 `summary()`（写 JSON + 打印
+   "summary ->"）是在这一切**之后**才执行的。于是存在 0.5s 以上
+   的稳定窗口：worker 已全部正常退出、stop 未置、launcher 的 2s
+   轮询必然命中"worker 已退出而 stop 未置"即 `os._exit(2)`。
+   有 JSON + failed=0 + 数值与 rep1 一致，全部符合"正常跑完、
+   teardown 时被误炸"；真 mid-run 死亡的格不会有 JSON。
+2. **卡死**：worker 主循环是**阻塞 recv**，**没有周期心跳**——
+   协议注释（worker.py 头部）里写的 "periodic + on change" 的
+   periodic 从未实现。status 只在命令处理后发送：空闲 worker
+   完全无信号，忙 worker 卡死时也无信号。scheduler 对失联的
+   检测因此只剩命令超时一条路，这就是 300s 沉默的成因（holder
+   在那之后整体沉默，进程活着但 wedged）。
+3. 同族小坑：旧 xfer degrade 路径把 turn 重新 `send_assign` 给
+   **同一个失联 worker**（`x["target"]`），worker 真卡死时会
+   二次挂起。
+
+### 3. 修复（2026-09-27 实现；验证 = runbook §2 五条单测 + §7d 三条）
+
+三层修法，死亡走事件、卡死走秒级心跳，超时只剩一个 60s 兜底：
+
+- **L1 死亡 = 事件**：launcher poll 保留，响应维持"立即终止实
+  验"——mid-run worker 死亡是基础设施故障，不是协议变量，格作
+  废重跑（BAD）是正确语义，不该降级混进数字。修的是竞态：
+  Scheduler 加 teardown 钩子，`run()` 的 finally 第一行先置
+  teardown 事件；watchdog 仅在"未 teardown 且未 stop"时 abort
+  ——正常跑完不再误炸 rc=2。
+- **L2 卡死 = 心跳失联**：worker 主循环改 `poll(timeout=1s)`，
+  命令空闲 ≥2s（`HB_INTERVAL`）主动发 status——协议注释里的
+  periodic 从此是真的。scheduler 侧任何 worker 消息（hello /
+  status / result / fetched / delivered）都刷新 `t_status`；
+  housekeeping tick 对**非 busy** 且心跳静默 >8s（`HB_GREY_S`）
+  的 worker 调 `_grey()`：在途 turn 按旧看门狗语义判失败、在途
+  xfer 降级到 fetch 前本地边界、repl 中止；重派一律 re-queue 走
+  `choose()` 重选，**绝不回灰 worker**（根因 3 的坑顺带修掉）。
+  choose() / controller 的 idle、tips、holders、replication 目标
+  全部过滤 grey；全灰且有 ready turn 时 raise 快速坏格，不挂起
+  等 cell timeout。超时在此不可避免（卡死无事件），但语义从
+  "判死"改为"降级转移"，且从 300s 收紧到秒级。
+- **L3 兜底**：`STALL_S` 300s→60s，只覆盖"busy worker 卡死在
+  长 assign 内"——run_turn 内联执行无法心跳，只能靠这个平界；
+  busy 打印阈值 120/180s 不变（仅日志）。
+
+实现落点：`worker.py`（serve 心跳 + `_t_status`）、
+`scheduler.py`（WorkerState.grey/t_status、`_grey`、
+`_watchdog_fail` 重构、choose/controller 过滤、teardown 钩子）、
+`run_cluster.py`（teardown 事件传入看门狗）。
+
+### 4. 备注
+
+- 案 A 那类 holder wedged 场景，修复后检测时间从 300s → ~8s；
+  若未来再现，日志签名是 `GREY (heartbeat silent ...s)` +
+  `degraded to E_loc=... (grey ...)`，取证命令见 runbook §7d。
+- 与事故二/三同一类教训：scheduler 每个活性/可用性判断都要问
+  "这条信息的最后确认时刻是什么"——resident 轴、spilled 轴、
+  活性轴各栽一次。
+
+
+
+
+## 7. 常见异常处置
+
+| 现象 | 处置 |
+|---|---|
+| 某格 `BAD` / 超时 | `python -m icn_proto.matrix_step5 --manifest results/icn_proto/matrix_e2.json --drop-bad`（清坏格），然后重跑那一条命令 |
+| 同一格清完重跑还 `BAD` | 先别重跑。跑 §7a 的命令看失败错误，贴回来再定处置 |
+| worker 起不来 / hello 超时 | 有孤儿进程：`pkill -9 -f icn_proto`，sleep 3，重跑 |
+| 想看重跑某格的完整日志 | `results/icn_proto/cell_logs/cell_<wl>_s2_<pol>_r<rep>_b48_p0.log`（wl 含 `_sp-1`/`_sp96`） |
+| 聚合表 spill 列全 0 | 确认命令带 `--spill-mb`、§2 的 5 条测试命令全过；再查该格日志里 `recalled` / `evicted ... spill +` 行 |
+| 96MB 档 `dropped_bytes` 恒 0 | LRU 没触发；s=1.6 格应出现第二级 churn，若无记录到结果文档即可 |
+| 格内 failed>0，错误含 `resume block not resident` / `STALE_RESUME` | 根因见 `12-e2-diag.md` 事故二+三：确认 `git pull` 拿到最新修复 → §5b 清格重跑；修复后仍出现则跑 §7a 贴完整错误回来 |
+| b3 的 spill 格质量指标大幅偏离 ours 同档 | 泄漏或新 bug，停止矩阵，贴日志回来修 |
+| 格显示 `OK rc=2`（看门狗退出码，JSON 可能正常） | JSON 数值照常读，但要看门狗为什么杀 worker：贴该格 cell log 最后 50 行回来（路径见上一行），文件名里 `_b48_p0.log` 的 b48 对应 budget=48 |
+
+### 7a. 看格内失败错误（最近 4 个有 failed 的 JSON）
+
+```bash
+cd ~/lut-experiments/LLM_LUT/v8
+python -m icn_proto.failed_report
+```
+
+只打印有 failed 的 JSON。每条失败记录给 request_id、worker、
+decision mode 和完整错误文本（STALE_RESUME 会列出所有缺失块，
+末尾就是要拿去 trace 重放查的块名，别截断）。
+
+不带参数扫最新 4 个 JSON；`python -m icn_proto.failed_report 8` 扫
+最新 8 个；`python -m icn_proto.failed_report 路径.json` 只看一个。
+
+模块不存在（老代码）时用这个等价 heredoc，但要把 `[:200]` 改成
+完整打印，否则看不到错误末尾的块名：
+
+```bash
+python - <<'EOF'
+import json, glob, os
+for p in sorted(glob.glob('results/icn_proto/blkcluster_*.json'),
+                key=os.path.getmtime)[-4:]:
+    d = json.load(open(p))
+    if not d.get('failed'):
+        continue
+    print('==', p, 'failed', d['failed'])
+    for r in d['records']:
+        if not r.get('ok'):
+            print(' ', r.get('request_id'), '->', r.get('worker'))
+            print('   ', r.get('error'))
+EOF
+```
+
+### 7b. 事故三机制确认（trace 重放已知失败块）
+
+修复是按代码因果洞实施的，定稿前要事件链证据。§7a 查到
+STALE_RESUME 后，用错误里**任意一个缺失块**的 span 重放它的一生。
+预期事件序列（事故三成立则必见）：
+
+```text
+publish → evict (outcome=spilled) → spill_drop (reason=lru)
+→ demand（scheduler 派工）→ stale_resume
+```
+
+2026-09-27 两格 b3 失败（sp96×s1.6）的现成重放命令：
+
+```bash
+cd ~/lut-experiments/LLM_LUT/v8
+# r0 格（doc1:19 → w3，缺 span 2224-2272）
+python -m icn_proto.trace_replay \
+  results/icn_proto/traces/cell_pp2_z16s1.6_t2_tps40_q40_sp96_sd0_s2_b3_r0 \
+  "span/2224-2240"
+# r1 格（doc2:19 → w3，缺 0-109 等，取其中一块即可）
+python -m icn_proto.trace_replay \
+  results/icn_proto/traces/cell_pp2_z16s1.6_t2_tps40_q40_sp96_sd0_s2_b3_r1 \
+  "span/848-864"
+```
+
+输出贴回来。看不到 `spill_drop` 就说明根因判错，回炉。
+
+### 7c. 一格 wall 明显长于其它格（近 2 倍）
+
+先查该格日志里有没有看门狗/降级记录（以 b3 sp96×s1.6 为例，
+文件名里 b48 对应 budget=48）：
+
+```bash
+cd ~/lut-experiments/LLM_LUT/v8
+grep -iE "watchdog|degrade|FAILED" \
+  results/icn_proto/cell_logs/cell_pp2_z16s1.6_t2_tps40_q40_sp96_sd0_s2_b3_r0_b48_p0.log \
+  results/icn_proto/cell_logs/cell_pp2_z16s1.6_t2_tps40_q40_sp96_sd0_s2_b3_r1_b48_p0.log
+```
+
+有 `watchdog` 行就把两行日志的这部分贴回来；没有就贴
+`grep -c evicted` 的计数即可。
+
+### 7d. 活性异常：日志签名与取证
+
+活性语义（死亡=事件立即炸格；卡死=8s 心跳失联标灰降级）的根因
+与修法记录见 **12 号事故四**；本节只放操作性的签名与取证。
+
+日志里看到以下签名时的含义：
+
+| 签名 | 含义 | 处置 |
+|---|---|---|
+| `[launcher] worker pid=... exited ... aborting` + 格无 JSON | mid-run worker 死亡（事件路径） | 格本就 BAD，按 §7 清格重跑 |
+| `GREY (heartbeat silent ...s)` / `degraded to E_loc=... (grey ...)` | worker 卡死被标灰，在途工作已降级转移 | 格可正常完成；grep 该 worker 有无 `Traceback` |
+| `GREY (stall ...s > STALL_S)` | busy worker 卡死在长 turn 内（60s 兜底） | 同上 |
+| rc=2 但格有 JSON、failed=0 | ~~teardown 竞态误炸~~ 已修复；再出现才算新问题 | 贴日志回来 |
+
+修复后验证标准：§2 五条单测全 `ALL PASS`；人为 kill worker →
+2s 内 abort 无 JSON；注入卡死 → ~8s 标灰、格 failed=0 完成；
+连跑 3 格无 rc=2。
+
+取证命令（以 b3 sp96×s1.6 r0 为例）：
+
+1. **死亡**：launcher（`run_cluster.py` watchdog 线程）每 2s
+   `poll()` 子进程——事件检测本来就有。案 A 不是死亡（死亡的
+   话 launcher 会 abort，格不会有 JSON；该案有 JSON、正常出
+   summary）。案 B 的 rc=2 才是 launcher 看门狗触发的，但它是
+   **误炸**：`scheduler.run()` 的 finally 先向 worker 发
+   shutdown、worker 收到即退出；而主线程要等 run() 返回才进
+   finally 调 `stop.set()`——run() 的 finally 在发完 shutdown 后
+   还 sleep 0.5s、关 socket，且 `summary()`（写 JSON + 打印
+   "summary ->"）是在这一切**之后**才执行的。于是存在 0.5s 以上
+   的稳定窗口：worker 已全部正常退出、stop 未置、launcher 的 2s
+   轮询必然命中"worker 已退出而 stop 未置"，每格竞态概率不低。有
+   JSON + failed=0 + 数值与 rep1 一致，全部符合"正常跑完、
+   teardown 时被误炸"；真 mid-run 死亡的格不会有 JSON。
+2. **卡死**：worker 主循环是**阻塞 recv**（worker.py），
+   **没有周期心跳**——协议注释（05 号 §2）里写的 "periodic +
+   on change" 的 periodic 从未实现。status 只在命令处理后发送：
+   空闲 worker 完全无信号，忙 worker 卡死时也无信号。scheduler
+   对失联的检测因此只剩命令超时一条路，这就是 300s 沉默的成因
+   （holder 在那之后整体沉默，进程活着但 wedged）。
+3. 同族小坑：xfer degrade 路径把 turn 重新 `send_assign` 给
+   **同一个失联 worker**（`x["target"]`），worker 真卡死时会
+   二次挂起。
+
+**三层修法**（随行 7 interest aggregation spec 一起实现，改
+scheduler/worker 消息路径时顺带）：
+
+- **L1 死亡 = 事件**：launcher poll 保留，响应维持"立即终止实
+  验"——mid-run worker 死亡是基础设施故障，不是协议变量，格作
+  废重跑（BAD）是正确语义，不该降级混进数字。修的是竞态：
+  Scheduler 加 teardown 钩子，`run()` 的 finally 第一行先置
+  teardown 事件；watchdog 仅在"未 teardown 且未 stop"时 abort
+  ——正常跑完不再误炸 rc=2。
+- **L2 卡死 = 心跳失联**：worker 主循环改 `poll(timeout=1s)`，
+  每 ~2s 主动发一次 status（约 10 行改动，顺带兑现协议注释里
+  早已写下的 periodic 承诺）。scheduler 在现有 1s housekeeping
+  tick 里记每 worker 最后 status 时间：>8s 未更新 = 失联，标灰
+  ——不再派工、移出 holder 集合、在途 turn/xfer/repl 走 degrade
+  路径，**重派时必须排除灰 worker**。超时在此不可避免（卡死无
+  事件），但语义从"判死"改为"降级转移"，且从 300s 收紧到秒级。
+- **L3 兜底阈值**：xfer/repl 挂起打印阈值 120s 不变（仅日志）；
+  强制 degrade 的 STALL_S 300s → 60s，作为 L2 的兜底（心跳
+  消息自身丢失的极端情况）。
+
+**验证标准（实现后跑）**：
+
+先跑 §2 五条单测（`test_controller / test_e1 / test_e2 /
+test_policy / test_openloop`，全 `ALL PASS`），再过下面三条：
+
+1. 人为 `kill` 一个 worker 进程：launcher 2s 内 abort、格 BAD
+   无 JSON（事件路径）；
+2. 人为给 worker 注入 120s 卡死：scheduler ~8s 标灰、在途 turn
+   degrade、格正常完成 failed=0、日志有标灰记录（超时路径）；
+3. 连续 3 格正常完成：无 rc=2（竞态修复）。
+
+**实现落点（2026-09-27，随本修法入库）**：
+
+- `worker.py`：主循环改 `sock.poll(1000)` tick，命令空闲
+  ≥2s（`HB_INTERVAL`）主动发 status——协议注释里 "periodic +
+  on change" 的 periodic 从此是真的；
+- `scheduler.py`：`WorkerState` 加 `grey` / `t_status`；
+  任何 worker 消息（含 hello/ack）都刷新 `t_status`；
+  housekeeping tick 对非 busy 且心跳静默 >8s（`HB_GREY_S`）的
+  worker 调 `_grey()`：在途 turn 按旧看门狗语义判失败、在途
+  xfer/repl 降级或中止，**重派一律 re-queue 走 choose()，绝不
+  回灰 worker**（旧 watchdog 会把 turn 重新 send_assign 给
+  卡死的原 worker，顺带修掉）；choose()/controller 的 idle、
+  tips、holders、replication 目标全部过滤 grey；全灰且有 ready
+  turn 时 raise 快速坏格，不挂起等 cell timeout；
+  `STALL_S` 300s→60s，只兜"busy worker 卡死在长 assign 内"
+  （run_turn 内联执行无法心跳，只能靠这个平界）；busy 打印阈值
+  120/180s 不变（仅日志）；
+- `run_cluster.py`：`Scheduler(..., on_teardown=...)`，
+  `run()` 的 finally 第一行先置 teardown 事件，launcher 看门狗
+  在 stop 或 teardown 已置时不再 abort——正常跑完不再误炸
+  rc=2。
+
+**再现任一格时定位 holder 的取证命令**：
+
+```bash
+grep -E "xfer .doc6:31 fetch|fetched|Traceback|Killed" \
+  results/icn_proto/cell_logs/cell_pp2_z16s1.6_t2_tps40_q40_sp96_sd0_s2_b3_r0_b48_p0.log
+```
