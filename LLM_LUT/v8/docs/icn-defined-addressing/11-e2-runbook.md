@@ -159,7 +159,10 @@ python -m icn_proto.matrix_report --drop-before 20260928
 ```
 
 3. 重跑 §5 的 4 条和 §5a 的 2 条（manifest 只补被清的格）。
-   新格 `stale_resume_retries` 应为 0；不为 0 贴回来。
+   可用性门槛：**failed=0**、无 `xfer ... stuck` 卡死记录即可用。
+   少量 stale_resume 重试（重试后成功）是事故三守卫的设计行为
+   （宁可重试不可硬失败），不单独作废格；重试多得反常
+   （>20）或同一格反复出现才贴回来。
 
 ## 6. 块生命周期追踪（机制观测）
 
@@ -310,3 +313,90 @@ python -m icn_proto.trace_replay \
 ```
 
 输出贴回来。看不到 `spill_drop` 就说明根因判错，回炉。
+
+### 7c. 一格 wall 明显长于其它格（近 2 倍）
+
+先查该格日志里有没有看门狗/降级记录（以 b3 sp96×s1.6 为例，
+文件名里 b48 对应 budget=48）：
+
+```bash
+cd ~/lut-experiments/LLM_LUT/v8
+grep -iE "watchdog|degrade|FAILED" \
+  results/icn_proto/cell_logs/cell_pp2_z16s1.6_t2_tps40_q40_sp96_sd0_s2_b3_r0_b48_p0.log \
+  results/icn_proto/cell_logs/cell_pp2_z16s1.6_t2_tps40_q40_sp96_sd0_s2_b3_r1_b48_p0.log
+```
+
+有 `watchdog` 行就把两行日志的这部分贴回来；没有就贴
+`grep -c evicted` 的计数即可。
+
+### 7d. 活性设计缺陷与三层修法（2026-09-27 定稿）
+
+两案并查：
+
+- **案 A**（b3 sp96×s1.6 r0）：`xfer doc6:31 stuck in stage fetch`
+  持续 300s，`STALL_S=300s` 看门狗降级兜住（failed=0，代价 160
+  rederiv tokens + wall 虚高）。
+- **案 B**（ours sp96×s1.6 rep0）：格 `rc=2` 但 JSON 正常、
+  failed=0、数值与 rep1 一致。
+
+**定性：不是协议行为，是活性检测的设计缺陷**。当前系统把"死亡"
+和"卡死"两种本质不同的事件统一用超时糊住（STALL_S=300s），且
+细查后两种都没有及时检测路径：
+
+1. **死亡**：launcher（`run_cluster.py` watchdog 线程）每 2s
+   `poll()` 子进程——事件检测本来就有。案 A 不是死亡（死亡的
+   话 launcher 会 abort，格不会有 JSON；该案有 JSON、正常出
+   summary）。案 B 的 rc=2 才是 launcher 看门狗触发的，但它是
+   **误炸**：`scheduler.run()` 的 finally 先向 worker 发
+   shutdown、worker 收到即退出；而主线程要等 run() 返回才进
+   finally 调 `stop.set()`——run() 的 finally 在发完 shutdown 后
+   还 sleep 0.5s、关 socket，且 `summary()`（写 JSON + 打印
+   "summary ->"）是在这一切**之后**才执行的。于是存在 0.5s 以上
+   的稳定窗口：worker 已全部正常退出、stop 未置、launcher 的 2s
+   轮询必然命中"worker 已退出而 stop 未置"，每格竞态概率不低。有
+   JSON + failed=0 + 数值与 rep1 一致，全部符合"正常跑完、
+   teardown 时被误炸"；真 mid-run 死亡的格不会有 JSON。
+2. **卡死**：worker 主循环是**阻塞 recv**（worker.py），
+   **没有周期心跳**——协议注释（05 号 §2）里写的 "periodic +
+   on change" 的 periodic 从未实现。status 只在命令处理后发送：
+   空闲 worker 完全无信号，忙 worker 卡死时也无信号。scheduler
+   对失联的检测因此只剩命令超时一条路，这就是 300s 沉默的成因
+   （holder 在那之后整体沉默，进程活着但 wedged）。
+3. 同族小坑：xfer degrade 路径把 turn 重新 `send_assign` 给
+   **同一个失联 worker**（`x["target"]`），worker 真卡死时会
+   二次挂起。
+
+**三层修法**（随行 7 interest aggregation spec 一起实现，改
+scheduler/worker 消息路径时顺带）：
+
+- **L1 死亡 = 事件**：launcher poll 保留，响应维持"立即终止实
+  验"——mid-run worker 死亡是基础设施故障，不是协议变量，格作
+  废重跑（BAD）是正确语义，不该降级混进数字。修的是竞态：
+  Scheduler 加 teardown 钩子，`run()` 的 finally 第一行先置
+  teardown 事件；watchdog 仅在"未 teardown 且未 stop"时 abort
+  ——正常跑完不再误炸 rc=2。
+- **L2 卡死 = 心跳失联**：worker 主循环改 `poll(timeout=1s)`，
+  每 ~2s 主动发一次 status（约 10 行改动，顺带兑现协议注释里
+  早已写下的 periodic 承诺）。scheduler 在现有 1s housekeeping
+  tick 里记每 worker 最后 status 时间：>8s 未更新 = 失联，标灰
+  ——不再派工、移出 holder 集合、在途 turn/xfer/repl 走 degrade
+  路径，**重派时必须排除灰 worker**。超时在此不可避免（卡死无
+  事件），但语义从"判死"改为"降级转移"，且从 300s 收紧到秒级。
+- **L3 兜底阈值**：xfer/repl 挂起打印阈值 120s 不变（仅日志）；
+  强制 degrade 的 STALL_S 300s → 60s，作为 L2 的兜底（心跳
+  消息自身丢失的极端情况）。
+
+**验证标准（实现后跑）**：
+
+1. 人为 `kill` 一个 worker 进程：launcher 2s 内 abort、格 BAD
+   无 JSON（事件路径）；
+2. 人为给 worker 注入 120s 卡死：scheduler ~8s 标灰、在途 turn
+   degrade、格正常完成 failed=0、日志有标灰记录（超时路径）；
+3. 连续 3 格正常完成：无 rc=2（竞态修复）。
+
+**再现任一格时定位 holder 的取证命令**：
+
+```bash
+grep -E "xfer .doc6:31 fetch|fetched|Traceback|Killed" \
+  results/icn_proto/cell_logs/cell_pp2_z16s1.6_t2_tps40_q40_sp96_sd0_s2_b3_r0_b48_p0.log
+```
