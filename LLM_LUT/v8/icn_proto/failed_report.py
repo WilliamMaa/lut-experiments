@@ -7,7 +7,9 @@ Usage:
     python -m icn_proto.failed_report path.json  # one specific JSON
 
 Only JSONs with failed > 0 print anything. For each failed record:
-request_id, chosen worker, decision mode, and the error (truncated).
+request_id, chosen worker, decision mode, and the full error text
+(STALE_RESUME errors list every missing block; the tail of the message
+is what you need for trace replay, so nothing is truncated).
 """
 
 import glob
@@ -30,7 +32,7 @@ def report(path):
             continue
         dec = (r.get("decision") or {}).get("mode")
         print(f"  {r.get('request_id')} -> {r.get('worker')}"
-              f" mode={dec} {repr(r.get('error'))[:200]}")
+              f" mode={dec}\n    {r.get('error')}")
     return n
 
 

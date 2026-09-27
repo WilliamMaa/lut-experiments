@@ -247,11 +247,26 @@ dropped）→ recall / fetch_send → delivered。同一 span 若匹配到多块
 | 96MB 档 `dropped_bytes` 恒 0 | LRU 没触发；s=1.6 格应出现第二级 churn，若无记录到结果文档即可 |
 | 格内 failed>0，错误含 `resume block not resident` / `STALE_RESUME` | 根因见 `12-e2-diag.md`：确认 `git pull` 拿到修复 → `--drop-bad` 清格重跑；修复后仍出现则贴日志 |
 | b3 的 spill 格质量指标大幅偏离 ours 同档 | 泄漏或新 bug，停止矩阵，贴日志回来修 |
+| 格显示 `OK rc=2`（看门狗退出码，JSON 可能正常） | JSON 数值照常读，但要看门狗为什么杀 worker：贴该格 cell log 最后 50 行回来（路径见上一行），文件名里 `_b48_p0.log` 的 b48 对应 budget=48 |
 
 ### 7a. 看格内失败错误（最近 4 个有 failed 的 JSON）
 
 ```bash
 cd ~/lut-experiments/LLM_LUT/v8
+python -m icn_proto.failed_report
+```
+
+只打印有 failed 的 JSON。每条失败记录给 request_id、worker、
+decision mode 和完整错误文本（STALE_RESUME 会列出所有缺失块，
+末尾就是要拿去 trace 重放查的块名，别截断）。
+
+不带参数扫最新 4 个 JSON；`python -m icn_proto.failed_report 8` 扫
+最新 8 个；`python -m icn_proto.failed_report 路径.json` 只看一个。
+
+模块不存在（老代码）时用这个等价 heredoc，但要把 `[:200]` 改成
+完整打印，否则看不到错误末尾的块名：
+
+```bash
 python - <<'EOF'
 import json, glob, os
 for p in sorted(glob.glob('results/icn_proto/blkcluster_*.json'),
@@ -262,7 +277,7 @@ for p in sorted(glob.glob('results/icn_proto/blkcluster_*.json'),
     print('==', p, 'failed', d['failed'])
     for r in d['records']:
         if not r.get('ok'):
-            print(' ', r.get('request_id'), '->', r.get('worker'),
-                  repr(r.get('error'))[:200])
+            print(' ', r.get('request_id'), '->', r.get('worker'))
+            print('   ', r.get('error'))
 EOF
 ```
