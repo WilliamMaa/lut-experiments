@@ -151,3 +151,68 @@ interest aggregation 实验时一并评估。
   一致，是否保留由 `matrix_report` 的 retries 扫描判决（runbook
   §5b）；rep1 两格坏 JSON 随 §5b 流程清掉重跑。
 - b3@s0 × s=1.6 一条未跑，同样等修复后一起跑。
+
+## 事故三（2026-09-27，sp96×s1.6 b3 两格修复后仍 STALE_RESUME）
+
+状态：**根因已定位（代码级因果洞，trace 待重跑后补证）+ 已修复
+（2026-09-27，六测全绿），待远程重跑验证**
+
+### 1. 现象
+
+事故二修复（因果序）当天重跑 sp96×s1.6：b3 rep0/rep1 仍各
+`failed=1`，错误仍是 `STALE_RESUME`，`mode=fetch`。两格失败形态：
+
+- `..._181143.json` doc1:19→w3：缺 3 块（span 2224-2272，一段连续）。
+- `..._181451.json` doc2:19→w3：缺 0-109 与 115-117，**中间的
+  110-114 却在**——块被零散交付，scheduler 对"w3 缺多少前缀"的
+  视图和实际不一致。
+
+### 2. 根因（代码因果分析）
+
+事故二的因果序修复只保护了 **resident/tips 轴**（驱逐目标有
+`evict_t` 记录，可做 ghost 减法）。**spilled 轴完全没有对等保护**：
+
+1. worker 的 tier 在 `_spill_put` 里为了给驱逐块腾地方会 LRU 踢
+   collateral 旧块（还有 oversize 拒绝）。这些被踢的名字**不是驱逐
+   目标**，不在任何因果日志里，scheduler 只能通过全量 status 的
+   spilled 列表间接知道。
+2. 全量替换本身在 zmq FIFO 下是对的，但**踢块发生 → post-evict
+   status 被 scheduler 处理**之间有一个在飞窗口。窗口内
+   `choose()`/`match_local()` 把已被踢的名字当作"可召回"，从 fetch
+   的 `need` 里排除 → 不 fetch → 派工 resume → worker `_recall`
+   拿不到 → STALE_RESUME。
+3. 重试再失败的路径：purge 把缺块从视图清掉后，块可经 deliver
+   重新落到 w3 并被 status 确认回视图；下一次未确认驱逐窗口又把
+   它踢掉——同一 turn 连撞两次窗口即硬失败。
+
+加重因素：sp96 档 tier 常满 + 驱逐频繁，窗口被击中概率最高；tier
+满时 LRU 踢的是整条冷链，解释了"大块连续缺失名单"。
+
+**连带发现（同一现场暴露）**：worker 的 fetch 失败 ack 没带
+`names` 字段，而 scheduler 按 `(holder, names)` 配对——失败 ack
+永远配不上等待中的 xfer，计划的即时 degrade 路径是死代码，turn
+只能等 120s 看门狗兜底。
+
+### 3. 修复（2026-09-27，回归测试 3 条新增）
+
+- worker `_spill_put(name, obj, dropped=...)` 收集本次 collateral
+  踢块名单（LRU + oversize），evict handler 随 post-evict status
+  上报 `"spill_dropped"`；scheduler status handler 从 `w.spilled`
+  减去（`test_status_spill_dropped`）。
+- scheduler 新增 `_spill_confirmed(w)`：存在**未确认驱逐**且按
+  投影字节 tier 装不下时，spilled 名字一律不可信——
+  `match_local` 不把 spilled-only 当可 resume，`choose` 把这类块
+  计入 `need`（宁可多 fetch 不可硬失败）；tier 空闲、装得下、
+  或驱逐已确认时保持 E2 原语义（`test_spill_window_conservative`）。
+- fetch 失败 ack 补 `"names"` 字段使配对生效；degrade 同时按
+  缺块名单清 holder 的 resident/spilled/tips 视图
+  （`test_fetch_fail_purges_holder_view`）。
+
+### 4. 备注
+
+- 行为变化范围：只触及 spill tier 路径（sp96 格）和 fetch 失败
+  路径。按项目规则（行为修复→旧格全作废），2026-09-27 当天跑出的
+  全部格子再次作废，见 runbook §5b。
+- 事故二/三的共同教训：scheduler 的每个"可用性判断"都必须问
+  "这条信息最后由谁、经哪条消息确认"——resident 轴和 spilled 轴
+  各栽一次。

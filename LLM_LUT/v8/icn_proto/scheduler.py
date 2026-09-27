@@ -383,8 +383,13 @@ class Scheduler:
         """Longest resume position T on worker w: a tip position whose
         full resume-name set (complete blocks + tip block) is available
         in the fast tier or the spill tier (E2: resident ∪ spilled —
-        eviction no longer destroys the resume path)."""
+        eviction no longer destroys the resume path). Spilled names only
+        count while the tier is CONFIRMED quiet: collateral LRU drops
+        happen while an evict command is in flight (incident 3), so an
+        unconfirmed eviction may already have removed names the view
+        still lists."""
         bt = self.args.block_tokens
+        spilled_ok = self._spill_confirmed(w)
         best = 0
         for tip_name in w.tips:
             t_pos = self._tip_end(tip_name)
@@ -392,11 +397,29 @@ class Scheduler:
                 continue
             if turn.tip_name_at(t_pos, "bf16", bt) != tip_name:
                 continue                      # not a tip of THIS turn's chain
-            if not all(n in w.resident or n in w.spilled
+            if not all(n in w.resident or (n in w.spilled and spilled_ok)
                        for n in self.resume_names(turn, t_pos)):
                 continue
             best = max(best, t_pos)
         return best
+
+    def _spill_confirmed(self, w):
+        """True while no UNCONFIRMED eviction could have overflowed the
+        backing tier. Tier drops (_spill_put LRU) happen only while
+        landing an evicted block, and only the worker knows the victims
+        (it reports them via spill_dropped, 12-e2-diag incident 3).
+        Between the worker's drop and our processing of the trailing
+        status, any spilled name in the view may already be gone; the
+        projected-byte check below bounds that window to evictions that
+        actually could not fit."""
+        if not w.evict_t:
+            return True
+        cap_mb = getattr(self.args, "spill_mb", 0.0)
+        if cap_mb == 0 or cap_mb < 0:
+            return True        # tier disabled; -1 = unbounded, no LRU drops
+        proj = w.spill_bytes + sum(self.dir.get(n, {}).get("bytes", 0)
+                                   for n in w.evict_t)
+        return proj <= cap_mb * 1e6
 
     DECODE_STEP0 = 0.08   # s per decode token; refined once decode timing
                           # is EWMA-tracked (step 3 pipelining)
@@ -478,10 +501,15 @@ class Scheduler:
             if pol in ("b3", "ours"):
                 cand = sorted(self._tip_end(tn) for tn in tips_global
                               if e_loc < self._tip_end(tn) <= tip_bound)
+                # incident 3: while an unconfirmed eviction could have
+                # overflowed the tier, spilled names may already be LRU
+                # drops — count them as NEED (fetch them) instead of
+                # trusting the stale spilled view.
+                spill_ok = self._spill_confirmed(w)
                 for t_pos in reversed(cand):
                     need = [n for n in self.resume_names(turn, t_pos)
                             if n not in w.resident
-                            and n not in w.spilled]
+                            and (n not in w.spilled or not spill_ok)]
                     if not need:
                         # the whole resume set (tip block included) is
                         # already available locally — a FREE extension,
@@ -1184,6 +1212,13 @@ class Scheduler:
                 del w.evict_t[n]
             w.resident_bytes = hdr.get("resident_bytes", w.resident_bytes)
             w.spilled = set(hdr.get("spilled", []))
+            # incident 3 (12-e2-diag): collateral tier drops (LRU victims,
+            # oversize refusals) reported by the worker — the full
+            # snapshot normally already excludes them, this makes the
+            # causal event explicit and covers any future non-snapshot
+            # status path.
+            for n in hdr.get("spill_dropped") or []:
+                w.spilled.discard(n)
             w.spill_bytes = hdr.get("spill_bytes", w.spill_bytes)
             w.spill_stat = hdr.get("spill", w.spill_stat)
             return
@@ -1299,8 +1334,17 @@ class Scheduler:
             else:
                 # holder lost blocks: demand degrades to the local
                 # boundary; a failed replication just aborts (zero-replica
-                # is legal — identity survives via re-derivation)
+                # is legal — identity survives via re-derivation).
+                # The holder PROVED absence (recall + resident lookup both
+                # missed) — purge its view or every later plan keeps
+                # routing fetches through a holder that no longer holds
+                # (incident 3, 12-e2-diag).
                 for n in hdr.get("missing") or []:
+                    hw = self.workers.get(ident)
+                    if hw is not None:
+                        hw.resident.discard(n)
+                        hw.spilled.discard(n)
+                        hw.tips.discard(n)
                     self.trace.emit("fetch_missing", n,
                                     holder=ident.decode(), kind=kind)
                 if kind == "repl":

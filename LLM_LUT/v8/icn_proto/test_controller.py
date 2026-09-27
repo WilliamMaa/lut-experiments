@@ -338,6 +338,93 @@ def test_status_snapshot_clobber():
     check("evict log retired", w0.evict_t == {})
 
 
+def test_status_spill_dropped():
+    """Incident 3 (2026-09-27, sp96×s1.6 b3 cells): the worker's tier
+    drops LRU victims to make room for an evicted block. Those drops are
+    collateral — not evict targets, invisible to the resident-ghost
+    logic — and ride the trailing status as spill_dropped; the handler
+    must subtract them from the spilled view."""
+    print("status spill_dropped:")
+    s = make_sched("b3", spill_mb=96.0)
+    w0 = s.workers[b"w0"]
+    turn = doc_turn()
+    _, names = hold(s, w0, turn, t_pos=512)
+    w0.resident = set()
+    w0.spilled = set(names)
+    hdr = {"type": "status", "seq": 5, "resident": [], "tips": [],
+           "resident_bytes": 0,
+           "spilled": [n for n in names[2:]],
+           "spill_dropped": [names[0], names[1]],
+           "spill_bytes": 0, "spill": {}}
+    s.on_message(None, b"w0", hdr, payload=None)
+    check("collateral drops purged from spilled view",
+          names[0] not in w0.spilled and names[1] not in w0.spilled)
+    check("survivors kept", all(n in w0.spilled for n in names[2:]))
+
+
+def test_spill_window_conservative():
+    """Incident 3 window: a tier drop happens WHILE the evict command
+    is in flight; until the trailing status confirms, spilled names
+    must not make a resume look servable on that worker — the tier may
+    already have dropped them (STALE_RESUME). Quiet, roomy, or
+    confirmed-quiet tiers keep the E2 recall semantics."""
+    print("spill window conservatism:")
+    turn = doc_turn()
+    s = make_sched("b3", spill_mb=2.0)
+    w0 = s.workers[b"w0"]
+    tip, names = hold(s, w0, turn, t_pos=512, mb=1)
+    w0.resident = set()
+    w0.spilled = set(names)
+    w0.tips = {tip}
+    check("quiet tier resumes from spill",
+          s.match_local(turn, w0, N_TOK) == 512)
+    # an unconfirmed eviction whose payload cannot fit a FULL tier:
+    # LRU drops are possible right now → spilled-only resume untrusted
+    w0.evict_t[names[-1]] = 9
+    w0.spill_bytes = 2.0 * MB
+    check("unconfirmed overflow -> spilled not trusted",
+          s.match_local(turn, w0, N_TOK) == 0)
+    # roomy tier: the evicted block lands without touching anyone
+    w0.spill_bytes = 0
+    check("unconfirmed but fits -> still trusted",
+          s.match_local(turn, w0, N_TOK) == 512)
+    # confirmed quiet (log retired): trusted again
+    w0.spill_bytes = 2.0 * MB
+    w0.evict_t.clear()
+    check("confirmed quiet -> trusted",
+          s.match_local(turn, w0, N_TOK) == 512)
+
+
+def test_fetch_fail_purges_holder_view():
+    """A holder that reports blocks missing PROVED their absence (recall
+    + resident lookup both missed). Purge its view — otherwise every
+    later plan keeps routing fetches through a holder that no longer
+    holds (incident 3)."""
+    print("fetch fail purges holder view:")
+
+    class FakeSock:
+        def send_multipart(self, frames):
+            pass
+
+    s = make_sched("b3")
+    turn = doc_turn()
+    _, names = hold(s, s.workers[b"w0"], turn)
+    gone = names[3]
+    s._xfer["doc3:0"] = {"stage": "fetch", "holder": b"w0",
+                         "target": b"w1", "names": [gone], "bytes": 0,
+                         "t_fetch": time.time(), "turn": turn,
+                         "E_loc": 0, "decision": None}
+    s.on_message(FakeSock(), b"w0",
+                 {"type": "fetched", "ok": False, "names": [gone],
+                  "missing": [gone]},
+                 payload=None)
+    check("missing purged from holder resident",
+          gone not in s.workers[b"w0"].resident)
+    check("missing purged from holder spilled",
+          gone not in s.workers[b"w0"].spilled)
+    check("xfer drained", s._xfer == {})
+
+
 def test_watchdog_fail():
     """A worker stall must fail the turn and advance the session (the
     share=8/ours/budget=48 cell of the 20260921 v2 run hung forever on
@@ -440,6 +527,9 @@ def main():
     test_eviction()
     test_eviction_shared_substrate()
     test_status_snapshot_clobber()
+    test_status_spill_dropped()
+    test_spill_window_conservative()
+    test_fetch_fail_purges_holder_view()
     test_watchdog_fail()
     test_delivered_repl()
     test_delivered_updates_residency()

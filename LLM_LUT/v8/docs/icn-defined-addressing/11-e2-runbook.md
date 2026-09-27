@@ -146,14 +146,16 @@ python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-3
 
 ## 5b. 修复后重跑（清掉修复前的全部格子）
 
-背景见 `12-e2-diag.md` 事故二。修复前的格子全部作废重跑（逐格
-保留的旧格会把新旧数据混在一起，2026-09-27 已踩过）。步骤：
+背景见 `12-e2-diag.md`：事故二（2026-09-27 白天）和事故三
+（2026-09-27 晚，spilled 轴因果洞 + fetch 失败 ack 缺 names）
+各作废一次全部格子。修复前的格子全部作废重跑（逐格保留的旧格
+会把新旧数据混在一起，2026-09-27 已踩过两次）。步骤：
 
 1. 跑 §2 的 5 条测试命令，全过再继续；
-2. 清掉修复前（9-27 之前）的全部格子：
+2. 清掉全部格子（两次修复当天跑出的也在内）：
 
 ```bash
-python -m icn_proto.matrix_report --drop-before 20260927
+python -m icn_proto.matrix_report --drop-before 20260928
 ```
 
 3. 重跑 §5 的 4 条和 §5a 的 2 条（manifest 只补被清的格）。
@@ -245,7 +247,7 @@ dropped）→ recall / fetch_send → delivered。同一 span 若匹配到多块
 | 想看重跑某格的完整日志 | `results/icn_proto/cell_logs/cell_<wl>_s2_<pol>_r<rep>_b48_p0.log`（wl 含 `_sp-1`/`_sp96`） |
 | 聚合表 spill 列全 0 | 确认命令带 `--spill-mb`、§2 的 5 条测试命令全过；再查该格日志里 `recalled` / `evicted ... spill +` 行 |
 | 96MB 档 `dropped_bytes` 恒 0 | LRU 没触发；s=1.6 格应出现第二级 churn，若无记录到结果文档即可 |
-| 格内 failed>0，错误含 `resume block not resident` / `STALE_RESUME` | 根因见 `12-e2-diag.md`：确认 `git pull` 拿到修复 → `--drop-bad` 清格重跑；修复后仍出现则贴日志 |
+| 格内 failed>0，错误含 `resume block not resident` / `STALE_RESUME` | 根因见 `12-e2-diag.md` 事故二+三：确认 `git pull` 拿到最新修复 → §5b 清格重跑；修复后仍出现则跑 §7a 贴完整错误回来 |
 | b3 的 spill 格质量指标大幅偏离 ours 同档 | 泄漏或新 bug，停止矩阵，贴日志回来修 |
 | 格显示 `OK rc=2`（看门狗退出码，JSON 可能正常） | JSON 数值照常读，但要看门狗为什么杀 worker：贴该格 cell log 最后 50 行回来（路径见上一行），文件名里 `_b48_p0.log` 的 b48 对应 budget=48 |
 
@@ -281,3 +283,30 @@ for p in sorted(glob.glob('results/icn_proto/blkcluster_*.json'),
             print('   ', r.get('error'))
 EOF
 ```
+
+### 7b. 事故三机制确认（trace 重放已知失败块）
+
+修复是按代码因果洞实施的，定稿前要事件链证据。§7a 查到
+STALE_RESUME 后，用错误里**任意一个缺失块**的 span 重放它的一生。
+预期事件序列（事故三成立则必见）：
+
+```text
+publish → evict (outcome=spilled) → spill_drop (reason=lru)
+→ demand（scheduler 派工）→ stale_resume
+```
+
+2026-09-27 两格 b3 失败（sp96×s1.6）的现成重放命令：
+
+```bash
+cd ~/lut-experiments/LLM_LUT/v8
+# r0 格（doc1:19 → w3，缺 span 2224-2272）
+python -m icn_proto.trace_replay \
+  results/icn_proto/traces/cell_pp2_z16s1.6_t2_tps40_q40_sp96_sd0_s2_b3_r0 \
+  "span/2224-2240"
+# r1 格（doc2:19 → w3，缺 0-109 等，取其中一块即可）
+python -m icn_proto.trace_replay \
+  results/icn_proto/traces/cell_pp2_z16s1.6_t2_tps40_q40_sp96_sd0_s2_b3_r1 \
+  "span/848-864"
+```
+
+输出贴回来。看不到 `spill_drop` 就说明根因判错，回炉。

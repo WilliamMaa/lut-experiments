@@ -77,10 +77,15 @@ class Worker:
         # predates its own evictions (12-e2-diag incident 2)
         self.cmd_seq = 0
 
-    def _spill_put(self, name, obj):
+    def _spill_put(self, name, obj, dropped=None):
         """Eviction landing point: move a block into the tier. Capacity
         pressure drops the oldest entries (LRU). Returns True if the
-        block is resident in the tier, False if dropped."""
+        block is resident in the tier, False if dropped. Every name
+        removed from the tier by THIS call — LRU victims and an oversize
+        refusal — is appended to `dropped` (when given) so the trailing
+        status can tell the scheduler (12-e2-diag incident 3: a
+        collateral tier drop is invisible to the scheduler's spilled
+        view and a resume planned against it hard-fails)."""
         if not self.spill_enabled:
             return False
         nb = obj.nbytes()
@@ -90,9 +95,13 @@ class Worker:
             self.spill_bytes -= old.nbytes()
             self.spill_stat["dropped_bytes"] += old.nbytes()
             self.trace.emit("spill_drop", old_name, reason="lru")
+            if dropped is not None:
+                dropped.append(old_name)
         if nb > self.spill_cap:     # a single object larger than the tier
             self.spill_stat["dropped_bytes"] += nb
             self.trace.emit("spill_drop", name, reason="oversize")
+            if dropped is not None:
+                dropped.append(name)
             return False
         self.spill[name] = obj
         self.spill_bytes += nb
@@ -341,8 +350,13 @@ class Worker:
                     (objs if obj is not None else missing).append(
                         obj if obj is not None else n)
                 if missing:
+                    # echo the requested names: the scheduler pairs this
+                    # ack by (holder, names) to find the waiting xfer —
+                    # without them the ack matches nothing, the planned
+                    # degrade never fires, and the turn stalls until the
+                    # watchdog (incident 3 follow-up)
                     msg.send(sock, {"type": "fetched", "ok": False,
-                                    "missing": missing})
+                                    "names": names, "missing": missing})
                 else:
                     buf = io.BytesIO()
                     torch.save(objs, buf)
@@ -369,12 +383,13 @@ class Worker:
                 continue
             if mtype == "evict":
                 gone, spilled_b, dropped_b = [], 0, 0
+                spill_dropped = []   # collateral tier drops (incident 3)
                 for n in hdr.get("names", []):
                     obj = self.resident.pop(n, None)
                     if obj is None:
                         continue
                     gone.append(obj)
-                    if self._spill_put(n, obj):
+                    if self._spill_put(n, obj, dropped=spill_dropped):
                         spilled_b += obj.nbytes()
                         self.trace.emit("evict", n, outcome="spilled")
                     else:
@@ -384,7 +399,8 @@ class Worker:
                       f"({sum(o.nbytes() for o in gone) / 1e6:.1f}MB; "
                       f"spill +{spilled_b / 1e6:.1f}MB, "
                       f"dropped {dropped_b / 1e6:.1f}MB)", flush=True)
-                self.report_status(sock)
+                self.report_status(sock,
+                                   extra={"spill_dropped": spill_dropped})
                 continue
             if mtype == "assign":
                 hdr_out = {"type": "result",
@@ -431,11 +447,12 @@ class Worker:
             "spill": dict(self.spill_stat),
         }
 
-    def report_status(self, sock):
+    def report_status(self, sock, extra=None):
         # no busy field: the scheduler owns the busy flag (set on
         # assign/fetch, cleared on result). A worker-reported busy would
         # be stale by the time it arrives and caused double-booking.
-        msg.send(sock, dict({"type": "status"}, **self._status_hdr()))
+        msg.send(sock, dict({"type": "status"}, **self._status_hdr(),
+                            **(extra or {})))
 
 
 def main():
