@@ -329,7 +329,7 @@ grep -iE "watchdog|degrade|FAILED" \
 有 `watchdog` 行就把两行日志的这部分贴回来；没有就贴
 `grep -c evicted` 的计数即可。
 
-### 7d. 活性设计缺陷与三层修法（2026-09-27 定稿）
+### 7d. 活性设计缺陷与三层修法（2026-09-27 定稿；代码已实现，待验证）
 
 两案并查：
 
@@ -388,11 +388,36 @@ scheduler/worker 消息路径时顺带）：
 
 **验证标准（实现后跑）**：
 
+先跑 §2 五条单测（`test_controller / test_e1 / test_e2 /
+test_policy / test_openloop`，全 `ALL PASS`），再过下面三条：
+
 1. 人为 `kill` 一个 worker 进程：launcher 2s 内 abort、格 BAD
    无 JSON（事件路径）；
 2. 人为给 worker 注入 120s 卡死：scheduler ~8s 标灰、在途 turn
    degrade、格正常完成 failed=0、日志有标灰记录（超时路径）；
 3. 连续 3 格正常完成：无 rc=2（竞态修复）。
+
+**实现落点（2026-09-27，随本修法入库）**：
+
+- `worker.py`：主循环改 `sock.poll(1000)` tick，命令空闲
+  ≥2s（`HB_INTERVAL`）主动发 status——协议注释里 "periodic +
+  on change" 的 periodic 从此是真的；
+- `scheduler.py`：`WorkerState` 加 `grey` / `t_status`；
+  任何 worker 消息（含 hello/ack）都刷新 `t_status`；
+  housekeeping tick 对非 busy 且心跳静默 >8s（`HB_GREY_S`）的
+  worker 调 `_grey()`：在途 turn 按旧看门狗语义判失败、在途
+  xfer/repl 降级或中止，**重派一律 re-queue 走 choose()，绝不
+  回灰 worker**（旧 watchdog 会把 turn 重新 send_assign 给
+  卡死的原 worker，顺带修掉）；choose()/controller 的 idle、
+  tips、holders、replication 目标全部过滤 grey；全灰且有 ready
+  turn 时 raise 快速坏格，不挂起等 cell timeout；
+  `STALL_S` 300s→60s，只兜"busy worker 卡死在长 assign 内"
+  （run_turn 内联执行无法心跳，只能靠这个平界）；busy 打印阈值
+  120/180s 不变（仅日志）；
+- `run_cluster.py`：`Scheduler(..., on_teardown=...)`，
+  `run()` 的 finally 第一行先置 teardown 事件，launcher 看门狗
+  在 stop 或 teardown 已置时不再 abort——正常跑完不再误炸
+  rc=2。
 
 **再现任一格时定位 holder 的取证命令**：
 

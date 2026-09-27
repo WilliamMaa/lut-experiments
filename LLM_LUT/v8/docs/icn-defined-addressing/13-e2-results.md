@@ -149,6 +149,7 @@ trace 目录：`results/icn_proto/traces/cell_<wl>_s2_<b3|ours>_r<rep>/`
    （`xfer doc6:31 stuck in stage fetch`），看门狗降级 + 重试兜住，
    代价 160 rederiv tokens（占该格 0.25%）+ wall 虚高。根因是活
    性检测设计缺陷（worker 无周期心跳，阻塞 recv，卡死与死亡都
-   只能靠超时糊），已定性并给出三层修法，见 runbook §7d；
-   随同行 7 spec 实现，不必再现追查；
+   只能靠超时糊）。三层修法（心跳标灰 / teardown 竞态修复 /
+   STALL_S 收紧）已于 2026-09-27 实现，见 runbook §7d，含验证
+   步骤；验证通过后此格的重跑价值另行评估；
 3. §5a（b3@s0 四格）未跑：补齐后 P1/P3 获得虚空落点对照。

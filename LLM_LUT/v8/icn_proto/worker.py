@@ -76,6 +76,7 @@ class Worker:
         # so the scheduler can tell whether a full-snapshot status
         # predates its own evictions (12-e2-diag incident 2)
         self.cmd_seq = 0
+        self._t_status = time.time()   # last status emission (heartbeat)
 
     def _spill_put(self, name, obj, dropped=None):
         """Eviction landing point: move a block into the tier. Capacity
@@ -325,6 +326,11 @@ class Worker:
 
     # ---- command loop ---------------------------------------------------
 
+    HB_INTERVAL = 2.0   # heartbeat status period while command-idle (7d L2):
+                        # the scheduler greys a worker whose status stream
+                        # stops; a purely blocking recv gives an idle
+                        # worker no way to prove liveness
+
     def serve(self):
         import zmq
         ctx = zmq.Context()
@@ -334,6 +340,14 @@ class Worker:
                              "worker_id": self.args.worker_id},
                             **self._status_hdr()))
         while True:
+            # 1s tick: emit the promised "periodic" status when no
+            # command arrived for HB_INTERVAL (long commands block the
+            # loop by construction — run_turn runs inline — so the
+            # scheduler excludes busy workers from the heartbeat check)
+            if not sock.poll(1000):
+                if time.time() - self._t_status >= self.HB_INTERVAL:
+                    self.report_status(sock)
+                continue
             _, hdr, payload = msg.recv(sock)
             self.cmd_seq += 1
             mtype = hdr.get("type")
@@ -451,6 +465,7 @@ class Worker:
         # no busy field: the scheduler owns the busy flag (set on
         # assign/fetch, cleared on result). A worker-reported busy would
         # be stale by the time it arrives and caused double-booking.
+        self._t_status = time.time()
         msg.send(sock, dict({"type": "status"}, **self._status_hdr(),
                             **(extra or {})))
 

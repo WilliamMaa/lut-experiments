@@ -45,9 +45,14 @@ def spawn_workers(pool, gpus_per_worker, scheduler_addr, args):
     return procs
 
 
-def watchdog(procs, stop):
-    """If any worker dies unexpectedly, kill the whole experiment."""
-    while not stop.is_set():
+def watchdog(procs, stop, teardown):
+    """If any worker dies unexpectedly, kill the whole experiment.
+    Death is an EVENT (poll, 2s) — but a worker that exited because the
+    scheduler already began teardown (it sends shutdown before run()
+    returns, then computes + writes the summary) must NOT abort the
+    cell: the teardown event closes that race (7d L1, rc=2 false
+    aborts 2026-09-27)."""
+    while not (stop.is_set() or teardown.is_set()):
         for i, p in enumerate(procs):
             if p.poll() is not None:
                 print(f"[launcher] worker pid={p.pid} exited rc={p.returncode} "
@@ -102,7 +107,9 @@ def main():
 
     procs = spawn_workers(pool, args.gpus_per_worker, scheduler_addr, args)
     stop = threading.Event()
-    wd = threading.Thread(target=watchdog, args=(procs, stop), daemon=True)
+    teardown = threading.Event()
+    wd = threading.Thread(target=watchdog, args=(procs, stop, teardown),
+                          daemon=True)
     wd.start()
 
     def kill_all(*_):
@@ -119,7 +126,8 @@ def main():
     signal.signal(signal.SIGTERM, kill_all)
 
     try:
-        out = sched_mod.Scheduler(args, worker_ids).run()
+        out = sched_mod.Scheduler(args, worker_ids,
+                                  on_teardown=teardown.set).run()
     finally:
         stop.set()
         for p in procs:

@@ -37,7 +37,14 @@ from icn_proto import msg
 from icn_proto.blkchain import GENESIS, BlockName, chain_through, derive_chain
 from icn_proto.trace import open_tracer
 
-STALL_S = 300.0   # watchdog hard-fail: max seconds a worker may stall
+STALL_S = 60.0    # watchdog backstop: max seconds a BUSY worker may
+                    # run one turn before we treat it as wedged. NOT a
+                    # death detector — death is an event (launcher poll,
+                    # 7d L1) and idle/holder wedges are caught by the
+                    # heartbeat grey in ~8s (7d L2); this flat bound only
+                    # covers a worker wedged inside a long assign (7d L3)
+HB_GREY_S = 8.0   # heartbeat silence before a non-busy worker is greyed
+                    # (worker heartbeats every 2s while command-idle)
 
 TRACE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                      "data", "multi_turn_prompts_v3.jsonl")
@@ -154,6 +161,14 @@ class WorkerState:
     # crossings and was replaced by this causal seq).
     cmd_sent: int = 0
     # commands sent to this worker; the seq the next _send will carry
+    grey: bool = False
+    # excluded from service (7d L2): heartbeat-silent or wedged past
+    # every bound. choose()/controller skip grey workers; in-flight
+    # work was degraded or failed at grey time. Cell-scoped: once grey,
+    # never un-greyed (a recovered worker's state is not trustworthy).
+    t_status: float = 0.0
+    # last time ANY message from this worker arrived (hello/status/
+    # result/fetched/delivered all count — an ack is liveness proof)
 
 
 class Scheduler:
@@ -162,7 +177,8 @@ class Scheduler:
     PREFILL_RATE0 = 2_500.0
     XFER_RATE0 = 100e6
 
-    def __init__(self, args, worker_ids):
+    def __init__(self, args, worker_ids, on_teardown=None):
+        self._on_teardown = on_teardown
         self.args = args
         self.workers = {wid.encode(): WorkerState(ident=wid.encode())
                         for wid in worker_ids}
@@ -465,7 +481,8 @@ class Scheduler:
         pol = self.args.policy
         if pol == "p2":            # legacy alias
             pol = "ours"
-        idle = [w for w in self.workers.values() if not w.busy]
+        idle = [w for w in self.workers.values()
+                if not w.busy and not w.grey]
         # B2 planned affinity (CacheRoute-style): if a worker holding this
         # chain locally is busy but nearly done, and no idle worker is
         # warm, HOLD the turn — it stays in self.ready and is retried on
@@ -474,14 +491,17 @@ class Scheduler:
         if pol == "b2" and not any(
                 self.match_local(turn, w, tip_bound) > 0 for w in idle):
             warm_busy = [w for w in self.workers.values()
-                         if w.busy
+                         if w.busy and not w.grey
                          and self.eta(w) < self.args.wait_threshold
                          and self.match_local(turn, w, tip_bound) > 0]
             if warm_busy:
                 return None
         if not idle:
             return None
-        tips_global = set().union(*(w.tips for w in self.workers.values()))
+        tips_global = set()
+        for x in self.workers.values():
+            if not x.grey:
+                tips_global |= x.tips
         best = None
         costs = {}
         for w in idle:
@@ -520,7 +540,7 @@ class Scheduler:
                         e_max = t_pos
                         break
                     holders = [x for x in self.workers.values()
-                               if x is not w and all(
+                               if x is not w and not x.grey and all(
                                    n in x.resident or n in x.spilled
                                    for n in need)]
                     if holders:
@@ -837,6 +857,8 @@ class Scheduler:
                 rej["unknown_block"] += 1
                 continue          # cannot price an unknown block
             for w in self.workers.values():
+                if w.grey:
+                    continue
                 if len(self._repl) + len(actions) \
                         >= self.args.max_repl_inflight:
                     return actions
@@ -853,8 +875,9 @@ class Scheduler:
                     rej["inflight"] += 1
                     continue      # demand fetch already delivering it
                 holders = [x for x in self.workers.values()
-                           if all(n in x.resident or n in x.spilled
-                                  for n in missing)]
+                           if not x.grey and all(
+                                   n in x.resident or n in x.spilled
+                                   for n in missing)]
                 if not holders:
                     rej["no_holder"] += 1
                     continue
@@ -953,6 +976,7 @@ class Scheduler:
                 hellos.add(hdr["worker_id"])
                 w = self.workers.get(ident)
                 if w is not None:
+                    w.t_status = time.time()
                     w.resident = set(hdr.get("resident", []))
                     w.tips = set(hdr.get("tips", []))
                     w.spilled = set(hdr.get("spilled", []))
@@ -999,6 +1023,17 @@ class Scheduler:
                         print(f"[watchdog] repl {rid} stuck in stage "
                               f"{x['stage']} for {int(now - x['t'])}s",
                               flush=True)
+                for w in self.workers.values():
+                    if (not w.grey and not w.busy and w.t_status
+                            and now - w.t_status > HB_GREY_S):
+                        self._grey(sock, w, now,
+                                   f"heartbeat silent "
+                                   f"{int(now - w.t_status)}s")
+                if self.ready and all(w.grey for w in
+                                      self.workers.values()):
+                    raise RuntimeError(
+                        "all workers grey with turns ready — nothing "
+                        "left to serve (loud fail, not a silent hang)")
                 self._watchdog_fail(sock, now)
                 if sock not in evts:
                     continue
@@ -1006,6 +1041,8 @@ class Scheduler:
                 self.on_message(sock, ident, hdr, payload)
                 self.controller(sock)
         finally:
+            if self._on_teardown is not None:
+                self._on_teardown()
             for w in self.workers.values():
                 msg.send(sock, {"type": "shutdown"}, ident=w.ident)
             time.sleep(0.5)
@@ -1013,45 +1050,71 @@ class Scheduler:
             ctx.term()
         return self.summary()
 
-    def _watchdog_fail(self, sock, now):
-        """Last-resort liveness (the 120/180s loops above only print).
-        After STALL_S seconds a wedged worker or a lost ack is FAILED:
-        the turn records ok=False, the session advances, and the cell
-        finishes with failed>0 — the matrix marks it BAD and moves on
-        instead of hanging until the cell timeout. Late results for an
-        already-failed turn are discarded by the wd_failed guard."""
-        for w in self.workers.values():
-            if not w.busy or now - w.t_assign <= STALL_S:
-                continue
-            rid = w.current
-            if rid is None:
-                # busy in a demand fetch/deliver (no turn assigned yet):
-                # degrade to the pre-fetch local boundary, exactly like
-                # a fetch-failed ack does
-                for xrid, x in list(self._xfer.items()):
-                    if x["target"] == w.ident:
-                        print(f"[watchdog] xfer {xrid} stalled, degrade "
-                              f"to E_loc={x['E_loc']}", flush=True)
-                        self.degrade_rederiv_tokens += max(
-                            0, len(x["turn"].prefix_ids) - x["E_loc"])
-                        self._xfer.pop(xrid, None)
-                        self.send_assign(sock, x["target"], x["turn"],
-                                         x["E_loc"])
-                continue
+    def _grey(self, sock, w, now, why):
+        """Exclude a worker from service (7d L2). In-flight work is
+        degraded exactly like the fetch/watchdog paths — but never
+        re-dispatched to the grey worker itself."""
+        if w.grey:
+            return
+        w.grey = True
+        print(f"[watchdog] {w.ident.decode()} GREY ({why}): excluding "
+              f"from service", flush=True)
+        self.trace.emit("worker_grey", w.ident.decode(), why=why)
+        rid = w.current
+        if w.busy and rid is not None:
+            # a live turn on this worker is wedged beyond repair: fail
+            # it like the old stall watchdog did
             print(f"[watchdog] turn {rid} stuck on {w.ident.decode()} "
-                  f"for {int(now - w.t_assign)}s — failing", flush=True)
-            w.busy = False
-            w.current = None
-            w.cur_plan = None
+                  f"— failing (grey)", flush=True)
             rec = next((r for r in reversed(self.records)
                         if r["request_id"] == rid), None)
             if rec and "ok" not in rec:
                 rec.update({"ok": False,
-                            "error": "watchdog: worker stall",
+                            "error": "watchdog: worker grey",
                             "prefill_s": None, "published": []})
                 rec["latency_s"] = round(now - rec.pop("t_assigned"), 4)
                 rec["wd_failed"] = True
                 self.advance(rid)
+        w.busy = False
+        w.current = None
+        w.cur_plan = None
+        # demand fetches: holder grey → the blocks are unreachable;
+        # target grey → the turn cannot run there. Either way degrade
+        # to the pre-fetch local boundary and RE-QUEUE for a fresh
+        # choose() — never send_assign back to the grey worker (the
+        # old watchdog did, re-wedging the turn on the same worker)
+        for xrid, x in list(self._xfer.items()):
+            if x["holder"] == w.ident or x["target"] == w.ident:
+                turn = x["turn"]
+                print(f"[xfer ] {xrid} degraded to E_loc={x['E_loc']} "
+                      f"(grey {w.ident.decode()})", flush=True)
+                self.degrade_rederiv_tokens += max(
+                    0, len(turn.prefix_ids) - x["E_loc"])
+                self._xfer.pop(xrid, None)
+                rec = next((r for r in reversed(self.records)
+                            if r["request_id"] == xrid and "ok" not in r),
+                           None)
+                if rec is not None:
+                    self.records.remove(rec)
+                turn.t_ready = time.time()
+                self.ready.append(turn)
+        # replications are best-effort: a grey endpoint aborts the copy
+        for rid2, x in list(self._repl.items()):
+            if x["holder"] == w.ident or x["target"] == w.ident:
+                print(f"[ctl  ] {rid2} replication aborted (grey "
+                      f"{w.ident.decode()})", flush=True)
+                self._repl.pop(rid2, None)
+
+    def _watchdog_fail(self, sock, now):
+        """Backstop liveness (7d L3): the heartbeat grey (~8s, 7d L2)
+        covers idle/holder wedges, so this flat bound only covers a
+        worker wedged INSIDE a long assign — run_turn runs inline, so a
+        busy worker cannot heartbeat until the turn returns."""
+        for w in self.workers.values():
+            if w.grey or not w.busy or now - w.t_assign <= STALL_S:
+                continue
+            self._grey(sock, w, now,
+                       f"stall {int(now - w.t_assign)}s > STALL_S")
         # replications are best-effort: a stuck copy just aborts
         for rid, x in list(self._repl.items()):
             if now - x["t"] > STALL_S:
@@ -1077,7 +1140,7 @@ class Scheduler:
                 need_ro = [n for n in rn if n not in w.resident]
                 if any(n in w.spilled for n in need_ro):
                     holders = [x for x in self.workers.values()
-                               if x is not w and all(
+                               if x is not w and not x.grey and all(
                                    n in x.resident or n in x.spilled
                                    for n in need_ro)]
                     if holders:
@@ -1189,6 +1252,7 @@ class Scheduler:
         w = self.workers.get(ident)
         if w is None:
             return
+        w.t_status = time.time()
         mtype = hdr.get("type")
         if mtype == "status":
             # NOTE: busy is NOT taken from status. The worker's status is
