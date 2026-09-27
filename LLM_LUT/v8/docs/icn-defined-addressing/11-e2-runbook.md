@@ -144,19 +144,20 @@ python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-3
   --manifest results/icn_proto/matrix_e2.json
 ```
 
-## 5b. 修复后重跑（清受影响的格）
+## 5b. 修复后重跑（清掉修复前的全部格子）
 
-背景见 `12-e2-diag.md` 事故二。步骤：
+背景见 `12-e2-diag.md` 事故二。修复前的格子全部作废重跑（逐格
+保留的旧格会把新旧数据混在一起，2026-09-27 已踩过）。步骤：
 
 1. 跑 §2 的 5 条测试命令，全过再继续；
-2. 清掉受影响的格（retries>0 或 JSON 不可读）：
+2. 清掉修复前（9-27 之前）的全部格子：
 
 ```bash
-python -m icn_proto.matrix_report --drop-stale
+python -m icn_proto.matrix_report --drop-before 20260927
 ```
 
-3. 重跑 §5 和 §5a 的命令（只补被清的格）。新格
-   `stale_resume_retries` 应为 0；不为 0 贴回来。
+3. 重跑 §5 的 4 条和 §5a 的 2 条（manifest 只补被清的格）。
+   新格 `stale_resume_retries` 应为 0；不为 0 贴回来。
 
 ## 6. 块生命周期追踪（机制观测）
 
