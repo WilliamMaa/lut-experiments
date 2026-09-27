@@ -18,7 +18,7 @@
 | 4 | Content Store / 分层驻留 | HBM→DRAM→… 驱逐≠消失 | HBM 稀缺，驱逐=销毁导致重算回潮 | ✅ 成立（E2，2026-09-27 判文） | sp-1：外部性全吸收（b3=ours，P1 三次复现）；sp96：tier 满→LRU 踢→真消失，回潮 2.9–4.4×（P3）；trace 踢块计数为直接计量 |
 | 5 | Replication（度数×位置） | 热 state 多副本，副本可落在不同 tier | 热点 state 单副本成为单点瓶颈/等待源 | 🔶 方向性成立 | HBM-only 已证伪（E1：虚空落点才是罪魁）；tier 有限时复制有保护价值的迹象（E2 P2：tier LRU 踢块高频 + evict 分担），缺"复制 vs 不复制"同预算严格对照 |
 | 6 | Nearest / best-copy retrieval | topology/load-aware  locator 选择 | 所有副本一视同仁，无视距离与拥塞 | ❌ 未做 | 单机 4-worker 扁平拓扑测不了；需多机或模拟拓扑代价 |
-| 7 | Interest aggregation（PIT） | 并发请求同一未就绪 state，合并只算/搬一次 | 高并发同前缀风暴下的重复劳动 | ❌ 未做 | **当前 testbed 可测**：open-loop Poisson + zipf 共享文档天然产生并发同前缀需求 |
+| 7 | Interest aggregation（PIT） | 并发请求同一未就绪 state，合并只算/搬一次 | 高并发同前缀风暴下的重复劳动 | 设计✅（15 号） | spec + 机会量脚本就绪（`icn_proto/pit_opportunity.py`），待 Step 0 量化后动工 |
 | 8 | Freshness / lifetime | model 版本 / adapter / cache salt 的 state validity | 错误 state 被复用 | ✅ 基础已有 | 块名含内容哈希，语义即 validity；不需要 ICN 原机制 |
 | 9 | NDN 包平面（FIB/PIT 路由转发） | —— | —— | ❌ 不需要 | 明确排除：只借抽象，不碰网络栈 |
 
@@ -46,11 +46,10 @@ locator 解析、驻留层级决策、复制放置、需求合并。不重复造
    的"落点决定链条"三角完整。**逐环过程证据，不看比分。**
    另有两件收尾不挡判文：`stale_resume_retries` 报告核验（11 §5b）、
    b3 sp96×s1.6 一格 wall=310s 查因（11 §7c）。
-2. **Interest aggregation（行 7）**：当前 testbed 内价值最高的未做
-   机制。scheduler 加 PIT 式 pending-object 表：一个 turn 正在
-   fetch/prefill 某前缀时，后续同前缀需求挂为等待者，就绪后一并
-   唤醒。观测量：重复劳动抑制次数。它解决的"并发同前缀风暴"是
-   高并发 serving 的真问题，且比 proactive replication 更 ICN 正统。
+2. **Interest aggregation（行 7）**：spec 见 **15 号**。先跑
+   Step 0 机会量脚本（15 号 §3，零新实验），量化后再实现 PIT。
+   它解决的"并发同前缀风暴"是高并发 serving 的真问题，且比
+   proactive replication 更 ICN 正统。
 3. **Nearest-copy（行 6）**：需要多机或拓扑代价模拟，排在 testbed
    升级之后；E3 的 fetch-cost ratio 是它的单维前哨。
 
