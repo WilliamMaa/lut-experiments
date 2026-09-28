@@ -257,9 +257,11 @@ class HeavyHitterCache(DynamicCache):
         # evicted token folds FORWARD (causally later queries look backward).
         tgt_slot = torch.searchsorted(kept, ev_pos, right=True).clamp(max=hh - 1).long()  # [B, E]
         tgt_kept = kept[batch_ar.unsqueeze(1), tgt_slot]                            # [B, E]
-        ev_orig = middle_orig[ev_pos].clamp(max=ph.shape[-1] - 1).long()            # [B, E]
-        tgt_orig = middle_orig[tgt_kept].clamp(max=ph.shape[-1] - 1).long()         # [B, E]
-        own_orig = middle_orig[kept].clamp(max=ph.shape[-1] - 1).long()             # [B, hh]
+        # NOTE: single-tensor advanced indexing (middle_orig[ev_pos]) would index
+        # dim 0, not pair-wise across batch — use gather for per-row lookup.
+        ev_orig = middle_orig.gather(1, ev_pos).clamp(max=ph.shape[-1] - 1).long()            # [B, E]
+        tgt_orig = middle_orig.gather(1, tgt_kept).clamp(max=ph.shape[-1] - 1).long()         # [B, E]
+        own_orig = middle_orig.gather(1, kept).clamp(max=ph.shape[-1] - 1).long()             # [B, hh]
 
         # All folding in fp32; result cast back to the cache dtype.
         p_ev = ph.gather(2, ev_orig.unsqueeze(1).expand(B, H, E)).float()      # [B, H, E]
