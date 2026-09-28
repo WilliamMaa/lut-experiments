@@ -262,6 +262,22 @@ class Scheduler:
         # resident/spilled view stale (STALE_RESUME) — must stay ~0;
         # every retry is a placement decision made on a stale view
         self.stale_resume_retries = 0
+        # Interest aggregation (15 §4): PIT — scheduler-side pending
+        # interest table. A (compute merge): a ready turn whose prefix
+        # fingerprint matches an in-flight serving turn parks as a
+        # waiter instead of recomputing the chain. B (fetch merge): a
+        # demand fetch whose exact block list is already on the wire to
+        # another target rides it as a waiter, one wire fetch serves
+        # many. Every path is gated on pit_enabled (--pit, default off
+        # keeps pre-PIT behaviour byte-identical, 15 §5 invariant 4).
+        self.pit_enabled = getattr(args, "pit", False)
+        self._pit = {}   # fp -> {"rid", "worker", "waiters": [turn,...],
+                         #        "t": serving-start time}
+        self.pit_compute_merged = 0
+        self.pit_fetch_merged = 0
+        self.pit_waiters_served = 0
+        self.pit_wait_s_total = 0.0
+        self.pit_recompute_tokens_saved = 0
         # lifecycle tracing (14): per-block event stream; no-op unless
         # the launcher set ICN_TRACE_DIR
         self.trace = open_tracer("sched")
@@ -1034,6 +1050,21 @@ class Scheduler:
                     raise RuntimeError(
                         "all workers grey with turns ready — nothing "
                         "left to serve (loud fail, not a silent hang)")
+                # PIT park cap (15 §4.3): a serving turn wedged WITHOUT
+                # tripping grey (e.g. its worker heartbeats via a
+                # different code path) must not hold waiters forever —
+                # force-wake the whole entry past STALL_S. No _pit_wait
+                # stamp: they were NOT served by the merge
+                for fp, entry in list(self._pit.items()):
+                    if now - entry["t"] > STALL_S:
+                        print(f"[pit  ] {entry['rid']} parked "
+                              f"{int(now - entry['t'])}s — waking "
+                              f"{len(entry['waiters'])} waiter(s)",
+                              flush=True)
+                        self._pit.pop(fp, None)
+                        for wt in entry["waiters"]:
+                            wt.t_ready = time.time()
+                            self.ready.append(wt)
                 self._watchdog_fail(sock, now)
                 if sock not in evts:
                     continue
@@ -1104,6 +1135,37 @@ class Scheduler:
                 print(f"[ctl  ] {rid2} replication aborted (grey "
                       f"{w.ident.decode()})", flush=True)
                 self._repl.pop(rid2, None)
+        # PIT compute-merge waiters (15 §4.3): the grey worker was
+        # serving their prefix — wake them for a fresh choose(). No
+        # _pit_wait stamp: they were NOT served by the merge
+        for fp, entry in list(self._pit.items()):
+            if entry["worker"] == w.ident:
+                self._pit.pop(fp, None)
+                for wt in entry["waiters"]:
+                    wt.t_ready = time.time()
+                    self.ready.append(wt)
+                print(f"[pit  ] {entry['rid']} greyed with "
+                      f"{len(entry['waiters'])} waiter(s) — re-queued",
+                      flush=True)
+        # PIT fetch-merge waiters (15 §4.3): an xfer the grey worker
+        # touches degrades as a whole; a waiter TARGETED at the grey
+        # worker drops off its (still live) xfer. Waiters were never
+        # assigned (no records) — free the merge-time busy flag and
+        # re-queue each for a fresh choose()
+        for x in self._xfer.values():
+            touched = x["holder"] == w.ident or x["target"] == w.ident
+            for wt in list(x.get("waiters") or []):
+                if touched or wt["target"] == w.ident:
+                    self.degrade_rederiv_tokens += max(
+                        0, len(wt["turn"].prefix_ids) - x["E_loc"])
+                    x["waiters"].remove(wt)
+                    ww = self.workers.get(wt["target"])
+                    if ww is not None and ww.current is None:
+                        # busy set at merge time, no turn ever assigned
+                        ww.busy = False
+                        ww.cur_plan = None
+                    wt["turn"].t_ready = time.time()
+                    self.ready.append(wt["turn"])
 
     def _watchdog_fail(self, sock, now):
         """Backstop liveness (7d L3): the heartbeat grey (~8s, 7d L2)
@@ -1124,6 +1186,24 @@ class Scheduler:
 
     def dispatch(self, sock):
         for turn in list(self.ready):
+            if self.pit_enabled:
+                # A (compute merge, 15 §4.2.1): an identical prefix is
+                # already being prefilled on a live worker — park this
+                # turn as a waiter instead of recomputing the chain
+                fp = turn.prefix_fingerprint("bf16",
+                                             self.args.block_tokens)
+                entry = self._pit.get(fp)
+                if entry is not None:
+                    sw = self.workers[entry["worker"]]
+                    if not sw.grey and sw.busy:
+                        entry["waiters"].append(turn)
+                        self.pit_compute_merged += 1
+                        self.pit_recompute_tokens_saved += \
+                            turn.cum_tokens
+                        self.trace.emit(
+                            "pit_wait", fp, rid=entry["rid"],
+                            waiter=f"{turn.session}:{turn.turn}")
+                        continue
             chosen = self.choose(turn)
             if chosen is None:
                 break
@@ -1147,6 +1227,30 @@ class Scheduler:
                         self.spill_fetch_avoided += 1
             if fetch is not None:
                 holder_ident, names = fetch
+                if self.pit_enabled:
+                    # B (fetch merge, 15 §4.2.2): the EXACT block list is
+                    # already on the wire to another target — ride that
+                    # fetch as a waiter instead of a second copy of the
+                    # same bytes
+                    hit = next(
+                        (x for x in self._xfer.values()
+                         if x["names"] == names and x["target"] != ident
+                         and x["stage"] in ("fetch", "deliver")), None)
+                    if hit is not None:
+                        hit.setdefault("waiters", []).append(
+                            {"target": ident, "turn": turn,
+                             "decision": decision})
+                        self.pit_fetch_merged += 1
+                        self.trace.emit(
+                            "pit_fetch_merge", names[-1], rid=rid,
+                            target=ident.decode())
+                        print(f"[xfer ] {rid} merged into in-flight "
+                              f"fetch of {len(names)} blocks -> "
+                              f"{ident.decode()}", flush=True)
+                        w.busy = True
+                        w.t_assign = time.time()
+                        self.ready.remove(turn)
+                        continue
                 self._xfer[rid] = {"stage": "fetch", "target": ident,
                                    "holder": holder_ident,
                                    "names": names, "E_loc": decision["E_loc"],
@@ -1178,6 +1282,13 @@ class Scheduler:
         decode_steps = (0 if turn.turn == -1 else self.args.decode_steps)
         w.cur_plan = {"prefill_tokens": len(turn.prefix_ids) - e_resume,
                       "decode_steps": decode_steps}
+        if self.pit_enabled:
+            # PIT registration (15 §4.2.1): this prefix is now being
+            # computed on this worker — a later identical turn parks as
+            # a waiter instead of a duplicate prefill
+            fp = turn.prefix_fingerprint("bf16", self.args.block_tokens)
+            self._pit[fp] = {"rid": rid, "worker": ident, "waiters": [],
+                             "t": time.time()}
         self._xfer.pop(rid, None)
         resume_names = self.resume_names(turn, e_resume)
         new_names = turn.publish_names("bf16", self.args.block_tokens)
@@ -1367,6 +1478,35 @@ class Scheduler:
                                                   self.args.block_tokens)[-1]
                     w.tips.add(tip)
                     self.tips.add(tip)
+                if self.pit_enabled:
+                    # a turn that was served via compute merge finished
+                    # ok — count it and close its park-to-done window
+                    turn_done = self.turns_of[session][chain_idx]
+                    pw = getattr(turn_done, "_pit_wait", None)
+                    if pw is not None:
+                        self.pit_waiters_served += 1
+                        self.pit_wait_s_total += time.time() - pw[0]
+                        turn_done._pit_wait = None
+            if self.pit_enabled:
+                # wake the fp's waiters (15 §4.2.3) — on ok AND on
+                # failure: a failed serving turn may still have published
+                # nothing, but a normal choose() re-dispatch is safe
+                # either way. Never reached on STALE_RESUME (early
+                # return above) — the 60s park cap covers that.
+                session, t = rid.split(":")
+                chain_idx = 0 if t == "-1" else int(t) + 1
+                turn_done = self.turns_of[session][chain_idx]
+                fp = turn_done.prefix_fingerprint(
+                    "bf16", self.args.block_tokens)
+                entry = self._pit.pop(fp, None)
+                if entry is not None:
+                    for wt in entry["waiters"]:
+                        wt._pit_wait = (entry["t"], entry["rid"])
+                        wt.t_ready = time.time()
+                        self.ready.append(wt)
+                        self.trace.emit(
+                            "pit_wake", fp,
+                            rid=f"{wt.session}:{wt.turn}")
             self.advance(rid)
             return
         if mtype == "fetched":
@@ -1425,6 +1565,18 @@ class Scheduler:
                     0, len(turn.prefix_ids) - xfer["E_loc"])
                 self._xfer.pop(rid, None)
                 self.send_assign(sock, xfer["target"], turn, xfer["E_loc"])
+                # PIT waiters parked on this failed fetch degrade with
+                # the main turn (15 §4.3): never assigned, so no record
+                # to drop — free the merge-time busy flag and re-queue
+                for wt in xfer.get("waiters") or []:
+                    self.degrade_rederiv_tokens += max(
+                        0, len(wt["turn"].prefix_ids) - xfer["E_loc"])
+                    ww = self.workers.get(wt["target"])
+                    if ww is not None:
+                        ww.busy = False
+                        ww.cur_plan = None
+                    wt["turn"].t_ready = time.time()
+                    self.ready.append(wt["turn"])
             return
         if mtype == "delivered":
             names = hdr.get("names") or []
@@ -1469,6 +1621,7 @@ class Scheduler:
                  and x["target"] == ident and x["names"] == names),
                 (None, None))
             if xfer:
+                waiters = xfer.get("waiters") or []
                 self._xfer.pop(rid, None)
                 self.transfer_bytes += xfer["bytes"]
                 self.transfers += 1
@@ -1482,6 +1635,18 @@ class Scheduler:
                         0, len(xfer["turn"].prefix_ids) - xfer["E_loc"])
                     self.send_assign(sock, xfer["target"], xfer["turn"],
                                      xfer["E_loc"])
+                    # PIT waiters parked on this dead fetch were never
+                    # assigned (no records): free their workers and
+                    # re-queue like the main turn (15 §4.3)
+                    for wt in waiters:
+                        self.degrade_rederiv_tokens += max(
+                            0, len(wt["turn"].prefix_ids) - xfer["E_loc"])
+                        ww = self.workers.get(wt["target"])
+                        if ww is not None:
+                            ww.busy = False
+                            ww.cur_plan = None
+                        wt["turn"].t_ready = time.time()
+                        self.ready.append(wt["turn"])
                     return
                 # the worker stored these blocks the moment deliver
                 # landed — reflect it NOW instead of waiting for the
@@ -1509,6 +1674,35 @@ class Scheduler:
                                  xfer_bytes=xfer.get("bytes", 0),
                                  xfer_s=xfer_s,
                                  decision=xfer.get("decision"))
+                # PIT fetch merge (15 §4.2.4): multicast the SAME payload
+                # to every waiter target. transfers/transfer_bytes count
+                # WIRE fetches only — these extra delivers reuse the
+                # already-fetched bytes and must NOT be counted again
+                # (15 §4.4 accounting rule)
+                for wt in waiters:
+                    self._send(sock, {"type": "deliver"}, wt["target"],
+                               payload=payload)
+                    ww = self.workers[wt["target"]]
+                    ww.resident |= set(xfer["names"])
+                    for n in xfer["names"]:
+                        ww.evict_t.pop(n, None)
+                        self.trace.emit("delivered", n, via="fetch",
+                                        target=ww.ident.decode(),
+                                        merged=True)
+                    if tip in self.tips:
+                        ww.tips.add(tip)
+                    wt["turn"]._pit_wait = (xfer["t_fetch"], rid)
+                    self.send_assign(sock, wt["target"], wt["turn"], e,
+                                     xfer_names=xfer["names"],
+                                     xfer_bytes=xfer.get("bytes", 0),
+                                     xfer_s=xfer_s,
+                                     decision=wt["decision"])
+                    self.trace.emit(
+                        "pit_wake", xfer["names"][-1],
+                        rid=f"{wt['turn'].session}:{wt['turn'].turn}")
+                    print(f"[xfer ] {wt['turn'].session}:"
+                          f"{wt['turn'].turn} served by merged fetch -> "
+                          f"{wt['target'].decode()}", flush=True)
             return
 
     def _pair_fetch(self, holder, names):
@@ -1676,6 +1870,12 @@ class Scheduler:
                 self.repl_served_local,
             "rederivation_tokens": rederiv,
             "degrade_rederiv_tokens": self.degrade_rederiv_tokens,
+            "pit_compute_merged": self.pit_compute_merged,
+            "pit_fetch_merged": self.pit_fetch_merged,
+            "pit_waiters_served": self.pit_waiters_served,
+            "pit_wait_s": round(self.pit_wait_s_total
+                                / max(1, self.pit_waiters_served), 4),
+            "pit_recompute_tokens_saved": self.pit_recompute_tokens_saved,
             "repl_reject": dict(self._repl_reject),
             "c_recompute": c_recompute,
             "state_lifetime": state_lifetime,
@@ -1719,7 +1919,10 @@ class Scheduler:
                   "session_turn_migration_rate",
                   "remote_resume_opportunities",
                   "remote_resume_served_local_due_to_replication",
-                  "rederivation_tokens", "degrade_rederiv_tokens"):
+                  "rederivation_tokens", "degrade_rederiv_tokens",
+                  "pit_compute_merged", "pit_fetch_merged",
+                  "pit_waiters_served", "pit_wait_s",
+                  "pit_recompute_tokens_saved"):
             print(f"  {k}: {out[k]}")
         for wid, ws in workers.items():
             print(f"  worker {wid}: {ws}")
@@ -1811,6 +2014,12 @@ def add_args(ap):
                     help="poisson: mean user think time between turns (s)")
     ap.add_argument("--seed", type=int, default=0,
                     help="workload RNG seed (arrival times + zipf draws)")
+    ap.add_argument("--pit", action="store_true",
+                    help="Interest aggregation (15 §4): PIT compute merge "
+                         "(same-fp turns park behind the serving turn) + "
+                         "fetch merge (identical in-flight block lists "
+                         "multicast-delivered). Default off keeps old cells "
+                         "comparable.")
     ap.add_argument("--out", default=os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
         "results", "icn_proto"))

@@ -39,7 +39,17 @@ v2）。
 
 ```bash
 cd ~/lut-experiments/LLM_LUT/v8
+# E2 格（open-loop）：2026-09-28 实测 A_pairs 2-4/格、B_pairs≈0 ——
+# poisson 到达 + think time 把同前缀 session 错开，风暴前提不满足
 python -m icn_proto.pit_opportunity results/icn_proto/matrix_e2.json
+# 闭链强前提（16 session 同时起步、share=2、8 对完全相同前缀链）：
+# 一格新 cell 同时是 ①活性修法 smoke（rc 必须 0）②行 7 闭链机会量
+# ③将来 PIT A/B 的 pit=off 基线。不要用任何老 manifest。
+python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --gpu-pool 0,1,2,3,4,5,6,7 --sessions 16 --turns-per-session 3 --q-tokens 40 \
+  --shares 2 --policies b3 --reps 1 --cell-timeout 1800 \
+  --manifest results/icn_proto/matrix_pit_smoke.json
+python -m icn_proto.pit_opportunity results/icn_proto/matrix_pit_smoke.json
 ```
 
 脚本（本目录仓库 `icn_proto/pit_opportunity.py`）输出每格：
@@ -133,3 +143,22 @@ multicast 不产生新 wire 传输；deliver 是本地消息），这点必须�
 5. 回归：runbook §2 五条单测 + `--pit off` 与旧格逐指标一致
    （同 seed 重跑一格 diff JSON，除时间戳外应完全相同）。
 6. 实验矩阵 + 判文写入 13/14 号。
+
+**验证（2026-09-28 实现后，按顺序）**：
+
+```bash
+# 1. runbook §2 五条单测，全 ALL PASS
+# 2. pit=on 对照格：与 matrix_pit_smoke 完全同配置仅加 --pit，
+#    新 manifest（闭链一格 ~35s）
+cd ~/lut-experiments/LLM_LUT/v8
+python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --gpu-pool 0,1,2,3,4,5,6,7 --sessions 16 --turns-per-session 3 --q-tokens 40 \
+  --shares 2 --policies b3 --reps 1 --cell-timeout 1800 --pit \
+  --manifest results/icn_proto/matrix_pit_on.json
+```
+
+判读（判文锚点 = smoke 格机会量 A_pairs=4）：pit=on 格
+`pit_compute_merged > 0` 且 `pit_recompute_tokens_saved ≈ 6082`
+→ A 类机制成立；`failed=0` 且 hit/new_tok 不比基线崩 → 没破坏
+正常路径；二者全满足 → 按 §6 铺 {b3, ours} × {off, on} 小矩阵
+补齐 regime 边界。计数器全 0 → 实现有洞，回炉。

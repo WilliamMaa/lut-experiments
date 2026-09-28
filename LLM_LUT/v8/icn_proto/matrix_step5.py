@@ -109,6 +109,11 @@ def run_cell(args, share, pol, rep, port):
                 os.path.join(args.trace_dir, cell)]
     if getattr(args, "spill_mb", 0.0) != 0:
         cmd += ["--spill-mb", str(args.spill_mb)]
+    if getattr(args, "pit", False):
+        # 15 §6: pit is a MECHANISM switch, not workload shape — it
+        # stays out of wl_signature; pit=on cells live in their own
+        # manifest, isolated from legacy matrices by construction
+        cmd += ["--pit"]
     if args.arrival == "poisson":
         cmd += ["--arrival", "poisson",
                 "--arrival-rate", str(args.arrival_rate),
@@ -249,6 +254,11 @@ def main():
     ap.add_argument("--trace-dir", default=None,
                     help="enable block-lifecycle tracing; each cell gets a "
                          "sub-dir (cell_<wl>_s<share>_<pol>_r<rep>)")
+    ap.add_argument("--pit", action="store_true",
+                    help="Interest aggregation (15 §4): pass --pit through "
+                         "to run_cluster. Mechanism switch, NOT workload "
+                         "shape: wl_signature is unchanged, so use a "
+                         "separate manifest for pit=on cells")
     ap.add_argument("--arrival", choices=["none", "poisson"], default="none")
     ap.add_argument("--arrival-rate", type=float, default=1.0)
     ap.add_argument("--zipf-n", type=int, default=16)
