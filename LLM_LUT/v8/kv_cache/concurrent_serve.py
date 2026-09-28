@@ -184,36 +184,37 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
             if oi is not None:
                 break
         budget = patch.max_cache_len
-        if oi is None:
-            # _hh_orig_idx is only written by the first EVICTING update, so it
-            # does not exist before the first decode step (the single-stream
-            # probe reads it only after generation — same reason it never
-            # surfaced there).
-            if input_ids.shape[1] + 1 <= budget:
-                # Tiny prefill, no eviction will happen: prefill mask + new token.
-                return torch.cat(
-                    [attn_mask, torch.ones(B, 1, dtype=torch.long, device=device)], dim=1,
-                )
-            # First decode step with an over-budget prefill: eviction happens
-            # inside this update. Post-update layout is sink|hh|recent; only
-            # the sink region can hold left-pad slots (zero-mass pads are
-            # never selected into hh at real context lengths; the
-            # B=1-vs-batched selftest guards this corner).
-            ar = torch.arange(budget, device=device).unsqueeze(0).expand(B, budget)
-            m = (ar >= pad_t).long()
-            m[:, patch.sink_tokens:] = 1
-            return m
-        oi = oi.to(device)  # layers may sit on other GPUs under device_map
-        if oi.shape[1] + 1 <= budget:
-            # No eviction this step: content validity + the new token (valid).
+        if oi is not None:
+            oi = oi.to(device)  # layers may sit on other GPUs under device_map
+        if oi is None and input_ids.shape[1] + 1 <= budget:
+            # Tiny prefill, no eviction at this step: prefill mask + new token.
+            return torch.cat(
+                [attn_mask, torch.ones(B, 1, dtype=torch.long, device=device)], dim=1,
+            )
+        if oi is not None and oi.shape[1] < budget:
+            # Content fits after appending: content validity + the new token.
             return torch.cat(
                 [(oi >= pad_t).long(), torch.ones(B, 1, dtype=torch.long, device=device)],
                 dim=1,
             )
-        # Steady state: eviction trims back to exactly the current length,
-        # so pre-update slot validity is exact for the post-update slots
-        # (only the recent-window tail shifts, and those slots are valid).
-        return (oi >= pad_t).long()
+        if oi is not None and oi.shape[1] == budget:
+            # Steady state: eviction trims back to exactly the current length,
+            # so pre-update slot validity is exact for the post-update slots
+            # (only the recent-window tail shifts, and those slots are valid).
+            return (oi >= pad_t).long()
+        # Remaining cases: (a) oi is None with an over-budget prefill, or
+        # (b) oi longer than budget (uncompressed content) — both mean the
+        # FIRST decode step, with eviction happening inside this update.
+        # _hh_orig_idx may not exist yet (it is written by the evicting
+        # update itself; the single-stream probe only reads it after
+        # generation, which is why batch=1 never surfaced this). Post-update
+        # layout is sink|hh|recent; only the sink region can hold left-pad
+        # slots (zero-mass pads are never selected into hh at real context
+        # lengths; the B=1-vs-batched selftest guards this corner).
+        ar = torch.arange(budget, device=device).unsqueeze(0).expand(B, budget)
+        m = (ar >= pad_t).long()
+        m[:, patch.sink_tokens:] = 1
+        return m
 
     for step in range(max_new_tokens - 1):
         if bool(finished.all()):
