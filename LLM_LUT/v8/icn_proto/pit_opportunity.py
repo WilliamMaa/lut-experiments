@@ -91,7 +91,12 @@ def cell_opportunity(path):
                 if r1.get("worker") != r2.get("worker"):
                     b_pairs += 1
     return {"turns": len(recs), "a_compute_pairs": a_pairs,
-            "a_recompute_tokens": a_tok, "b_fetch_pairs": b_pairs}
+            "a_recompute_tokens": a_tok, "b_fetch_pairs": b_pairs,
+            **{k: d.get(k) for k in REALIZED}, "failed": d.get("failed")}
+
+
+REALIZED = ("pit_compute_merged", "pit_fetch_merged",
+            "pit_recompute_tokens_saved", "pit_waiters_served")
 
 
 def main():
@@ -120,6 +125,26 @@ def main():
     print("\nA_pairs = 同前缀并发重算对数（PIT 可抑制的重复计算）")
     print("A_re_tok = 被抑制的话可省的 prefill tokens（ waiter 侧）")
     print("B_pairs = 同块集并发 fetch 对数（PIT 可合并的重复搬运）")
+    # realized counters: opportunity (above) is measured on pit=off
+    # cells; a pit=on cell removes the overlap from the timing, so its
+    # opportunity reads ~0 by construction — the mechanism's payoff
+    # lives in the summary counters, printed here for the §6 判文
+    # side-by-side (opportunity vs realized)
+    print(f"\n{'REALIZED (pit=on cells)':<72}")
+    print(f"{'cell':<72} {'failed':>6} {'m_comp':>7} {'m_fetch':>8} "
+          f"{'saved_tok':>10} {'served':>7}")
+    for c in cells:
+        try:
+            o = cell_opportunity(c)
+        except (OSError, json.JSONDecodeError):
+            continue
+        if all(o.get(k) in (None, 0) for k in REALIZED):
+            continue
+        print(f"{os.path.basename(c):<72} {o['failed'] or 0:>6} "
+              f"{o['pit_compute_merged'] or 0:>7} "
+              f"{o['pit_fetch_merged'] or 0:>8} "
+              f"{o['pit_recompute_tokens_saved'] or 0:>10} "
+              f"{o['pit_waiters_served'] or 0:>7}")
 
 
 if __name__ == "__main__":
