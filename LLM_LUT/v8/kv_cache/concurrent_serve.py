@@ -183,30 +183,37 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
             oi = getattr(layer, "_hh_orig_idx", None)
             if oi is not None:
                 break
-        if oi is None:
-            raise RuntimeError(
-                "[serve] no _hh_orig_idx on any cache layer after prefill; "
-                "the cache object returned by the model does not look like a "
-                "HeavyHitterCache — check past_key_values threading."
-            )
-        oi = oi.to(device)  # layers may sit on other GPUs under device_map
         budget = patch.max_cache_len
+        if oi is None:
+            # _hh_orig_idx is only written by the first EVICTING update, so it
+            # does not exist before the first decode step (the single-stream
+            # probe reads it only after generation — same reason it never
+            # surfaced there).
+            if input_ids.shape[1] + 1 <= budget:
+                # Tiny prefill, no eviction will happen: prefill mask + new token.
+                return torch.cat(
+                    [attn_mask, torch.ones(B, 1, dtype=torch.long, device=device)], dim=1,
+                )
+            # First decode step with an over-budget prefill: eviction happens
+            # inside this update. Post-update layout is sink|hh|recent; only
+            # the sink region can hold left-pad slots (zero-mass pads are
+            # never selected into hh at real context lengths; the
+            # B=1-vs-batched selftest guards this corner).
+            ar = torch.arange(budget, device=device).unsqueeze(0).expand(B, budget)
+            m = (ar >= pad_t).long()
+            m[:, patch.sink_tokens:] = 1
+            return m
+        oi = oi.to(device)  # layers may sit on other GPUs under device_map
         if oi.shape[1] + 1 <= budget:
             # No eviction this step: content validity + the new token (valid).
             return torch.cat(
                 [(oi >= pad_t).long(), torch.ones(B, 1, dtype=torch.long, device=device)],
                 dim=1,
             )
-        if oi.shape[1] <= budget:
-            # Steady state: eviction trims back to exactly the current length,
-            # so pre-update slot validity is exact for the post-update slots
-            # (only the recent-window tail shifts, and those slots are valid).
-            return (oi >= pad_t).long()
-        # First decode step after an over-budget prefill.
-        ar = torch.arange(budget, device=device).unsqueeze(0).expand(B, budget)
-        m = (ar >= pad_t).long()
-        m[:, patch.sink_tokens:] = 1
-        return m
+        # Steady state: eviction trims back to exactly the current length,
+        # so pre-update slot validity is exact for the post-update slots
+        # (only the recent-window tail shifts, and those slots are valid).
+        return (oi >= pad_t).long()
 
     for step in range(max_new_tokens - 1):
         if bool(finished.all()):
