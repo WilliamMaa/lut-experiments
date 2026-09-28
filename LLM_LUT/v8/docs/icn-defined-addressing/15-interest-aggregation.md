@@ -151,6 +151,14 @@ multicast 不产生新 wire 传输；deliver 是本地消息），这点必须�
 # 2. pit=on 对照格：与 matrix_pit_smoke 完全同配置仅加 --pit，
 #    新 manifest（闭链一格 ~35s）
 cd ~/lut-experiments/LLM_LUT/v8
+
+python -m icn_proto.run_cluster --policy ours --sessions 8 \
+  --turns-per-session 40 --q-tokens 40 --doc-chars 4000 \
+  --doc-repeat 2 --doc-repeat-alt 2 --port 5671 --gpu-pool 0,1,2,3 \
+  --gpus-per-worker 2 --model-path /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --arrival poisson --arrival-rate 2.0 --zipf-n 16 --zipf-s 1.0 \
+  --think-s 2.0 --worker-mem-budget-mb 48 --spill-mb -1 --seed 0 --pit
+
 python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-35B-A3B \
   --gpu-pool 0,1,2,3,4,5,6,7 --sessions 16 --turns-per-session 3 --q-tokens 40 \
   --shares 2 --policies b3 --reps 1 --cell-timeout 1800 --pit \
