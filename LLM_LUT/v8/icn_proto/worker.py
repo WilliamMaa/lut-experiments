@@ -378,7 +378,20 @@ class Worker:
                                     "names": names}, payload=buf.getvalue())
                 continue
             if mtype == "deliver":
-                objs = torch.load(io.BytesIO(payload), weights_only=False)
+                if not payload:
+                    # an empty deliver must NEVER kill the worker process:
+                    # the pending assign's run_turn raises STALE_RESUME
+                    # on the missing resume blocks and the scheduler
+                    # re-queues the turn. The crash loop (rc=1 →
+                    # launcher abort → cell looks hung under matrix's
+                    # captured stdout) was the pit closed-loop
+                    # 2026-09-28 "hang".
+                    msg.send(sock, {"type": "delivered", "ok": False,
+                                    "names": hdr.get("names") or [],
+                                    "error": "empty deliver payload"})
+                    continue
+                objs = torch.load(io.BytesIO(payload),
+                                  weights_only=False)
                 for obj in objs:
                     self.resident[str(obj.name)] = obj
                     self.trace.emit("resident_add", str(obj.name),

@@ -42,6 +42,29 @@ class FakeSock:
         self.sent.append(list(frames))
 
 
+class Mirror:
+    """Faithful stand-in for worker.py's wire protocol: counts every
+    processed command (cmd_seq, echoed in each status) and answers
+    result/deliver/evict with the FULL status snapshot worker.py sends
+    (worker.py:396,416,440). The original FakeSock never sent these —
+    the one structural difference from a real cluster, and the first
+    suspect for the closed-loop hang: the status handler REPLACES
+    w.resident/w.tips wholesale (scheduler.py:1389-1390), which can
+    clobber scheduler-side optimistic state the test never exercised."""
+
+    def __init__(self, w):
+        self.w = w
+        self.cmd_seq = 0
+
+    def status(self):
+        return {"type": "status", "seq": self.cmd_seq,
+                "resident": list(self.w.resident),
+                "tips": [n for n in self.w.tips
+                         if n in self.w.resident],
+                "resident_bytes": 0, "spilled": [], "spill_bytes": 0,
+                "spill": {}}
+
+
 def make_sched(n_workers=4, pit=True):
     kw = dict(ARGS, pit=pit)
     return Scheduler(Namespace(**kw), [f"w{i}" for i in range(n_workers)])
@@ -75,6 +98,8 @@ def drive(s, sock, max_iters=5000, busy_ticks=3):
     after receiving it — real compute time, so concurrency windows
     (parks, fetch merges) actually open. Without it every turn
     completes instantly and no two identical prefixes ever overlap."""
+    mirrors = {ident: Mirror(w) for ident, w in s.workers.items()}
+    truly_busy = set()          # idents with an un-answered assign
     inflight = []   # (remaining_ticks, ident, hdr)
     for it in range(max_iters):
         s.dispatch(sock)
@@ -83,26 +108,35 @@ def drive(s, sock, max_iters=5000, busy_ticks=3):
                 if json.loads(f[1].decode())["type"] != "assign"]
         for f in fast:
             sock.sent.remove(f)
-            answer_one(s, sock, f)
+            answer_one(s, sock, f, mirrors)
         for f in list(sock.sent):
             sock.sent.remove(f)
             inflight.append([busy_ticks, f])
-        progressed = False
+            truly_busy.add(f[0])
         for item in inflight:
             item[0] -= 1
             if item[0] <= 0:
-                answer_one(s, sock, item[1])
+                answer_one(s, sock, item[1], mirrors)
+                truly_busy.discard(item[1][0])
                 inflight.remove(item)
-                progressed = True
+        # heartbeat: a real idle worker reports every HB_INTERVAL
+        # (worker.py serve-loop); a busy one cannot (run_turn inline).
+        # A B-merge waiter target is scheduler-busy but REALLY idle — it
+        # heartbeats, and that status must not corrupt its merge state
+        for ident, mir in mirrors.items():
+            if ident not in truly_busy:
+                s.on_message(sock, ident, mir.status(), None)
         if not s.ready and not sock.sent and not inflight:
             break
     return it
 
 
-def answer_one(s, sock, frames):
+def answer_one(s, sock, frames, mirrors):
     ident = frames[0]
     hdr = json.loads(frames[1].decode())
     w = s.workers[ident]
+    mir = mirrors[ident]
+    mir.cmd_seq += 1            # worker.py:352, every command received
     mtype = hdr["type"]
     if mtype == "assign":
         names = hdr["new_block_names"]
@@ -115,6 +149,7 @@ def answer_one(s, sock, frames):
             "ok": True, "prefill_s": 0.1, "prefill_tokens": 64,
             "decode_s": 0.1, "published": pubs,
             "resident_bytes": MB}, None)
+        s.on_message(sock, ident, mir.status(), None)   # worker.py:440
     elif mtype == "fetch":
         for n in hdr["names"]:
             if n in s.dir:
@@ -122,6 +157,7 @@ def answer_one(s, sock, frames):
         s.on_message(sock, ident, {"type": "fetched", "ok": True,
                                    "names": hdr["names"]},
                      b"payload")
+        # worker.py sends NO status after fetch
     elif mtype == "deliver":
         xfer = next((x for x in s._xfer.values()
                      if x["target"] == ident
@@ -130,14 +166,11 @@ def answer_one(s, sock, frames):
         w.resident |= set(names)
         s.on_message(sock, ident, {"type": "delivered",
                                    "names": list(names)}, None)
+        s.on_message(sock, ident, mir.status(), None)   # worker.py:396
     elif mtype == "evict":
         for n in hdr["names"]:
             w.resident.discard(n)
-        s.on_message(sock, ident, {"type": "status", "seq": 0,
-                                   "resident": list(w.resident),
-                                   "tips": [], "resident_bytes": 0,
-                                   "spilled": [], "spill_bytes": 0},
-                     None)
+        s.on_message(sock, ident, mir.status(), None)   # worker.py:416
 
 
 def dump_state(s, it):

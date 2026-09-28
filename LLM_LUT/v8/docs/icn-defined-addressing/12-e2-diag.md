@@ -306,6 +306,60 @@ trace 确认（runbook §7b 重放 r1 格失败块 span/848-864）：该块一�
 
 
 
+## 事故五（2026-09-28，闭链 pit 格"卡死"20 分钟：worker 崩溃连环）
+
+### 1. 现象
+
+闭链 + `--pit` 的 matrix 格（`matrix_pit_on`，s16 t3 share2 b3）
+两次跑到 20 分钟无任何输出；open-loop + `--pit` 同代码 218s 正常
+完成（pit_compute_merged=9, failed=0）。`test_pit` 白盒闭链模拟
+ALL PASS——真实环境与测试的唯一结构差异只剩 worker 的 status
+快照协议（已在 test_pit 补模拟，仍未复现）。
+
+### 2. 根因（`--cell-timeout 60` 快速复现后现形）
+
+不是调度逻辑挂起，是 **worker 进程崩溃连环**：
+
+1. PIT fetch-merge 组播（scheduler `delivered` 处理，旧 ~1703 行）
+   转发的是 `on_message` 的参数 `payload`——但 delivered ack 本身
+   不带 payload，所以 **waiter 目标收到的 deliver 永远是空 body**；
+2. worker `deliver` 处理直接 `torch.load(io.BytesIO(payload))`，
+   空/None payload → EOFError/TypeError → **进程退出 rc=1**；
+3. run_cluster 看门狗见 worker 退出 → `os._exit(2)` 中止整个 cell；
+4. matrix 用 `capture_output` 跑 cell，崩溃信息全部捂在管道里，
+   终端 20 分钟只有一行 cell 头——表象就是"卡死"。
+
+test_pit 没抓到是因为 FakeSock 不做 `torch.load`，协议层"收到了
+deliver"就算通过，不管 payload 是空。
+
+### 3. 修复
+
+- scheduler fetched 处理：`xfer["payload"] = payload` 暂存字节，
+  组播时复用（`xfer.get("payload")`）——delivered ack 到达时原始
+  payload 仍在内存，引用延长秒级，无额外拷贝；
+- worker deliver 处理：`if not payload:` 回
+  `delivered ok=False` 而不是崩进程；随后的 assign 会因缺 resume
+  块抛 STALE_RESUME，scheduler 已有重排队路径，自愈；
+- scheduler 两条防御 + 取证日志：fetched `ok=True` 但空 payload →
+  大声打印并按 holder 丢失降级（purge holder 视图 + 主 turn 和
+  waiter 一起 re-queue）；`delivered ok=False` → 大声打印。
+  若 EOFError 另有上游来源，下次跑会直接在日志留签名。
+
+### 4. 教训
+
+- **协议层测试必须校验 payload 内容**，不能只校验消息类型到达；
+  FakeSock 越忠实（cmd_seq、status 快照、payload 字节）越早抓到
+  这类 bug。
+- matrix 的 capture_output 把崩溃变成"卡死"表象。以后排障第一问：
+  是不是 capture 捂住了输出——用等价 run_cluster 前台流式跑一遍，
+  卡死点直接写在最后一行。
+- 传发 payload 时写明"这个 payload 在这一刻是什么"：delivered
+  ack 的 payload 是 None，转发它必是空——注释里把这个不变量钉死。
+
+
+
+
+
 ## 7. 常见异常处置
 
 | 现象 | 处置 |

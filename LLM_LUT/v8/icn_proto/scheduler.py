@@ -1539,9 +1539,16 @@ class Scheduler:
                       f"{ident.decode()}: ok={hdr.get('ok')} "
                       f"names={len(hdr.get('names') or [])}", flush=True)
                 return
-            if hdr.get("ok"):
+            if hdr.get("ok") and payload:
                 xfer["stage"] = "deliver"
                 xfer["bytes"] = len(payload)
+                # keep the bytes for the PIT multicast: the delivered ack
+                # carries NO payload, so the old code resent None and
+                # every waiter worker crashed in torch.load on an empty
+                # deliver (EOFError/TypeError, pit closed-loop cell
+                # 2026-09-28 — surfaced as a silent 20-min "hang" under
+                # matrix's captured stdout)
+                xfer["payload"] = payload
                 if kind == "repl":
                     xfer_s = time.time() - xfer["t"]
                     print(f"[ctl  ] {rid} fetched {xfer['bytes']/1e6:.1f}MB "
@@ -1556,6 +1563,18 @@ class Scheduler:
                     self._send(sock, {"type": "deliver"},
                                xfer["target"], payload=payload)
             else:
+                missing = hdr.get("missing") or []
+                if hdr.get("ok"):
+                    # ok=True but an empty/unloadable body: nothing to
+                    # deliver — degrade exactly like a holder loss, but
+                    # LOUDLY (this is the worker-side EOFError crash
+                    # seen in the pit closed-loop cell 2026-09-28; the
+                    # empty-payload source must stay visible in the log)
+                    print(f"[xfer ] {rid} fetched ok=True with EMPTY "
+                          f"payload ({kind}) from {ident.decode()} "
+                          f"({len(hdr.get('names') or [])} names) — "
+                          f"treating as holder loss", flush=True)
+                    missing = list(hdr.get("names") or [])
                 # holder lost blocks: demand degrades to the local
                 # boundary; a failed replication just aborts (zero-replica
                 # is legal — identity survives via re-derivation).
@@ -1563,7 +1582,7 @@ class Scheduler:
                 # missed) — purge its view or every later plan keeps
                 # routing fetches through a holder that no longer holds
                 # (incident 3, 12-e2-diag).
-                for n in hdr.get("missing") or []:
+                for n in missing:
                     hw = self.workers.get(ident)
                     if hw is not None:
                         hw.resident.discard(n)
@@ -1573,12 +1592,12 @@ class Scheduler:
                                     holder=ident.decode(), kind=kind)
                 if kind == "repl":
                     print(f"[ctl  ] {rid} replication FAILED (missing "
-                          f"{len(hdr.get('missing') or [])}), abort",
+                          f"{len(missing)}), abort",
                           flush=True)
                     self._repl.pop(rid, None)
                     return
                 print(f"[xfer ] {rid} fetch FAILED (missing "
-                      f"{len(hdr.get('missing') or [])}), degrade to "
+                      f"{len(missing)}), degrade to "
                       f"E_loc={xfer['E_loc']}", flush=True)
                 turn = xfer["turn"]
                 self.degrade_rederiv_tokens += max(
@@ -1600,6 +1619,15 @@ class Scheduler:
             return
         if mtype == "delivered":
             names = hdr.get("names") or []
+            if hdr.get("ok") is False:
+                # worker refused the deliver (empty-payload guard,
+                # worker.py): the turn's pending assign raises
+                # STALE_RESUME on the missing resume blocks and the
+                # scheduler re-queues it — loud here so an empty-deliver
+                # source stays visible in the cell log
+                print(f"[xfer ] WARN delivered ok=False from "
+                      f"{ident.decode()}: {hdr.get('error')}", flush=True)
+                return
             if hdr.get("repl"):
                 # controller replication ack: paired by the echoed rid —
                 # a demand fetch may be delivering the SAME names to the
@@ -1701,7 +1729,7 @@ class Scheduler:
                 # (15 §4.4 accounting rule)
                 for wt in waiters:
                     self._send(sock, {"type": "deliver"}, wt["target"],
-                               payload=payload)
+                               payload=xfer.get("payload"))
                     ww = self.workers[wt["target"]]
                     ww.resident |= set(xfer["names"])
                     for n in xfer["names"]:

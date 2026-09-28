@@ -161,7 +161,7 @@ python -m icn_proto.run_cluster --policy ours --sessions 8 \
 
 python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-35B-A3B \
   --gpu-pool 0,1,2,3,4,5,6,7 --sessions 16 --turns-per-session 3 --q-tokens 40 \
-  --shares 2 --policies b3 --reps 1 --cell-timeout 1800 --pit \
+  --shares 2 --policies b3 --reps 1 --cell-timeout 60 --pit \
   --manifest results/icn_proto/matrix_pit_on.json
 ```
 
