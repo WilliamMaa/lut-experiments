@@ -70,59 +70,74 @@ def setup_closed_loop(s, n_sessions=16, pairs=8, n_turns=4):
     return s
 
 
-def answer(s, sock):
-    """Perfect-worker replies for every captured command."""
-    for frames in list(sock.sent):
-        sock.sent.remove(frames)
-        ident = frames[0]
-        hdr = json.loads(frames[1].decode())
-        w = s.workers[ident]
-        mtype = hdr["type"]
-        if mtype == "assign":
-            names = hdr["new_block_names"]
-            w.resident |= set(names) | set(hdr["resume_names"])
-            for n in hdr["resume_names"]:
-                s.dir_add(n, MB)
-            pubs = [{"name": n, "bytes": MB} for n in names]
-            s.on_message(sock, ident, {
-                "type": "result", "request_id": hdr["request_id"],
-                "ok": True, "prefill_s": 0.1, "prefill_tokens": 64,
-                "decode_s": 0.1, "published": pubs,
-                "resident_bytes": MB}, None)
-        elif mtype == "fetch":
-            for n in hdr["names"]:
-                if n in s.dir:
-                    w.resident.add(n)
-            s.on_message(sock, ident, {"type": "fetched", "ok": True,
-                                       "names": hdr["names"]},
-                         b"payload")
-        elif mtype == "deliver":
-            xfer = next((x for x in s._xfer.values()
-                         if x["target"] == ident
-                         and x["stage"] == "deliver"), None)
-            names = xfer["names"] if xfer else []
-            w.resident |= set(names)
-            s.on_message(sock, ident, {"type": "delivered",
-                                       "names": list(names)}, None)
-        elif mtype == "evict":
-            for n in hdr["names"]:
-                w.resident.discard(n)
-            s.on_message(sock, ident, {"type": "status", "seq": 0,
-                                       "resident": list(w.resident),
-                                       "tips": [], "resident_bytes": 0,
-                                       "spilled": [], "spill_bytes": 0},
-                         None)
-
-
-def drive(s, sock, max_iters=5000):
+def drive(s, sock, max_iters=5000, busy_ticks=3):
+    """busy_ticks: a worker answers an assign this many scheduler ticks
+    after receiving it — real compute time, so concurrency windows
+    (parks, fetch merges) actually open. Without it every turn
+    completes instantly and no two identical prefixes ever overlap."""
+    inflight = []   # (remaining_ticks, ident, hdr)
     for it in range(max_iters):
         s.dispatch(sock)
-        if not sock.sent:
-            if not s.ready:
-                break
-            continue
-        answer(s, sock)
+        # fetch/deliver/evict answers are fast: same tick
+        fast = [f for f in list(sock.sent)
+                if json.loads(f[1].decode())["type"] != "assign"]
+        for f in fast:
+            sock.sent.remove(f)
+            answer_one(s, sock, f)
+        for f in list(sock.sent):
+            sock.sent.remove(f)
+            inflight.append([busy_ticks, f])
+        progressed = False
+        for item in inflight:
+            item[0] -= 1
+            if item[0] <= 0:
+                answer_one(s, sock, item[1])
+                inflight.remove(item)
+                progressed = True
+        if not s.ready and not sock.sent and not inflight:
+            break
     return it
+
+
+def answer_one(s, sock, frames):
+    ident = frames[0]
+    hdr = json.loads(frames[1].decode())
+    w = s.workers[ident]
+    mtype = hdr["type"]
+    if mtype == "assign":
+        names = hdr["new_block_names"]
+        w.resident |= set(names) | set(hdr["resume_names"])
+        for n in hdr["resume_names"]:
+            s.dir_add(n, MB)
+        pubs = [{"name": n, "bytes": MB} for n in names]
+        s.on_message(sock, ident, {
+            "type": "result", "request_id": hdr["request_id"],
+            "ok": True, "prefill_s": 0.1, "prefill_tokens": 64,
+            "decode_s": 0.1, "published": pubs,
+            "resident_bytes": MB}, None)
+    elif mtype == "fetch":
+        for n in hdr["names"]:
+            if n in s.dir:
+                w.resident.add(n)
+        s.on_message(sock, ident, {"type": "fetched", "ok": True,
+                                   "names": hdr["names"]},
+                     b"payload")
+    elif mtype == "deliver":
+        xfer = next((x for x in s._xfer.values()
+                     if x["target"] == ident
+                     and x["stage"] == "deliver"), None)
+        names = xfer["names"] if xfer else []
+        w.resident |= set(names)
+        s.on_message(sock, ident, {"type": "delivered",
+                                   "names": list(names)}, None)
+    elif mtype == "evict":
+        for n in hdr["names"]:
+            w.resident.discard(n)
+        s.on_message(sock, ident, {"type": "status", "seq": 0,
+                                   "resident": list(w.resident),
+                                   "tips": [], "resident_bytes": 0,
+                                   "spilled": [], "spill_bytes": 0},
+                     None)
 
 
 def dump_state(s, it):
