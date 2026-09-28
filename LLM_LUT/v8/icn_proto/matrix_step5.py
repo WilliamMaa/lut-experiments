@@ -150,7 +150,12 @@ def run_cell(args, share, pol, rep, port):
         f.write(out or "")
         f.write("\n--- stderr ---\n")
         f.write(err or "")
-    path = newest_json(t0 - 5, out)
+    # a timed-out cell never reached summary() (it prints "summary ->"
+    # only at the end of a completed run) — any mtime fallback match is
+    # a STALE json from the previous cell and would pollute the
+    # aggregate + double-count in pit_opportunity (ours pit r0
+    # 2026-09-28 attached b3 rep2's json)
+    path = newest_json(t0 - 5, out) if rc != -9 else None
     row = {"share": share, "policy": pol, "rep": rep,
            "budget_mb": args.budget_mb,
            "repl_mem_price": args.repl_mem_price,

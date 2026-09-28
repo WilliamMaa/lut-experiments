@@ -359,12 +359,76 @@ deliver"就算通过，不管 payload 是空。
 
 
 
+## 事故六（2026-09-28，闭链 ours×pit 稀有超时竞态，开放）
+
+### 1. 现象
+
+`matrix_pit_on` 的 `ours rep=0` 格 300s 超时（rc=-9），同配置
+rep=1/2 均 ~35s 正常通过 → 非确定性。其余 5 格（b3×3、ours×2）
+全绿，不影响行 7 机制判文。
+
+### 2. 已知签名（cell log 尾部）
+
+最后一个 `[result]` 之后完全静默 ~200s：无 watchdog busy 刷
+报、无 GREY、无 `[pit ] parked` cap 刷报、无 `[xfer ] stuck`
+刷报、无 `[match]`（ready 空）。即 scheduler 主循环空转、
+worker 全体空闲心跳正常，但 `finished()` 永不达成——有 turn
+既不在 ready、不在 `_pit`、不在 `_xfer`，也不在任何 worker
+上。疑似 B-merge waiter 或 A-waiter 的释放路径存在未覆盖的
+丢失分支（12 号 §7 的活性三层均未触发）。
+
+### 3. 处置
+
+- 取证：`grep -nE "watchdog|GREY|\[pit|\[xfer|\[ctl|EMPTY|WARN|
+  STALE" cell_cl_tps3_q40_s2_ours_r0_b0_p0.log`（纯读文件，
+  不烧卡），看中段有无被 tail 漏掉的 grey/pit 事件；
+- **已完成**：主循环 housekeeping 加死锁 backstop——
+  `ready/_pit/_xfer/_repl/arrivals 全空 ∧ 无 busy ∧ not finished`
+  持续 >15s → `_dump_pending()` 打出每个未完成 session 的
+  chain 位置 + 响亮 RuntimeError（复用事故四"响亮失败"模式），
+  下次复现秒级定位；
+- **补跑 ours r0 完整步骤**（--drop-bad 只删 manifest 里的坏行，
+  不动磁盘上的 json/log；重跑时已有 5 个好格自动跳过，只补
+  被删掉的那一格）：
+
+```bash
+cd ~/lut-experiments/LLM_LUT/v8
+
+# 1. 清坏行：--manifest 必须指向要清的那个 manifest；
+#    --model-path 是 argparse 必填项，drop-bad 路径不读它的值，
+#    随便填一个合法路径即可
+python -m icn_proto.matrix_step5 \
+  --model-path /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --manifest results/icn_proto/matrix_pit_on.json --drop-bad
+# 预期输出：dropped 1 bad row(s): share=2 policy=ours rep=0 rc=-9 ...
+
+# 2. 原样重跑之前那条 matrix 命令（一字不改）：
+nohup python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --gpu-pool 0,1,2,3,4,5,6,7 --sessions 16 --turns-per-session 3 --q-tokens 40 \
+  --shares 2 --policies b3,ours --reps 3 --cell-timeout 300 --pit \
+  --manifest results/icn_proto/matrix_pit_on.json > logs/matrix_step_5_pit_on.log 2>&1 &
+
+# 3. 看进度（只会跑 === cell share=2 policy=ours rep=0 === 一格，
+#    其余 5 格打印 resuming 后跳过）：
+tail -f logs/matrix_step_5_pit_on.log
+```
+
+### 4. 附带修复（已完成）
+
+matrix_step5 的 mtime 兜底曾把超时格挂到上一格的旧 JSON
+（ours 聚合行和 pit_opportunity 都被污染成 101227 双份）——
+超时（rc=-9）格一律不再匹配 JSON（`newest_json` 仅在 rc≠-9
+时调用）。
+
+
+
+
 
 ## 7. 常见异常处置
 
 | 现象 | 处置 |
 |---|---|
-| 某格 `BAD` / 超时 | `python -m icn_proto.matrix_step5 --manifest results/icn_proto/matrix_e2.json --drop-bad`（清坏格），然后重跑那一条命令 |
+| 某格 `BAD` / 超时 | 清坏行再补跑，完整步骤见 12 号事故六 §3（--manifest 指向该矩阵自己的 manifest；--drop-bad 只删 manifest 行，重跑自动只补被删的格） |
 | 同一格清完重跑还 `BAD` | 先别重跑。跑 §7a 的命令看失败错误，贴回来再定处置 |
 | worker 起不来 / hello 超时 | 有孤儿进程：`pkill -9 -f icn_proto`，sleep 3，重跑 |
 | 想看重跑某格的完整日志 | `results/icn_proto/cell_logs/cell_<wl>_s2_<pol>_r<rep>_b48_p0.log`（wl 含 `_sp-1`/`_sp96`） |

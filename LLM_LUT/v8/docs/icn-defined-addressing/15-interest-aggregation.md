@@ -170,3 +170,38 @@ python -m icn_proto.matrix_step5 --model-path /home/u/downloads/models/Qwen3.6-3
 → A 类机制成立；`failed=0` 且 hit/new_tok 不比基线崩 → 没破坏
 正常路径；二者全满足 → 按 §6 铺 {b3, ours} × {off, on} 小矩阵
 补齐 regime 边界。计数器全 0 → 实现有洞，回炉。
+
+## 8. 结果（2026-09-28，smoke 尺度）
+
+**机制成立，跨策略兑现。** 闭链 s16 t3 share2：
+
+| 腿 | 格 | served/64 | saved_tok（上界口径） | m_fetch | failed |
+|---|---|---|---|---|---|
+| b3 pit=on r0 | 095512 | 41 | 175416 | 2 | 0 |
+| b3 pit=on r1 | 101148 | 47 | 190120 | 2 | 0 |
+| b3 pit=on r2 | 101227 | 45 | 188444 | 2 | 0 |
+| ours pit=on r1 | 101811 | 41 | 166630 | 2 | 0 |
+| ours pit=on r2 | 101850 | 42 | 176790 | 2 | 0 |
+| ours pit=on r0 | — | **超时 rc=-9（唯一 BAD，见 12 号事故六）** | | | |
+
+- 机会量基线（pit=off，b3/ours 各 rep 稳定）：A_pairs=4，
+  A_re_tok=6082，B_pairs=1/格。
+- A 类真实兑现且远超 4 对机会：闭链同时起步的风暴里 serving
+  时间窗被合并本身拉长，又制造新的重叠——pit=off 的机会量测量
+  （时间窗重叠）**系统性低估**高并发 regime，判文以 pit=on 计数器
+  为准。
+- **记账口径注意**：`saved_tok` 是"每次 park × 当时 cum_tokens"
+  累加，同一 turn 反复 park（m_comp 118-128 events > 64 turns）
+  会重复计，是上界口径，不是去重 token 数。
+- 事故五（组播空 payload → worker 崩溃连环，表象为 matrix
+  capture 下的"卡死"）已修复并记入 12 号；修复后上述 5 格 rc=0。
+- **质量面无退化**：b3 pit=on 的 hit/new_tok（0.969/4810）与
+  pit=off 基线逐位一致；ours pit=on 把 ours 基线偏高的
+  new_tok（9296）拉回 b3 水平（4810）——放置控制在风暴 regime
+  引起的迁移重算被聚合 resume 吸收，pit 对 ours 是净收益。
+
+**判文结论**：行 7 PIT 在闭链风暴 regime 成立，b3/ours 两策略
+同量级兑现，活性/释放路径在 5 格 × 64 turns 下零失败。
+regime 边界：open-loop（poisson+think 错开）机会量 ≈0 已判否；
+闭链 share=2 强前提成立。剩余开放项：ours pit=on 的稀有超时
+竞态（12 号事故六），不影响机制判文，修复后补一格 rep=0 即可。

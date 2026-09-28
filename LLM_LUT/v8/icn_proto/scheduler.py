@@ -1066,6 +1066,30 @@ class Scheduler:
                             wt.t_ready = time.time()
                             self.ready.append(wt)
                 self._watchdog_fail(sock, now)
+                # deadlock backstop (12号事故六): a turn lost from
+                # ready/_pit/_xfer with every worker idle makes
+                # finished() unreachable while EVERY other watchdog
+                # stays silent (no busy, no xfer, no pit entry, workers
+                # heartbeating fine). Detect the all-empty state and
+                # fail LOUD with the pending-turn map instead of
+                # spinning until the cell timeout.
+                stalled = (not self.ready and not self._pit
+                           and not self._xfer and not self._repl
+                           and not self.arrivals
+                           and not any(w.busy
+                                       for w in self.workers.values())
+                           and not self.finished())
+                if stalled:
+                    self._idle_since = (getattr(self, "_idle_since", None)
+                                        or now)
+                    if now - self._idle_since > 15:
+                        self._dump_pending()
+                        raise RuntimeError(
+                            "all queues empty, no worker busy, "
+                            "unfinished sessions remain — turns lost "
+                            "(see pending dump above)")
+                else:
+                    self._idle_since = None
                 if sock not in evts:
                     continue
                 ident, hdr, payload = msg.recv(sock)
@@ -1183,6 +1207,22 @@ class Scheduler:
                 print(f"[watchdog] repl {rid} abandoned after "
                       f"{int(now - x['t'])}s", flush=True)
                 self._repl.pop(rid, None)
+
+    def _dump_pending(self):
+        """Loud pending-turn map for the deadlock backstop: which
+        session is stuck at which chain index, and whether that turn is
+        findable in ready. A 'no' there pinpoints the losing path."""
+        ready_ids = {(t.session, t.turn) for t in self.ready}
+        for s, turns in self.turns_of.items():
+            nxt = self.pending_next.get(s, 0)
+            if nxt >= len(turns):
+                continue
+            t = turns[nxt]
+            print(f"  pending {s}: chain idx={nxt}/{len(turns)} "
+                  f"turn={t.turn} "
+                  f"in_ready={(s, t.turn) in ready_ids}", flush=True)
+        print(f"  done_sessions={self.done_sessions}/"
+              f"{len(self.turns_of)}", flush=True)
 
     def dispatch(self, sock):
         for turn in list(self.ready):
