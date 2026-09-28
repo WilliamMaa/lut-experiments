@@ -153,21 +153,27 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
     step_times = []
     n_steps = 0
 
-    pad_t = torch.tensor(
-        [input_ids.shape[1] - r for r in real_lens], device=device,
-    ).unsqueeze(1)  # [B, 1] left-pad count per session
+    pad_counts = [input_ids.shape[1] - r for r in real_lens]
+    pad_t = torch.tensor(pad_counts, device=device).unsqueeze(1)  # [B, 1]
+    has_pads = any(p > 0 for p in pad_counts)
+    model_dtype = next(model.parameters()).dtype
 
     # Decode masks are derived HARNESS-SIDE, never from cache internals:
     # out.past_key_values may be a rewrapped object whose reported content
-    # length and custom attributes do not reflect the compressed state
-    # (measured 2026-09-17: the model extended a 128-slot mask to the full
-    # 31127-slot prefill length via the cache's own get_seq_length). The only
-    # facts needed here are all harness-known:
-    #   - eviction triggers iff content + 1 > budget, and after an evicting
-    #     update the layout is ALWAYS sink|hh|recent — pads can only survive
-    #     in the sink region (zero-mass pads are never selected into hh at
-    #     real context lengths; the B=1-vs-batched selftest guards it), so
-    #     the mask is constant across all evicting steps.
+    # length and custom attributes do not reflect the compressed state, and
+    # transformers builds the 4D causal mask at forward START from the
+    # PRE-update cache length — while eviction happens INSIDE the forward's
+    # first update (measured 2026-09-17: a 128-slot mask was extended back
+    # to the full 31127-slot prefill length). So for the evicting steps the
+    # mask can only be correct if transformers does not rebuild it:
+    #   - no pads in the batch -> attention_mask=None; sdpa uses is_causal,
+    #     which is exact for q_len=1 and is what the single-stream batch=1
+    #     path effectively does (this is why it never crashed there);
+    #   - pads present -> a ready-made 4D mask, which transformers passes
+    #     through without rebuilding.
+    # Layout after any evicting update is always sink|hh|recent; pads can
+    # only survive in the sink region (zero-mass pads are never selected
+    # into hh at real context lengths; the B=1-vs-batched selftest guards).
     budget = patch.max_cache_len if patch is not None else None
     sink_n = patch.sink_tokens if patch is not None else 0
     content = input_ids.shape[1]  # post-prefill cache content length
@@ -175,7 +181,8 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
     def decode_mask(step):
         nonlocal content
         if patch is None:
-            # Full cache grows unbounded; pads stay masked via attn_mask.
+            # Full cache grows unbounded, no in-forward eviction: lengths
+            # stay consistent, so the 2D mask path is safe.
             return torch.cat(
                 [attn_mask, torch.ones(B, step + 1, dtype=torch.long, device=device)],
                 dim=1,
@@ -183,13 +190,19 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
         if content + 1 > budget:
             # Evicting update: post-update layout is sink|hh|recent(budget).
             content = budget
-            ar = torch.arange(budget, device=device).unsqueeze(0).expand(B, budget)
-            m = (ar >= pad_t).long()
-            m[:, sink_n:] = 1
+            if not has_pads:
+                return None
+            valid = (torch.arange(budget, device=device).unsqueeze(0) >= pad_t)
+            valid[:, sink_n:] = True
+            m = torch.zeros(B, 1, 1, budget, dtype=model_dtype, device=device)
+            m.masked_fill_(~valid.unsqueeze(1).unsqueeze(1),
+                           torch.finfo(model_dtype).min)
             return m
         # No eviction yet (tiny prefill): uncompressed content, orig ==
         # arange(content), so the prefill mask + ones is exact.
         content += 1
+        if not has_pads:
+            return None
         return torch.cat(
             [attn_mask, torch.ones(B, step + 1, dtype=torch.long, device=device)],
             dim=1,
