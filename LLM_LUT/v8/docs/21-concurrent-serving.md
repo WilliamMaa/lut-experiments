@@ -46,6 +46,12 @@ pad、mask 隔离、首个 EOS 截断）。
   （`9%` 不匹配 `19%`）；multi_instruction 为 AND（所有 gt 必须出现）。
 - 负载是**合成文档**：记录块（多位数事实，考验 M4）+ 无数字 filler（可压缩噪声），
   区域每文档唯一保证问题无歧义，gt 生成时校验必在文档内。
+- decode 步的 attention mask 必须建在**压缩后 slot 空间**：transformers 会把传入
+  mask 的 kv 维直接交给 sdpa，长度必须等于 update 返回的 key 数。harness 按
+  `_hh_orig_idx`（slot→原始位置映射）构建 mask——稳态逐 slot 精确，首个 decode 步
+  （淘汰发生在 update 内）按 sink|hh|recent 布局推导，仅 sink 区可能含 left-pad
+  （hh 选入 pad 的极端角落由 B=1-vs-batched selftest 实证兜底）。单流 batch=1
+  评测从未暴露此问题：无 pad 时 mask=None 走 is_causal，根本不经过 4D mask。
 
 ## 运行步骤（按顺序，每步过再进下一步）
 

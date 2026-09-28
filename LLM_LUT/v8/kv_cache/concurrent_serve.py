@@ -148,16 +148,61 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
     last = next_ids
     step_times = []
     n_steps = 0
+
+    pad_t = torch.tensor(
+        [input_ids.shape[1] - r for r in real_lens], device=device,
+    ).unsqueeze(1)  # [B, 1] left-pad count per session
+
+    def decode_mask(step):
+        """Mask for this decode step, in POST-update slot space.
+
+        transformers passes a provided mask's kv dim straight to sdpa, so the
+        length must equal the key length update() will return this step:
+          - full config: cache grows unbounded -> prefill mask + one 1 per
+            consumed decode token (pads stay 0).
+          - compressed config: validity must follow the cache's own
+            slot -> original-position map (_hh_orig_idx), because eviction
+            drops slots. Steady state: exact per-slot validity. First decode
+            step (eviction happens inside this update, content is still the
+            uncompressed prefill): post-update layout is sink|hh|recent, and
+            only the sink region can hold left-pad slots (zero-mass pads are
+            never selected into hh in practice; the B=1-vs-batched selftest
+            guards this).
+        """
+        if patch is None:
+            return torch.cat(
+                [attn_mask, torch.ones(B, step + 1, dtype=torch.long, device=device)],
+                dim=1,
+            )
+        oi = None
+        for layer in cache.layers:
+            oi = getattr(layer, "_hh_orig_idx", None)
+            if oi is not None:
+                break
+        oi = oi.to(device)  # layers may sit on other GPUs under device_map
+        budget = patch.max_cache_len
+        if oi.shape[1] + 1 <= budget:
+            # No eviction this step: content validity + the new token (valid).
+            return torch.cat(
+                [(oi >= pad_t).long(), torch.ones(B, 1, dtype=torch.long, device=device)],
+                dim=1,
+            )
+        if oi.shape[1] <= budget:
+            # Steady state: eviction trims back to exactly the current length,
+            # so pre-update slot validity is exact for the post-update slots
+            # (only the recent-window tail shifts, and those slots are valid).
+            return (oi >= pad_t).long()
+        # First decode step after an over-budget prefill.
+        ar = torch.arange(budget, device=device).unsqueeze(0).expand(B, budget)
+        m = (ar >= pad_t).long()
+        m[:, patch.sink_tokens:] = 1
+        return m
+
     for step in range(max_new_tokens - 1):
         if bool(finished.all()):
             break
         feed = torch.where(finished, torch.full_like(last, pad_id), last).unsqueeze(1)
-        # Mask must cover past + current: prefill mask plus one 1 per
-        # consumed decode token (pads stay 0, so finished sessions' pad
-        # keys and left-pad slots never become visible).
-        cur_mask = torch.cat(
-            [attn_mask, torch.ones(B, step + 1, dtype=torch.long, device=device)], dim=1,
-        )
+        cur_mask = decode_mask(step)
         sync()
         ts = time.perf_counter()
         with torch.no_grad():
