@@ -1203,6 +1203,11 @@ class Scheduler:
                         self.trace.emit(
                             "pit_wait", fp, rid=entry["rid"],
                             waiter=f"{turn.session}:{turn.turn}")
+                        # MUST leave ready: the wakeup appends this turn
+                        # back once; leaving it in place double-dispatches
+                        # the same rid to two workers (hang/corruption,
+                        # pit cell 2026-09-28)
+                        self.ready.remove(turn)
                         continue
             chosen = self.choose(turn)
             if chosen is None:
@@ -1450,6 +1455,21 @@ class Scheduler:
                         self.records.remove(rec)
                     turn.t_ready = time.time()
                     self.ready.append(turn)
+                    if self.pit_enabled:
+                        # the result branch's wakeup is never reached on
+                        # this early return — release the fp's waiters or
+                        # they park forever (they are NOT in ready; the
+                        # re-dispatch of this serving turn re-registers
+                        # the fp and waiters may re-park then)
+                        fp = turn.prefix_fingerprint(
+                            "bf16", self.args.block_tokens)
+                        entry = self._pit.pop(fp, None)
+                        if entry is not None:
+                            for wt in entry["waiters"]:
+                                wt.t_ready = time.time()
+                                self.ready.append(wt)
+                            self.trace.emit(
+                                "pit_wake", fp, rid=rid, why="stale")
                     print(f"[assign] {rid} STALE_RESUME "
                           f"({len(missing)} blocks), purged view and "
                           f"re-queued", flush=True)
