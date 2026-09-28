@@ -30,10 +30,12 @@ import transformers.modeling_utils as modeling_utils
 class AttentionScoreBank:
     """Per-layer per-position accumulated attention mass from the last prefill.
 
-    scores:           layer_idx -> [seq_len] float32, summed over all q-heads
-                      and obs-window rows (used for eviction selection).
-    scores_per_head:  layer_idx -> [kv_heads, seq_len] float32, summed over
-                      the q-heads each kv-head serves and over obs-window
+    scores:           layer_idx -> [batch, seq_len] float32, summed over all
+                      q-heads and obs-window rows (used for eviction
+                      selection). Batch-indexed: each concurrent session keeps
+                      its own scores so per-session selection is independent.
+    scores_per_head:  layer_idx -> [batch, kv_heads, seq_len] float32, summed
+                      over the q-heads each kv-head serves and over obs-window
                       rows (used for per-head merge weights).
     """
 
@@ -96,14 +98,14 @@ def _stash(module, query, key, value, attention_mask, scaling):
     else:
         scores = scores + _causal_rows(w, k_len, scores.device, scores.dtype)[None, None]
     probs = torch.softmax(scores, dim=-1)
-    bank.scores[layer_idx] = probs.sum(dim=(0, 1, 2))  # [K] float32
+    bank.scores[layer_idx] = probs.sum(dim=(1, 2))  # [B, K] float32
     n_kv = key.shape[1]
     if probs.shape[1] % n_kv == 0:
         # Per-kv-head mass: group the q-heads each kv-head serves (the sdpa
         # GQA repeat_interleave layout) so merge weights are per-head.
         bank.scores_per_head[layer_idx] = probs.reshape(
             probs.shape[0], n_kv, -1, w, k_len,
-        ).sum(dim=(0, 2, 3)).float()  # [H_kv, K]
+        ).sum(dim=(2, 3)).float()  # [B, H_kv, K]
 
 
 def _sdpa_stash(module, query, key, value, attention_mask, dropout=0.0,

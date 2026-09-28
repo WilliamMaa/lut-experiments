@@ -120,7 +120,8 @@ class HeavyHitterCache(DynamicCache):
         get +inf so they roll out gradually instead of being evicted before
         the prefill heavy hitters.
 
-        Returns [total_len], or None when no prefill scores are available.
+        orig_idx: [B, total_len] per-session original positions.
+        Returns [B, total_len], or None when no prefill scores are available.
         """
         if self.importance_mode != "attn_score" or self.score_bank is None:
             return None
@@ -131,14 +132,23 @@ class HeavyHitterCache(DynamicCache):
                 return None
             prefill = bank_scores.to(device)
             layer._hh_prefill_scores = prefill
+        B = orig_idx.shape[0]
+        if prefill.shape[0] != B:
+            raise RuntimeError(
+                f"[heavy_hitter] layer {layer_idx}: score bank batch "
+                f"({prefill.shape[0]}) != cache batch ({B}). The bank is "
+                f"refreshed per get_cache(); do not reuse a cache across "
+                f"generations with different batch sizes."
+            )
         plen = prefill.shape[-1]
         valid = orig_idx < plen
         safe_idx = orig_idx.clamp(max=plen - 1)
+        batch_vals = prefill[torch.arange(B, device=device).unsqueeze(1), safe_idx]
         # Decode tokens (written after the prefill snapshot) compete at the
         # *mean* attention mass. +inf here would let them flush every prefill
         # heavy hitter out of the middle region within one generation.
-        vals = torch.where(valid, prefill[safe_idx], prefill.mean())
-        return vals
+        mean_vals = prefill.mean(dim=-1, keepdim=True).expand(B, orig_idx.shape[1])
+        return torch.where(valid, batch_vals, mean_vals)
 
     def _shared_position_scores(self, layer, layer_idx, orig_idx, device):
         """Cross-layer aggregated attention mass for each cached position.
@@ -152,6 +162,12 @@ class HeavyHitterCache(DynamicCache):
         """
         if self.importance_mode != "attn_score" or self.score_bank is None:
             return None
+        if orig_idx.shape[0] != 1:
+            raise NotImplementedError(
+                "[heavy_hitter] shared_selection (M3) is only implemented "
+                "for batch=1; it is a dead direction (docs/19) and not "
+                "worth batch-ifying."
+            )
         agg = getattr(layer, "_hh_shared_scores", None)
         if agg is None:
             per_layer = list(self.score_bank.scores.values())
@@ -171,7 +187,7 @@ class HeavyHitterCache(DynamicCache):
         return vals
 
     def _per_head_scores(self, layer, layer_idx, device, n_heads):
-        """Per-kv-head prefill attention mass [H_kv, plen], cached per layer.
+        """Per-kv-head prefill attention mass [B, H_kv, plen], cached per layer.
 
         Falls back to spreading the head-summed scores evenly across heads
         when the bank has no per-head data (older stash).
@@ -187,7 +203,7 @@ class HeavyHitterCache(DynamicCache):
                         return None
                     summed = bank_scores.to(device)
                     layer._hh_prefill_scores = summed
-                ph = (summed / n_heads).unsqueeze(0).expand(n_heads, -1).contiguous()
+                ph = (summed / n_heads).unsqueeze(2).expand(-1, n_heads, -1).contiguous()
             else:
                 ph = ph.to(device)
             layer._hh_prefill_scores_per_head = ph
@@ -213,20 +229,25 @@ class HeavyHitterCache(DynamicCache):
 
         hh_values: [B, H, hh, D] gathered heavy-hitter values (fresh tensor,
         safe to modify in place). topk: [B, hh] middle-relative kept indices,
-        sorted ascending. middle_orig: [M] original prefill positions of the
-        middle region. middle_values: [B, H, M, D] (read-only view).
+        sorted ascending per batch element. middle_orig: [B, M] original
+        prefill positions of the middle region. middle_values: [B, H, M, D]
+        (read-only view). Selection and folding are per-session: batch
+        element i only ever folds its own evicted tokens into its own kept
+        slots.
         """
         B, H, hh, D = hh_values.shape
         M = middle_values.shape[2]
-        kept = topk[0]  # [hh], ascending
-        ev_mask = torch.ones(M, dtype=torch.bool, device=middle_values.device)
-        ev_mask[kept] = False
-        ev_pos = ev_mask.nonzero(as_tuple=True)[0]  # [E]
-        if ev_pos.numel() == 0:
+        kept = topk  # [B, hh], ascending per batch element
+        ev_mask = torch.ones(B, M, dtype=torch.bool, device=middle_values.device)
+        ev_mask.scatter_(1, kept, False)
+        ev_pos = ev_mask.nonzero(as_tuple=True)[1].view(B, -1)  # [B, E]
+        E = ev_pos.shape[1]
+        if E == 0:
             return hh_values
         ph = self._per_head_scores(layer, layer_idx, middle_values.device, H)
         if ph is None:
             return hh_values
+        batch_ar = torch.arange(B, device=middle_values.device)
         # Clamp every index against its table: the score table comes from the
         # prefill snapshot and any length mismatch must never turn into a CUDA
         # device-side assert.
@@ -234,14 +255,18 @@ class HeavyHitterCache(DynamicCache):
         ev_pos = ev_pos.clamp(max=M - 1).long()
         # First kept slot whose middle position is >= evicted position; an
         # evicted token folds FORWARD (causally later queries look backward).
-        tgt_slot = torch.searchsorted(kept, ev_pos, right=True).clamp(max=hh - 1).long()
-        ev_orig = middle_orig[ev_pos].clamp(max=ph.shape[-1] - 1).long()           # [E]
-        tgt_orig = middle_orig[kept[tgt_slot]].clamp(max=ph.shape[-1] - 1).long()  # [E]
-        own_orig = middle_orig[kept].clamp(max=ph.shape[-1] - 1).long()            # [hh]
+        tgt_slot = torch.searchsorted(kept, ev_pos, right=True).clamp(max=hh - 1).long()  # [B, E]
+        tgt_kept = kept[batch_ar.unsqueeze(1), tgt_slot]                            # [B, E]
+        ev_orig = middle_orig[ev_pos].clamp(max=ph.shape[-1] - 1).long()            # [B, E]
+        tgt_orig = middle_orig[tgt_kept].clamp(max=ph.shape[-1] - 1).long()         # [B, E]
+        own_orig = middle_orig[kept].clamp(max=ph.shape[-1] - 1).long()             # [B, hh]
 
         # All folding in fp32; result cast back to the cache dtype.
-        p_ev = ph[:, ev_orig].float()    # [H, E]
-        p_own = ph[:, own_orig].float()  # [H, hh]
+        p_ev = ph.gather(2, ev_orig.unsqueeze(1).expand(B, H, E)).float()      # [B, H, E]
+        p_own = ph.gather(2, own_orig.unsqueeze(1).expand(B, H, hh)).float()   # [B, H, hh]
+        ev_vals = torch.take_along_dim(
+            middle_values, ev_pos.view(B, 1, E, 1).expand(B, H, E, D), dim=2,
+        )  # [B, H, E, D]
 
         # Deterministic reduction: CUDA index_add_ uses atomics with
         # nondeterministic ordering, whose last-bit differences can flip
@@ -249,18 +274,17 @@ class HeavyHitterCache(DynamicCache):
         # m_sp4 rerun diverged in 2/53 free-generation turns, aggregate
         # metrics identical to 1e-10). A one-hot matmul sums the same
         # contributions through run-to-run stable GEMM.
-        E = ev_pos.numel()
-        onehot = torch.zeros(E, hh, dtype=torch.float32, device=middle_values.device)
-        onehot[torch.arange(E, device=middle_values.device), tgt_slot] = 1.0
-        contrib = p_ev.unsqueeze(0).unsqueeze(-1) * middle_values[:, :, ev_pos, :].float()  # [B, H, E, D]
-        num = hh_values.float() * p_own.unsqueeze(0).unsqueeze(-1)  # [B, H, hh, D]
-        num = num + torch.einsum("es,bhed->bhsd", onehot, contrib)
-        den = p_own + torch.einsum("es,he->hs", onehot, p_ev)  # [H, hh]
-        folded = num / den.clamp(min=1e-8).unsqueeze(0).unsqueeze(-1)
+        onehot = torch.zeros(B, E, hh, dtype=torch.float32, device=middle_values.device)
+        onehot[batch_ar.unsqueeze(1), torch.arange(E, device=middle_values.device), tgt_slot] = 1.0
+        contrib = p_ev.unsqueeze(-1) * ev_vals.float()  # [B, H, E, D]
+        num = hh_values.float() * p_own.unsqueeze(-1)  # [B, H, hh, D]
+        num = num + torch.einsum("bes,bhed->bhsd", onehot, contrib)
+        den = p_own + torch.einsum("bes,bhe->bhs", onehot, p_ev)  # [B, H, hh]
+        folded = num / den.clamp(min=1e-8).unsqueeze(-1)
         if not getattr(layer, "_hh_merge_logged", False):
             layer._hh_merge_logged = True
-            print(f"[heavy_hitter] layer {layer_idx}: convex-folded {ev_pos.numel()} "
-                  f"evicted values into {hh} kept slots")
+            print(f"[heavy_hitter] layer {layer_idx}: convex-folded {E} "
+                  f"evicted values into {hh} kept slots (per-batch, B={B})")
         return folded.to(hh_values.dtype)
 
     def update(self, key_states, value_states, layer_idx, *args, **kwargs):
@@ -328,16 +352,18 @@ class HeavyHitterCache(DynamicCache):
             self._k_meta.pop(layer_idx, None)
             self._v_meta.pop(layer_idx, None)
 
-        # Track original prefill positions of cached keys. After eviction the
-        # current positions no longer match prefill positions, so importance
-        # scores are looked up through this index.
+        # Track original prefill positions of cached keys, per session. After
+        # eviction the current positions no longer match prefill positions,
+        # so importance scores are looked up through this index. [B, len].
+        batch = key_states.shape[0]
         orig_idx = getattr(layer, "_hh_orig_idx", None)
         if orig_idx is None:
-            orig_idx = torch.arange(prev_len, device=keys.device)
+            orig_idx = torch.arange(prev_len, device=keys.device).unsqueeze(0).expand(batch, -1)
         orig_idx = torch.cat([
             orig_idx,
-            torch.arange(prev_len, prev_len + incoming_len, device=keys.device),
-        ])
+            torch.arange(prev_len, prev_len + incoming_len, device=keys.device)
+            .unsqueeze(0).expand(batch, -1),
+        ], dim=1)
 
         total_len = keys.shape[-2]
 
@@ -377,7 +403,7 @@ class HeavyHitterCache(DynamicCache):
                         layer, layer_idx, orig_idx, keys.device,
                     )
                 if pos_scores is not None:
-                    scores = pos_scores[sink_n:sink_n + middle_len]
+                    scores = pos_scores[:, sink_n:sink_n + middle_len]  # [B, M]
                     if self.obs_window > 0:
                         # SnapKV: tokens inside the observation window are
                         # mostly chat-template tokens that attract sink-like
@@ -385,7 +411,7 @@ class HeavyHitterCache(DynamicCache):
                         # exclude them from heavy-hitter candidacy instead of
                         # letting them eat the whole hh budget.
                         plen = layer._hh_prefill_scores.shape[-1]
-                        cand_orig = orig_idx[sink_n:sink_n + middle_len]
+                        cand_orig = orig_idx[:, sink_n:sink_n + middle_len]
                         scores = torch.where(
                             cand_orig >= plen - self.obs_window,
                             torch.full_like(scores, float("-inf")), scores,
@@ -398,7 +424,7 @@ class HeavyHitterCache(DynamicCache):
                         print(f"[heavy_hitter] layer {layer_idx}: no prefill "
                               f"attention scores available, falling back to key-norm")
                         layer._hh_fallback_warned = True
-                    scores = self._importance_scores(middle_keys)[0]
+                    scores = self._importance_scores(middle_keys)  # [B, M]
                 if self.span_window > 0:
                     # Span-aware selection: a token inherits the max score in
                     # its +-span_window neighborhood. Tokenizers split numbers
@@ -408,13 +434,15 @@ class HeavyHitterCache(DynamicCache):
                     # 2026-09-14: the sentinel span survived in 3/10 layers
                     # with ranks 9-53, but its digit neighbors ranked out).
                     # Max-pool makes a fact survive or perish as a unit.
+                    # Per batch element: padding lives at the sequence edges
+                    # of the pooled view, but middle candidates are real
+                    # tokens for every session (pads sit in the sink region).
                     pooled = torch.nn.functional.max_pool1d(
-                        scores.view(1, 1, -1),
+                        scores.unsqueeze(1),  # [B, 1, M]
                         kernel_size=2 * self.span_window + 1,
                         stride=1, padding=self.span_window,
                     )
-                    scores = pooled.view(-1)
-                scores = scores.unsqueeze(0).expand(B, -1)  # [B, M]
+                    scores = pooled.squeeze(1)
                 # Deterministic selection: CUDA topk is not run-to-run stable
                 # with near-tied masses (measured 2026-09-12: same config
                 # re-run flipped factual answers at 500x). A stable descending
@@ -427,7 +455,7 @@ class HeavyHitterCache(DynamicCache):
                 topk, _ = topk.sort(dim=-1)  # maintain temporal order
 
                 # Keep original-position index in sync with the compressed keys.
-                middle_orig = orig_idx[sink_n:middle_end]
+                middle_orig = orig_idx[:, sink_n:middle_end]  # [B, M]
 
                 # Gather heavy hitters: [B, H, hh_budget, D]
                 topk_expanded = topk.unsqueeze(1).unsqueeze(-1).expand(B, H, hh_budget, D)
@@ -440,22 +468,20 @@ class HeavyHitterCache(DynamicCache):
                         topk, middle_orig,
                     )
 
-                sel_orig = torch.gather(
-                    middle_orig.unsqueeze(0).expand(B, -1), 1, topk,
-                )[0]  # batch is always 1 in this eval
+                sel_orig = torch.gather(middle_orig, 1, topk)  # [B, hh_budget]
                 if not getattr(layer, "_hh_selection_logged", False):
                     layer._hh_selection_logged = True
                     plen = (layer._hh_prefill_scores.shape[-1]
                             if getattr(layer, "_hh_prefill_scores", None) is not None
                             else -1)
-                    in_win = (sel_orig >= plen - self.obs_window).sum().item() if plen > 0 else -1
+                    in_win = int((sel_orig >= plen - self.obs_window).sum().item()) if plen > 0 else -1
                     print(f"[heavy_hitter] layer {layer_idx}: first eviction "
-                          f"plen={plen} kept={sel_orig.numel()} "
+                          f"plen={plen} kept={sel_orig.shape[1]}x{sel_orig.shape[0]} "
                           f"in_obs_window={in_win} "
                           f"min_pos={sel_orig.min().item()} max_pos={sel_orig.max().item()}")
                 orig_idx = torch.cat([
-                    orig_idx[:sink_n], sel_orig, orig_idx[-recent_n:],
-                ])
+                    orig_idx[:, :sink_n], sel_orig, orig_idx[:, -recent_n:],
+                ], dim=1)
 
                 keys = torch.cat([sink_keys, hh_keys, recent_keys], dim=-2)
                 values = torch.cat([sink_values, hh_values, recent_values], dim=-2)

@@ -162,7 +162,9 @@ def main():
             continue
         orig_idx = layer._hh_orig_idx
         scores = getattr(layer, "_hh_prefill_scores", None)
-        kept = set(orig_idx.tolist())
+        if scores is not None and scores.dim() == 2:
+            scores = scores[0]  # per-batch bank: probe is single-stream (B=1)
+        kept = set(orig_idx[0].tolist())
         plen = scores.shape[-1] if scores is not None else prompt_len
         line = f"[layer {idx:2d}] kept_len={orig_idx.numel():4d} | span:"
         for p in span_orig:
