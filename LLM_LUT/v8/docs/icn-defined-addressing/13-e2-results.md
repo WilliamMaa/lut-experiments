@@ -153,3 +153,20 @@ trace 目录：`results/icn_proto/traces/cell_<wl>_s2_<b3|ours>_r<rep>/`
    STALL_S 收紧）已于 2026-09-27 实现，见 runbook §7d，含验证
    步骤；验证通过后此格的重跑价值另行评估；
 3. §5a（b3@s0 四格）未跑：补齐后 P1/P3 获得虚空落点对照。
+
+## 5. 行 7 PIT 判文（2026-09-28；判文主体与机制细节见 15 号 §8）
+
+闭链同前缀风暴 regime：**Interest aggregation 成立**。
+
+- 配置：闭链 s16 t3 share2 q40，{b3, ours} × pit on/off，rep=3。
+- 兑现：pit=on 各格 served 41-47/64 turns 由 compute merge 服务，
+  saved_tok 16.6-19 万（上界口径：park 事件 × cum_tokens，非去重
+  token 数），fetch merge 2 次/格，failed=0，b3 质量面（hit/new_tok）
+  与 pit=off 逐位一致；ours 的 new_tok 被 pit 从 9296 拉回 b3 水平
+  4810（放置控制引起的迁移重算被聚合 resume 吸收）。
+- 边界：open-loop（poisson 到达 + think time 错开）机会量 ≈0，
+  判否——**PIT 的价值由"共享度 × 并发度"的 regime 决定**：风暴
+  成立，错开无价值。
+- 过程事故：事故五（组播空 payload → worker 崩溃连环，已修）、
+  事故六（ours 稀有超时竞态，死锁 backstop 已入码，开放）——
+  均见 12 号，不影响判文。
