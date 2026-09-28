@@ -157,64 +157,43 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
         [input_ids.shape[1] - r for r in real_lens], device=device,
     ).unsqueeze(1)  # [B, 1] left-pad count per session
 
-    def decode_mask(step):
-        """Mask for this decode step, in POST-update slot space.
+    # Decode masks are derived HARNESS-SIDE, never from cache internals:
+    # out.past_key_values may be a rewrapped object whose reported content
+    # length and custom attributes do not reflect the compressed state
+    # (measured 2026-09-17: the model extended a 128-slot mask to the full
+    # 31127-slot prefill length via the cache's own get_seq_length). The only
+    # facts needed here are all harness-known:
+    #   - eviction triggers iff content + 1 > budget, and after an evicting
+    #     update the layout is ALWAYS sink|hh|recent — pads can only survive
+    #     in the sink region (zero-mass pads are never selected into hh at
+    #     real context lengths; the B=1-vs-batched selftest guards it), so
+    #     the mask is constant across all evicting steps.
+    budget = patch.max_cache_len if patch is not None else None
+    sink_n = patch.sink_tokens if patch is not None else 0
+    content = input_ids.shape[1]  # post-prefill cache content length
 
-        transformers passes a provided mask's kv dim straight to sdpa, so the
-        length must equal the key length update() will return this step:
-          - full config: cache grows unbounded -> prefill mask + one 1 per
-            consumed decode token (pads stay 0).
-          - compressed config: validity must follow the cache's own
-            slot -> original-position map (_hh_orig_idx), because eviction
-            drops slots. Steady state: exact per-slot validity. First decode
-            step (eviction happens inside this update, content is still the
-            uncompressed prefill): post-update layout is sink|hh|recent, and
-            only the sink region can hold left-pad slots (zero-mass pads are
-            never selected into hh in practice; the B=1-vs-batched selftest
-            guards this).
-        """
+    def decode_mask(step):
+        nonlocal content
         if patch is None:
+            # Full cache grows unbounded; pads stay masked via attn_mask.
             return torch.cat(
                 [attn_mask, torch.ones(B, step + 1, dtype=torch.long, device=device)],
                 dim=1,
             )
-        oi = None
-        for layer in past.layers:
-            oi = getattr(layer, "_hh_orig_idx", None)
-            if oi is not None:
-                break
-        budget = patch.max_cache_len
-        if oi is not None:
-            oi = oi.to(device)  # layers may sit on other GPUs under device_map
-        if oi is None and input_ids.shape[1] + 1 <= budget:
-            # Tiny prefill, no eviction at this step: prefill mask + new token.
-            return torch.cat(
-                [attn_mask, torch.ones(B, 1, dtype=torch.long, device=device)], dim=1,
-            )
-        if oi is not None and oi.shape[1] < budget:
-            # Content fits after appending: content validity + the new token.
-            return torch.cat(
-                [(oi >= pad_t).long(), torch.ones(B, 1, dtype=torch.long, device=device)],
-                dim=1,
-            )
-        if oi is not None and oi.shape[1] == budget:
-            # Steady state: eviction trims back to exactly the current length,
-            # so pre-update slot validity is exact for the post-update slots
-            # (only the recent-window tail shifts, and those slots are valid).
-            return (oi >= pad_t).long()
-        # Remaining cases: (a) oi is None with an over-budget prefill, or
-        # (b) oi longer than budget (uncompressed content) — both mean the
-        # FIRST decode step, with eviction happening inside this update.
-        # _hh_orig_idx may not exist yet (it is written by the evicting
-        # update itself; the single-stream probe only reads it after
-        # generation, which is why batch=1 never surfaced this). Post-update
-        # layout is sink|hh|recent; only the sink region can hold left-pad
-        # slots (zero-mass pads are never selected into hh at real context
-        # lengths; the B=1-vs-batched selftest guards this corner).
-        ar = torch.arange(budget, device=device).unsqueeze(0).expand(B, budget)
-        m = (ar >= pad_t).long()
-        m[:, patch.sink_tokens:] = 1
-        return m
+        if content + 1 > budget:
+            # Evicting update: post-update layout is sink|hh|recent(budget).
+            content = budget
+            ar = torch.arange(budget, device=device).unsqueeze(0).expand(B, budget)
+            m = (ar >= pad_t).long()
+            m[:, sink_n:] = 1
+            return m
+        # No eviction yet (tiny prefill): uncompressed content, orig ==
+        # arange(content), so the prefill mask + ones is exact.
+        content += 1
+        return torch.cat(
+            [attn_mask, torch.ones(B, step + 1, dtype=torch.long, device=device)],
+            dim=1,
+        )
 
     for step in range(max_new_tokens - 1):
         if bool(finished.all()):
@@ -472,24 +451,29 @@ def selftest(model_path, data_file, device_map, torch_dtype, docs=4, turns=2, ma
     model_config = model.config
     patch = build_patch("hh_merge_m4")
     sessions = load_sessions(data_file, docs, turns)
+    patch.install(model)  # without this the score bank stays empty and the
+    # cache silently falls back to key-norm (loud [WARN], plen=-1 in the
+    # eviction log) — the selftest would compare two key-norm runs.
+    try:
+        def answers_for(batch_sessions):
+            res = []
+            histories = [[] for _ in batch_sessions]
+            for t in range(turns):
+                msgs = [build_turn_messages(s["document"], s["questions"], t, histories[i])
+                        for i, s in enumerate(batch_sessions)]
+                records, _ = run_batched_turn(model, tokenizer, patch, device, msgs,
+                                              max_new_tokens, model_config)
+                for i, r in enumerate(records):
+                    histories[i].append(r["output"])
+                    res.append(r["output"])
+            return res
 
-    def answers_for(batch_sessions):
-        res = []
-        histories = [[] for _ in batch_sessions]
-        for t in range(turns):
-            msgs = [build_turn_messages(s["document"], s["questions"], t, histories[i])
-                    for i, s in enumerate(batch_sessions)]
-            records, _ = run_batched_turn(model, tokenizer, patch, device, msgs,
-                                          max_new_tokens, model_config)
-            for i, r in enumerate(records):
-                histories[i].append(r["output"])
-                res.append(r["output"])
-        return res
-
-    a_seq = []
-    for s in sessions:
-        a_seq.extend(answers_for([s]))
-    a_bat = answers_for(sessions)
+        a_seq = []
+        for s in sessions:
+            a_seq.extend(answers_for([s]))
+        a_bat = answers_for(sessions)
+    finally:
+        patch.uninstall(model)
     mismatches = sum(1 for x, y in zip(a_seq, a_bat) if x != y)
     if mismatches:
         for i, (x, y) in enumerate(zip(a_seq, a_bat)):

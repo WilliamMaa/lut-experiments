@@ -47,10 +47,12 @@ pad、mask 隔离、首个 EOS 截断）。
 - 负载是**合成文档**：记录块（多位数事实，考验 M4）+ 无数字 filler（可压缩噪声），
   区域每文档唯一保证问题无歧义，gt 生成时校验必在文档内。
 - decode 步的 attention mask 必须建在**压缩后 slot 空间**：transformers 会把传入
-  mask 的 kv 维直接交给 sdpa，长度必须等于 update 返回的 key 数。harness 按
-  `_hh_orig_idx`（slot→原始位置映射）构建 mask——稳态逐 slot 精确，首个 decode 步
-  （淘汰发生在 update 内）按 sink|hh|recent 布局推导，仅 sink 区可能含 left-pad
-  （hh 选入 pad 的极端角落由 B=1-vs-batched selftest 实证兜底）。单流 batch=1
+  mask 与 cache 自己报告的 `get_seq_length()` 对齐（实测：传 128-slot mask 被扩展回
+  全量 prefill 长度），长度不符直接炸 sdpa。harness **不读 cache 内部状态**（
+  `out.past_key_values` 可能被重包装，自定义属性不可靠），纯 harness 侧推导：淘汰后
+  布局恒为 sink|hh|recent，pad 只可能存活于 sink 区，故压缩配置的 mask 是常量
+  `arange(128) ≥ pad_len`（sink 后强制 1）；未淘汰的小 prefill 用 prefill mask +
+  补 1。hh 选入 pad 的极端角落由 B=1-vs-batched selftest 实证兜底。单流 batch=1
   评测从未暴露此问题：无 pad 时 mask=None 走 is_causal，根本不经过 4D mask。
 
 ## 运行步骤（按顺序，每步过再进下一步）
