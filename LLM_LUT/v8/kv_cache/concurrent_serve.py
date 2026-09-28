@@ -123,7 +123,10 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
     input_ids, attn_mask, real_lens = left_pad(seqs, pad_id, device)
     B = input_ids.shape[0]
 
-    cache = patch.get_cache(device, config=model_config) if patch is not None else None
+    # NOTE: always thread the cache through out.past_key_values. Transformers
+    # may convert/rewrap the object during a forward (legacy->new format),
+    # so the returned instance — not the one we passed in — carries the state.
+    past = patch.get_cache(device, config=model_config) if patch is not None else None
 
     def sync():
         if device.type == "cuda":
@@ -134,8 +137,9 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
     t0 = time.perf_counter()
     with torch.no_grad():
         out = model(input_ids=input_ids, attention_mask=attn_mask,
-                    past_key_values=cache, use_cache=True)
+                    past_key_values=past, use_cache=True)
         next_ids = out.logits[:, -1, :].argmax(dim=-1)  # [B]
+        past = out.past_key_values
     sync()
     ttft = time.perf_counter() - t0
 
@@ -175,10 +179,16 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
                 dim=1,
             )
         oi = None
-        for layer in cache.layers:
+        for layer in past.layers:
             oi = getattr(layer, "_hh_orig_idx", None)
             if oi is not None:
                 break
+        if oi is None:
+            raise RuntimeError(
+                "[serve] no _hh_orig_idx on any cache layer after prefill; "
+                "the cache object returned by the model does not look like a "
+                "HeavyHitterCache — check past_key_values threading."
+            )
         oi = oi.to(device)  # layers may sit on other GPUs under device_map
         budget = patch.max_cache_len
         if oi.shape[1] + 1 <= budget:
@@ -207,8 +217,9 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
         ts = time.perf_counter()
         with torch.no_grad():
             out = model(input_ids=feed, attention_mask=cur_mask,
-                        past_key_values=cache, use_cache=True)
+                        past_key_values=past, use_cache=True)
             nxt = out.logits[:, -1, :].argmax(dim=-1)
+            past = out.past_key_values
         sync()
         step_times.append(time.perf_counter() - ts)
         n_steps += 1
