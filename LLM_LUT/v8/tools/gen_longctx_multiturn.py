@@ -28,7 +28,7 @@ the JSONL means AND (all strings must appear).
 
 Length calibration: with --tokenizer_path the document is tokenized and
 filler is added/removed until the token count is within --tol of
---target_tokens. Without a tokenizer, --chars-per-token (default 1.6 for
+--target_tokens. Without a tokenizer, --chars-per-token (default 1.67 for
 Chinese Qwen BPE) gives a rough char target; run with the tokenizer on the
 remote machine for exact calibration.
 
@@ -179,18 +179,23 @@ def build_document(rng, target_tokens, tokenizer, tol, chars_per_token, year, qu
 
     # Exact token calibration when a tokenizer is available. Overshoot from
     # the last filler append is a few hundred tokens (<1% at 32k); nudge with
-    # single filler add/remove until within tolerance.
+    # filler add/remove until within tolerance. Appends are batched by the
+    # estimated deficit — one filler per iteration would need hundreds of
+    # iterations at 128k (measured 2026-09-17: 20 single-appends fell 5-10%
+    # short on all three tiers).
     if tokenizer is not None:
         def ntokens(text):
             return len(tokenizer(text, add_special_tokens=False).input_ids)
 
-        for _ in range(20):
+        for _ in range(10):
             t = ntokens(doc)
             if target_tokens * (1 - tol) <= t <= target_tokens * (1 + tol):
                 break
             if t < target_tokens * (1 - tol):
-                extra = make_filler(rng)
-                doc = doc + "\n\n" + extra
+                deficit_chars = (target_tokens - t) * chars_per_token
+                n_add = max(1, min(500, int(deficit_chars / 200) + 1))
+                doc = doc + "\n\n" + "\n\n".join(
+                    make_filler(rng) for _ in range(n_add))
             else:
                 # Drop the last filler paragraph (keeps all records intact).
                 head, sep, _ = doc.rpartition("\n\n")
@@ -244,7 +249,7 @@ def main():
     parser.add_argument("--seed", type=int, default=20260917)
     parser.add_argument("--tokenizer-path", default=None,
                         help="Qwen tokenizer for exact token calibration (recommended)")
-    parser.add_argument("--chars-per-token", type=float, default=1.6,
+    parser.add_argument("--chars-per-token", type=float, default=1.67,
                         help="fallback Chinese chars/token ratio when no tokenizer")
     parser.add_argument("--tol", type=float, default=0.02)
     parser.add_argument("--out", required=True)
