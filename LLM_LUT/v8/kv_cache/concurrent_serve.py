@@ -135,14 +135,53 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
     # ---- prefill ----
     sync()
     t0 = time.perf_counter()
+    S = input_ids.shape[1]
+    model_dtype = next(model.parameters()).dtype
+    # Chunked prefill for large B*S: a padded batch prefill makes HF build a
+    # [B,1,S,S] causal mask (N=8/32k -> 15.5GB, N=64 -> 124GB) plus full-seq
+    # activations, OOMing long before KV capacity becomes the constraint.
+    # The cache already defers eviction to the first decode step (prefill
+    # only appends), so chunking preserves eviction semantics: the last
+    # chunk's stash still sees q=last-64-rows x K=full-length, identical to
+    # the single-shot snapshot. Gated OFF the verified paths: B*S <= 131072
+    # keeps the B=1 regression and the B=4 selftest on the exact single-shot
+    # forward they were validated on.
+    chunk = max(512, min(8192, 2_000_000_000 // max(B * S, 1)))
+    use_chunk = B * S > 131_072 and chunk < S
     with torch.no_grad():
-        # logits_to_keep=1: full-seq logits would be B*len*vocab*2B
-        # (4*31128*262144*2 ~= 65 GiB for Qwen3.6 — OOM'd an 80GB card);
-        # only the last position is needed to seed decode.
-        out = model(input_ids=input_ids, attention_mask=attn_mask,
-                    past_key_values=past, use_cache=True, logits_to_keep=1)
-        next_ids = out.logits[:, -1, :].argmax(dim=-1)  # [B]
-        past = out.past_key_values
+        if not use_chunk:
+            # logits_to_keep=1: full-seq logits would be B*len*vocab*2B
+            # (4*31128*262144*2 ~= 65 GiB for Qwen3.6 — OOM'd an 80GB card);
+            # only the last position is needed to seed decode.
+            out = model(input_ids=input_ids, attention_mask=attn_mask,
+                        past_key_values=past, use_cache=True, logits_to_keep=1)
+            next_ids = out.logits[:, -1, :].argmax(dim=-1)  # [B]
+            past = out.past_key_values
+        else:
+            # Ready-made 4D additive masks per chunk: causal within the chunk
+            # AND original pads invisible everywhere (they sit at the sequence
+            # start, i.e. in chunk 0 / the past) — the same visibility the
+            # single-shot 2D->4D expansion produces, but O(B*chunk*S) not
+            # O(B*S^2).
+            next_ids = None
+            k_so_far = 0
+            for start in range(0, S, chunk):
+                cur = input_ids[:, start:start + chunk]
+                m = cur.shape[1]
+                k_total = k_so_far + m
+                rows = (start + torch.arange(m, device=device))[:, None]
+                cols = torch.arange(k_total, device=device)[None, :]
+                visible = (cols <= rows)[None] & attn_mask[:, :k_total].bool()[:, None, :]
+                m4 = torch.zeros(B, 1, m, k_total,
+                                 dtype=model_dtype, device=device)
+                m4.masked_fill_(~visible[:, None, :, :],
+                                torch.finfo(model_dtype).min)
+                out = model(input_ids=cur, attention_mask=m4,
+                            past_key_values=past, use_cache=True,
+                            logits_to_keep=1)
+                past = out.past_key_values
+                k_so_far = k_total
+            next_ids = out.logits[:, -1, :].argmax(dim=-1)  # [B]
     sync()
     ttft = time.perf_counter() - t0
 
@@ -159,7 +198,6 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
     pad_counts = [input_ids.shape[1] - r for r in real_lens]
     pad_t = torch.tensor(pad_counts, device=device).unsqueeze(1)  # [B, 1]
     has_pads = any(p > 0 for p in pad_counts)
-    model_dtype = next(model.parameters()).dtype
 
     # Decode masks are derived HARNESS-SIDE, never from cache internals:
     # out.past_key_values may be a rewrapped object whose reported content

@@ -83,29 +83,41 @@ def _stash(module, query, key, value, attention_mask, scaling):
     k_len = key.shape[-2]
     if scaling is None:
         scaling = query.shape[-1] ** -0.5
-    q = query[..., -w:, :].detach().float()
-    k = key.detach().float()
-    n_rep = q.shape[1] // k.shape[1]
-    if n_rep > 1:
-        k = k.repeat_interleave(n_rep, dim=1)
-    scores = torch.matmul(q, k.transpose(-1, -2)) * scaling  # [B, H, W, K]
+    q = query[..., -w:, :].detach().float()      # [B, H, W, D]
+    k = key.detach().float()                     # [B, H_kv, K, D]
+    B, H, _, _ = q.shape
+    H_kv = k.shape[1]
+    n_rep = H // H_kv
+
+    # Per-q-head accumulation: the naive repeat_interleave + full softmax
+    # materializes B*H*W*K fp32 TWICE (scores + probs) — >100GB at N=64/128k,
+    # OOMing before eviction ever runs. Looping heads keeps only [B, W, K]
+    # fp32 alive at a time (~1-2GB). Sum order over heads differs from a
+    # single tensor sum only by float associativity.
+    total = torch.zeros(B, k_len, device=q.device, dtype=torch.float32)
+    per_head = torch.zeros(B, H_kv, k_len, device=q.device, dtype=torch.float32)
     if torch.is_tensor(attention_mask):
         if attention_mask.dtype == torch.bool:
-            keep = attention_mask[..., -w:, :k_len].bool()
-            scores = scores.masked_fill(~keep, torch.finfo(scores.dtype).min)
+            keep = attention_mask[..., -w:, :k_len].bool()      # [B, W, K]
+            add = None
         else:
-            scores = scores + attention_mask[..., -w:, :k_len].float()
+            keep = None
+            add = attention_mask[..., -w:, :k_len].float()      # [B, W, K]
     else:
-        scores = scores + _causal_rows(w, k_len, scores.device, scores.dtype)[None, None]
-    probs = torch.softmax(scores, dim=-1)
-    bank.scores[layer_idx] = probs.sum(dim=(1, 2))  # [B, K] float32
-    n_kv = key.shape[1]
-    if probs.shape[1] % n_kv == 0:
-        # Per-kv-head mass: group the q-heads each kv-head serves (the sdpa
-        # GQA repeat_interleave layout) so merge weights are per-head.
-        bank.scores_per_head[layer_idx] = probs.reshape(
-            probs.shape[0], n_kv, -1, w, k_len,
-        ).sum(dim=(2, 3)).float()  # [B, H_kv, K]
+        keep = None
+        add = _causal_rows(w, k_len, q.device, torch.float32)[None]
+    for h in range(H):
+        s = torch.matmul(q[:, h], k[:, h // n_rep].transpose(-1, -2)) * scaling
+        if keep is not None:
+            s = s.masked_fill(~keep, torch.finfo(s.dtype).min)
+        elif add is not None:
+            s = s + add
+        p = torch.softmax(s, dim=-1)     # [B, W, K], freed before next head
+        total += p.sum(dim=1)            # [B, K]
+        per_head[:, h // n_rep] += p.sum(dim=1)
+        del s, p
+    bank.scores[layer_idx] = total
+    bank.scores_per_head[layer_idx] = per_head
 
 
 def _sdpa_stash(module, query, key, value, attention_mask, dropout=0.0,

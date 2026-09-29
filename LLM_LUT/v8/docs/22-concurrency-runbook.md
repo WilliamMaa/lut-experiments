@@ -178,7 +178,7 @@ python tools/analyze_result.py results/heavy_hitter/heavy_hitter_attn_l128_s4_r3
 **测什么**：正式矩阵前，用一个 cell 验证 harness 端到端产出全部 6 项指标且数值合理。
 
 ```bash
-CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/concurrent_serve.py \
+CUDA_LAUNCH_BLOCKING=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python -u kv_cache/concurrent_serve.py \
   --model_path /home/u/downloads/models/Qwen3.6-35B-A3B \
   --data_file data/longctx_multi_turn_32768.jsonl \
   --configs m4_k8v8 --concurrency-list 8 --turns 2 --max-new-tokens 64 \
