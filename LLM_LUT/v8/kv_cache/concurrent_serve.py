@@ -598,17 +598,19 @@ def main():
                         baseline_eos[N] - args.eos_tolerance_pp / 100.0
                     )
                 record["sustainable"] = bool(sustainable)
-            except torch.cuda.OutOfMemoryError:
+            except torch.cuda.OutOfMemoryError as e:
                 torch.cuda.empty_cache()
                 record["status"] = "oom"
+                record["error"] = str(e)  # "Tried to allocate ... GiB. GPU x ..."
                 record["sustainable"] = False
-                print(f"[serve]   N={N}: OOM")
+                print(f"[serve]   N={N}: OOM\n{e}")
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     torch.cuda.empty_cache()
                     record["status"] = "oom"
+                    record["error"] = str(e)
                     record["sustainable"] = False
-                    print(f"[serve]   N={N}: OOM")
+                    print(f"[serve]   N={N}: OOM\n{e}")
                 else:
                     raise
             else:

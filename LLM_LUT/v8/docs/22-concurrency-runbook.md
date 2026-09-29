@@ -154,14 +154,14 @@ CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/eval_kv_cache.py \
   --max_eval_samples 8 --max_new_tokens 128 --max_length 4096 \
   --device_map balanced_low_0 --torch_dtype bfloat16 --logit_metrics \
   --output_json results/heavy_hitter_attn_l128_s4_r32_w64_m_sp4_det_regress.json \
-  > heavy_hitter_attn_l128_m_sp4_det_regress.log 2>&1 &
+  > logs/heavy_hitter_attn_l128_m_sp4_det_regress.log 2>&1 &
 ```
 
 **判定**（与 docs/19 定型档案对比）：
 
 ```bash
-python tools/analyze_result.py results/heavy_hitter_attn_l128_s4_r32_w64_m_sp4_det_regress.json \
-  --compare results/heavy_hitter_attn_l128_s4_r32_w64_m_sp4_det_multiturn_v3set.json
+python tools/analyze_result.py results/heavy_hitter/heavy_hitter_attn_l128_s4_r32_w64_m_sp4_det_regress.json \
+  --compare results/heavy_hitter/heavy_hitter_attn_l128_s4_r32_w64_m_sp4_det_multiturn_v3set.json
 ```
 
 - EOS 0.8113207547、repetition 0.038、decode KL ≈ 0.519；
