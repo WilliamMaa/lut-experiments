@@ -621,17 +621,20 @@ def main():
             if cell_file.exists():
                 # Resume: keep completed cells (a crashed matrix run restarts
                 # from the first missing cell). Reload full-config EOS so the
-                # sustainability rule still has its baseline.
-                print(f"[serve]   N={N}: cell exists, skip")
+                # sustainability rule still has its baseline. cuda_error cells
+                # are NOT final — retry them (they may be transient).
                 try:
                     with open(cell_file, "r", encoding="utf-8") as f:
                         old = json.load(f)
+                except (OSError, json.JSONDecodeError):
+                    old = None
+                if old is not None and old.get("status") != "cuda_error":
+                    print(f"[serve]   N={N}: cell exists ({old.get('status')}), skip")
                     if name == "full" and old.get("status") == "ok":
                         baseline_eos[N] = old["eos_success_rate"]
                     summary.append(old)
-                except (OSError, json.JSONDecodeError):
-                    pass
-                continue
+                    continue
+                print(f"[serve]   N={N}: previous CUDA error, retrying")
             record = {
                 "config": name,
                 "concurrency": N,
@@ -663,15 +666,22 @@ def main():
                 print(f"[serve]   N={N}: OOM\n{e}")
             except RuntimeError as e:
                 if "unspecified launch failure" in str(e) or "CUDA error" in str(e):
-                    # Transient async device fault (memory wall, neighbor XID):
-                    # record the cell and keep sweeping — if the context is
-                    # poisoned the next cells fail fast and the resume logic
-                    # picks up from there.
-                    torch.cuda.empty_cache()
+                    # Transient async device fault. The CUDA context is
+                    # usually poisoned — ANY further cuda call (including
+                    # empty_cache) raises — so record the cell and exit
+                    # cleanly; the resume logic retries on a fresh process.
                     record["status"] = "cuda_error"
                     record["error"] = str(e)
                     record["sustainable"] = False
-                    print(f"[serve]   N={N}: CUDA error\n{e}")
+                    try:
+                        with open(cell_file, "w", encoding="utf-8") as f:
+                            json.dump(record, f, ensure_ascii=False, indent=2)
+                    except OSError:
+                        pass
+                    print(f"[serve]   N={N}: CUDA error (context poisoned) — "
+                          f"cell recorded, exiting; rerun the same command to "
+                          f"resume from here\n{e}")
+                    sys.exit(1)
                 elif "out of memory" in str(e).lower():
                     torch.cuda.empty_cache()
                     record["status"] = "oom"
