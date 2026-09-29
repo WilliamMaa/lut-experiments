@@ -613,6 +613,20 @@ def main():
         for N in concurrencies:
             sessions = load_sessions(args.data_file, N, args.turns)
             cell_file = out_dir / f"{name}_n{N}.json"
+            if cell_file.exists():
+                # Resume: keep completed cells (a crashed matrix run restarts
+                # from the first missing cell). Reload full-config EOS so the
+                # sustainability rule still has its baseline.
+                print(f"[serve]   N={N}: cell exists, skip")
+                try:
+                    with open(cell_file, "r", encoding="utf-8") as f:
+                        old = json.load(f)
+                    if name == "full" and old.get("status") == "ok":
+                        baseline_eos[N] = old["eos_success_rate"]
+                    summary.append(old)
+                except (OSError, json.JSONDecodeError):
+                    pass
+                continue
             record = {
                 "config": name,
                 "concurrency": N,
