@@ -121,9 +121,16 @@ def _stash(module, query, key, value, attention_mask, scaling):
         elif add is not None:
             s = s + add
         p = torch.softmax(s, dim=-1)     # [B, W, K], freed before next head
-        total += p.sum(dim=1)            # [B, K]
-        per_head[:, h // n_rep] += p.sum(dim=1)
-        del s, p
+        ph = p.sum(dim=1)                # [B, K]
+        if ph.shape != total.shape:
+            print(f"[attn_scores] SKIP layer {layer_idx}: shape mismatch "
+                  f"query{tuple(query.shape)} key{tuple(key.shape)} w={w} "
+                  f"k_len={k_len} B={B} H={H} H_kv={H_kv} "
+                  f"total{tuple(total.shape)} ph{tuple(ph.shape)}")
+            return
+        total += ph                      # [B, K]
+        per_head[:, h // n_rep] += ph
+        del s, p, ph
     bank.scores[layer_idx] = total
     bank.scores_per_head[layer_idx] = per_head
 
