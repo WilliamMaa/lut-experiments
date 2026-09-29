@@ -203,10 +203,11 @@ CUDA_LAUNCH_BLOCKING=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup py
 **测什么**：step 1 表格里的全部 cell。每个 cell 独立 JSON，**重跑同配置同 N 即
 覆盖续跑**，中断后从缺的 cell 继续即可。
 
-32k 主档（25 cell，全 ladder × N∈{1,8,16,32,64}）：
+32k 主档（25 cell，全 ladder × N∈{1,8,16,32,64}）——**以这条为准**（auto-pick
+自动剔除被邻居霸占的卡；`PYTHONUNBUFFERED` 让 log 实时；`-u`/buffered 二选一）：
 
 ```bash
-CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/concurrent_serve.py \
+PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python kv_cache/concurrent_serve.py \
   --model_path /home/u/downloads/models/Qwen3.6-35B-A3B \
   --data_file data/longctx_multi_turn_32768.jsonl \
   --configs full,hh,hh_merge,hh_merge_m4,m4_k8v8 \
@@ -215,35 +216,43 @@ CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/concurrent_serve.py \
   --kv-budget-gb 512 \
   --device_map balanced_low_0 --torch_dtype bfloat16 \
   --output-dir results/concurrency \
-  > serve_32k_matrix.log 2>&1 &
-
-PYTHONBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python kv_cache/concurrent_serve.py --model_path /home/u/downloads/models/Qwen3.6-35B-A3B --data_file data/longctx_turn_32768.jsonl --configs full,hh,hh_merge,hh_merge_m4,m4_k8v8 --concurrency-list 1,8,16,32,64 --turns 8 --output-dir results/concurrency > logs/concurrency_32k.log 2>&1 &
+  > logs/concurrency_32k.log 2>&1 &
 ```
 
-64k / 128k 两端对比（full vs m4_k8v8，各 4 cell）：
+64k / 128k 两端对比（full vs m4_k8v8；64k 全 ladder，128k 预计 full 在 mid-N
+即 OOM 可砍到 1,8,16）：
 
 ```bash
 for T in 65536 131072; do
-  CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/concurrent_serve.py \
+  PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python kv_cache/concurrent_serve.py \
     --model_path /home/u/downloads/models/Qwen3.6-35B-A3B \
     --data_file data/longctx_multi_turn_${T}.jsonl \
-    --configs full,m4_k8v8 --concurrency-list 8,32 \
-    --turns 4 --max-new-tokens 128 \
+    --configs full,m4_k8v8 --concurrency-list 1,8,16,32,64 \
+    --turns 8 --max-new-tokens 128 \
+    --kv-budget-gb 512 \
     --device_map balanced_low_0 --torch_dtype bfloat16 \
     --output-dir results/concurrency_${T} \
-    > serve_${T}.log 2>&1 &
+    > logs/concurrency_${T}.log 2>&1 &
 done
 ```
 
-**运行中监控**：
+**断点续跑语义**（2026-09-30 版 harness）：已有 cell JSON 且 `status: ok/oom` →
+skip；`status: cuda_error` → 重试。**OOM/cuda_error 的 cell 若记录在被共享
+邻居污染期间，删掉对应 JSON 再重启**（否则会被 skip 掉，拿不到干净判决）。
+
+**运行中监控**（nohup 下 log 已实时，无需看缓冲 tricks）：
 
 ```bash
-tail -f serve_32k_matrix.log    # 每 cell 完成会打一行 TTFT/TPOT/tok/s/HBM/EOS/fact
-ls results/concurrency/         # *_n*.json 逐个出现
+tail -f logs/concurrency_32k.log    # 每 cell 完成打一行 TTFT/TPOT/tok/s/HBM/EOS/fact
+ls results/concurrency/             # *_n*.json 逐个出现
+grep auto-selected logs/concurrency_32k.log   # 确认选卡剔除了邻居卡
 ```
 
-**判定**：`full` 的 HBM 随 N 近似线性（128k 档每路 ~2.6GB）；压缩配置 HBM 平线、
-TPOT 不随 N 恶化；任何 cell 的 `status: oom` 本身是有效数据点（记录，继续）。
+**判定**（32k 实测修正版，详见 docs/21 结果节）：full 的 TPOT 随 N 恶化
+~10×（32k KV 注意力），压缩配置仅 ~1.45×（128 slot）；**峰值 HBM 压缩配置
+反超 full**（prefill 期间 KV 无约束增长，128-slot 红利只在 decode 后兑现）；
+fact/EOS 无 N 趋势（并发不降解质量）。任何 cell 的 `status: oom` 本身是有效
+数据点（记录，继续）。
 
 **时间不够时的砍单顺序**（保留结论价值）：先砍 128k → 再砍 64k → 32k 矩阵至少保
 N∈{1,16,64} × 5 配置。**不要**砍 step 0-3 验证门。
@@ -271,7 +280,8 @@ python tools/analyze_concurrency.py results/concurrency --markdown > results/con
 | `--cache-selftest` mismatch | 停止；带 `b=` 编号与 k/v bits 回报，批化形状 bug |
 | `--selftest` MISMATCH | 看打印的 seq/bat 对照；事实题分叉=停止，开放题分叉=记录后继续 |
 | step 3 聚合指标不符 | 停止；`_position_scores`/`_fold_evicted_values` 批化回归 |
-| cell `status: oom` | 数据点，勿重试同档；降 N 补一个 cell |
+| cell `status: oom` | 数据点，勿重试同档；降 N 补一个 cell。**但若 OOM 时 log 里出现某邻居 PID 占了 ~20GB，先删该 cell JSON 再重启**（auto-pick 会换卡重跑，否则被 skip） |
+| `CUDA error: unspecified launch failure` | 多为内存墙异步爆发或邻居 XID；cell 记 `cuda_error` 后进程干净退出，**直接重跑同命令**（resume 自动重试该 cell）；第三次在同一 cell 复现才用 `compute-sanitizer` |
 | CUDA device-side assert | `CUDA_LAUNCH_BLOCKING=1` 重跑同一命令拿真实栈 |
 | fact accuracy 全 ~0 | 查负载（`data_file` 对不对、questions/answers 是否错位），不是模型问题 |
 | 想改判定阈值 | `--kv-budget-gb` / `--eos-tolerance-pp`，改完重跑受影响 cell 并注明 |
