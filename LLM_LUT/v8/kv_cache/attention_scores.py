@@ -105,12 +105,15 @@ def _stash(module, query, key, value, attention_mask, scaling):
     total = torch.zeros(B, k_len, device=q.device, dtype=torch.float32)
     per_head = torch.zeros(B, H_kv, k_len, device=q.device, dtype=torch.float32)
     if torch.is_tensor(attention_mask):
+        # A 4-D additive mask keeps its singleton head dim [B,1,W,K]; squeeze
+        # it — broadcasting [B,W,K] scores against [B,1,W,K] right-aligns to
+        # [1,B,W,K] and silently expands s to [B,B,W,K] (the 8-vs-64 crash).
         if attention_mask.dtype == torch.bool:
-            keep = attention_mask[..., -w:, :k_len].bool()      # [B, W, K]
+            keep = attention_mask[..., -w:, :k_len].bool().squeeze(1)  # [B, W, K]
             add = None
         else:
             keep = None
-            add = attention_mask[..., -w:, :k_len].float()      # [B, W, K]
+            add = attention_mask[..., -w:, :k_len].float().squeeze(1)  # [B, W, K]
     else:
         keep = None
         add = _causal_rows(w, k_len, q.device, torch.float32)[None]
