@@ -136,8 +136,11 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
     sync()
     t0 = time.perf_counter()
     with torch.no_grad():
+        # logits_to_keep=1: full-seq logits would be B*len*vocab*2B
+        # (4*31128*262144*2 ~= 65 GiB for Qwen3.6 — OOM'd an 80GB card);
+        # only the last position is needed to seed decode.
         out = model(input_ids=input_ids, attention_mask=attn_mask,
-                    past_key_values=past, use_cache=True)
+                    past_key_values=past, use_cache=True, logits_to_keep=1)
         next_ids = out.logits[:, -1, :].argmax(dim=-1)  # [B]
         past = out.past_key_values
     sync()
