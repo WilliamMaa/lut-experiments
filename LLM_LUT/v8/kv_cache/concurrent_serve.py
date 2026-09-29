@@ -33,6 +33,7 @@ import argparse
 import json
 import os
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -562,6 +563,47 @@ def selftest(model_path, data_file, device_map, torch_dtype, docs=4, turns=2, ma
 # Main benchmark
 # --------------------------------------------------------------------------
 
+def _auto_pick_gpus():
+    """Rank GPUs by free HBM and keep the emptiest ones.
+
+    This machine is shared: a single fat neighbor process (20GB) has been
+    sitting on one GPU all day and every N>=32 cell OOM'd on exactly that
+    card (79GB nominal minus 20GB neighbor = ~59GB usable). Picking cards by
+    ACTUAL free memory instead of assuming 8 empty cards moves the whole
+    ladder past that wall with zero manual diagnosis. No-op if the user
+    already pinned CUDA_VISIBLE_DEVICES. Must run before any CUDA init.
+    """
+    if os.environ.get("CUDA_VISIBLE_DEVICES"):
+        print(f"[serve] CUDA_VISIBLE_DEVICES already set "
+              f"({os.environ['CUDA_VISIBLE_DEVICES']}), keeping it")
+        return
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,memory.free",
+             "--format=csv,nounits,noheader"],
+            capture_output=True, text=True, timeout=15).stdout
+        rows = []
+        for line in out.strip().splitlines():
+            idx, free = line.split(",")
+            rows.append((int(free.strip()), int(idx.strip())))
+        if not rows:
+            return
+        rows.sort(reverse=True)
+        # Keep cards within 15% of the freest one — a card hosting a fat
+        # neighbor falls below the cut. Fall back to the top 5 if the
+        # cluster is so busy fewer qualify (model needs ~6 cards at 9GB
+        # each; 5 leaves ~14GB/card, still fits).
+        threshold = 0.85 * rows[0][0]
+        picked = [str(i) for f, i in rows if f >= threshold]
+        if len(picked) < 5:
+            picked = [str(i) for _, i in rows[:5]]
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(picked)
+        print(f"[serve] auto-selected GPUs by free HBM: {picked} "
+              f"(free MB: {[f for f, _ in rows[:len(picked)]]})")
+    except Exception as e:  # never block the run on diagnostics
+        print(f"[serve] GPU auto-select failed ({e}); using default visibility")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -584,6 +626,8 @@ def main():
     parser.add_argument("--selftest", action="store_true",
                         help="GPU sequential-vs-batched answer parity test, then exit")
     args = parser.parse_args()
+
+    _auto_pick_gpus()
 
     if args.cache_selftest:
         cache_selftest()

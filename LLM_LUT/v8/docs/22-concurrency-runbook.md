@@ -216,6 +216,8 @@ CUDA_LAUNCH_BLOCKING=1 nohup python -u kv_cache/concurrent_serve.py \
   --device_map balanced_low_0 --torch_dtype bfloat16 \
   --output-dir results/concurrency \
   > serve_32k_matrix.log 2>&1 &
+
+PYTHONBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python kv_cache/concurrent_serve.py --model_path /home/u/downloads/models/Qwen3.6-35B-A3B --data_file data/longctx_turn_32768.jsonl --configs full,hh,hh_merge,hh_merge_m4,m4_k8v8 --concurrency-list 1,8,16,32,64 --turns 8 --output-dir results/concurrency > logs/concurrency_32k.log 2>&1 &
 ```
 
 64k / 128k 两端对比（full vs m4_k8v8，各 4 cell）：
