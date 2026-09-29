@@ -85,6 +85,14 @@ def _stash(module, query, key, value, attention_mask, scaling):
         scaling = query.shape[-1] ** -0.5
     q = query[..., -w:, :].detach().float()      # [B, H, W, D]
     k = key.detach().float()                     # [B, H_kv, K, D]
+    if q.ndim != 4 or k.ndim != 4 or q.shape[1] % k.shape[1] != 0:
+        # Exotic sdpa caller (e.g. the linear-attention torch fallback
+        # reaches the registry with 5-D inputs) — NOT a KV-cache attention
+        # layer. The old full-tensor code silently stored a wrongly-shaped
+        # [B, W, K] "score" bank for these; skip instead of crashing.
+        print(f"[attn_scores] skip layer {layer_idx}: non-standard q/k dims "
+              f"{tuple(query.shape)}/{tuple(key.shape)}")
+        return
     B, H, _, _ = q.shape
     H_kv = k.shape[1]
     n_rep = H // H_kv
