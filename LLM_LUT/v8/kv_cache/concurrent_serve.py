@@ -146,7 +146,12 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
     # the single-shot snapshot. Gated OFF the verified paths: B*S <= 131072
     # keeps the B=1 regression and the B=4 selftest on the exact single-shot
     # forward they were validated on.
-    chunk = max(512, min(8192, 2_000_000_000 // max(B * S, 1)))
+    # Round the chunk DOWN to a multiple of 8: sdpa rejects misaligned
+    # additive masks from the memory-efficient backend and falls back to the
+    # math backend, which materializes B*H*chunk*K scores (64GB at N=32/32k
+    # — the hh_merge_n32 wall). 8-aligned k_total keeps the efficient
+    # backend, which never materializes scores.
+    chunk = max(512, min(8192, 2_000_000_000 // max(B * S, 1))) // 8 * 8
     use_chunk = B * S > 131_072 and chunk < S
     with torch.no_grad():
         if not use_chunk:
@@ -657,7 +662,17 @@ def main():
                 record["sustainable"] = False
                 print(f"[serve]   N={N}: OOM\n{e}")
             except RuntimeError as e:
-                if "out of memory" in str(e).lower():
+                if "unspecified launch failure" in str(e) or "CUDA error" in str(e):
+                    # Transient async device fault (memory wall, neighbor XID):
+                    # record the cell and keep sweeping — if the context is
+                    # poisoned the next cells fail fast and the resume logic
+                    # picks up from there.
+                    torch.cuda.empty_cache()
+                    record["status"] = "cuda_error"
+                    record["error"] = str(e)
+                    record["sustainable"] = False
+                    print(f"[serve]   N={N}: CUDA error\n{e}")
+                elif "out of memory" in str(e).lower():
                     torch.cuda.empty_cache()
                     record["status"] = "oom"
                     record["error"] = str(e)
