@@ -53,8 +53,16 @@ HBM ≤ 预算 **且** EOS ≥ 同 N 下 full 配置的 EOS − 2pp。
   `kv_cache/attention_scores.py`、`kv_cache/heavy_hitter_cache.py`、
   `kv_cache/probe_sentinel.py`、`kv_cache/concurrent_serve.py`（新）、
   `tools/gen_longctx_multiturn.py`（新）、`tools/analyze_concurrency.py`（新）
+- [ ] （2026-09-30 排查批）`kv_cache/concurrent_serve.py` 已同步最新
+  （含 `SERVE_MEMLOG` 开关），`tools/probe_sdpa.py` 已同步（含 `S_REAL`）。
+  **传完必须验证，没见过输出等于没传**：
+  ```bash
+  grep -n "SERVE_MEMLOG" kv_cache/concurrent_serve.py   # 期望: memlog_on / def memlog 等多行
+  grep -n "S_REAL" tools/probe_sdpa.py                  # 期望: S_REAL = 60380 等 2 行
+  ```
 - [ ] GPU 空闲：`nvidia-smi` 确认无残留进程（历史 CUDA 死锁教训，见红线 5）
 - [ ] 磁盘空间：`results/concurrency/` 每 cell JSON 数 MB 级，无压力
+- [ ] 目录存在：`mkdir -p results logs data`
 
 ---
 
@@ -220,8 +228,10 @@ PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python
 ```
 
 64k / 128k 两端对比（full vs m4_k8v8；64k 全 ladder，128k 预计 full 在 mid-N
-即 OOM）。**两条独立命令，手动串行**：先启动 64k，等进程退出（`ps -ef | grep
-concurrent_serve` 无输出）再启动 128k。不要用 for 循环 + `&`（循环体内的 `&`
+即 OOM）。**先完成 §12 的显存诊断并拿到修法，再跑这两组**（2026-09-30：
+64k N=32/64 的小缺口 OOM 根因尚未定位，直接重跑会原样复现）。**两条独立
+命令，手动串行**：先启动 64k，等进程退出（`ps -ef | grep concurrent_serve`
+无输出）再启动 128k。不要用 for 循环 + `&`（循环体内的 `&`
 会让两次跑同时抢卡）。
 
 ```bash
@@ -300,3 +310,110 @@ python tools/analyze_concurrency.py results/concurrency --markdown > results/con
 
 **禁止事项**（项目红线）：`device_map="auto"` / accelerate 自动多卡分配；
 在验证门（step 0-3）未全过时跑 step 5 全量矩阵。
+
+---
+
+## 12. 追加：64k/128k 高并发 OOM 排查流程（2026-09-30）
+
+**背景**：32k 主档矩阵已完成（结果在 docs/21）。64k 两端对比中，m4_k8v8
+N=16 通过（TTFT 276.8s / TPOT 185ms / HBM 279.4GB / EOS 0.953 /
+fact 0.4375），但 N=32、N=64 均以极小缺口 OOM（只差 258MiB / 512MiB，
+卡上 PyTorch 已分配 77.97GiB）。本节定位根因并给出修法；**§9 的 64k/128k
+命令在本节判定完成前不要跑**。
+
+**已排除的假说**（`tools/probe_sdpa.py` 实测，torch 2.6.0+cu124）：
+
+- ❌ "4D additive mask 把 sdpa 打到 math fallback 物化 64GB scores"——
+  探针强制逐 backend 测试 64k 下 N=8/16/32/64 的精确形状，**efficient
+  全部接受**（B=64/64k peak 63.7GiB 也能跑），math 才会 OOM 但不会被选中。
+- ❌ "chunk 太大"——efficient 的 peak 构成是 HF `repeat_kv` 的 GQA 拷贝
+  （K/V 2→16 头 expand+reshape，2×B×16×k×256×2B，**与 chunk 无关**：
+  N=32/64k ≈ 31.7GB，N=64/64k ≈ 63GB）。曾据此加过 12e9 的 chunk cap，
+  方向错误，**已回退**。
+- ⚠️ 账算不平：模型分片 ~8.75GB + prefill 期全量 KV（update() 只追加
+  不淘汰，N=32/64k ≈ 39.6GB 摊开）+ repeat_kv transient ~34.5GB +
+  m4 mask ~3.75GB，最忙的卡预测峰值 ~52GB，**与实际 78GB 差 ~25GB 待查**。
+
+### Step B：memlog 诊断跑（单 cell，~10 分钟，占卡）
+
+**测什么**：`[memlog]` 每 chunk 打印 8 卡 allocated/high-water (GiB)，
+区分"随 chunk 稳步爬升（累积型）"vs"某 chunk 突跳（transient 型）"，
+以及最后一行停在 prefill 中间还是 decode begin 之后（=第一次淘汰/折叠）。
+
+```bash
+SERVE_MEMLOG=1 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python kv_cache/concurrent_serve.py \
+  --model_path /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --data_file data/longctx_multi_turn_65536.jsonl \
+  --configs m4_k8v8 --concurrency-list 32 --turns 1 --max-new-tokens 8 \
+  --kv-budget-gb 512 \
+  --device_map balanced_low_0 --torch_dtype bfloat16 \
+  --output-dir results/memdiag_64k \
+  > logs/memdiag_64k.log 2>&1 &
+```
+
+**取数**（跑完或 OOM 后均可）：
+
+```bash
+grep "memlog" logs/memdiag_64k.log
+```
+
+把完整输出发回来定修法。主要候选：prefill 期全量 KV 常驻
+（`heavy_hitter_cache.py` update() 的 deferred-eviction 分支）或
+repeat_kv 拷贝与 masks 在单卡叠加。
+
+### Step B 结果（2026-09-30 实测，N=32/64k，chunk=1032）
+
+memlog 显示两类增长，根因双双定位：
+
+1. **resident 累积（真泄漏型）**：allocated 只有两张卡涨——gpu1
+   +0.10GiB/chunk、gpu5 +0.55GiB/chunk（52 chunk 后 gpu5 allocated
+   42.6GiB，即单卡攒了 ~30GB）。这就是 `heavy_hitter_cache.py`
+   update() 的 deferred-eviction：prefill 期间只追加不淘汰，N=32×60k
+   token × 20KB/token 的满血 KV 常驻到 decode 第一步。**机制结论：
+   chunked prefill 期间（每轮最吃显存的阶段）压缩配置和 full 一样
+   持有全量 KV，128-slot 红利只在 decode 第一步后兑现——这就是
+   32k 矩阵峰值 HBM 倒挂的根源。**
+2. **peak 棘轮（transient 型）**：每卡 peak 随 k_total 线性爬
+   ~1.1GiB/chunk（gpu6 恰好减半 = 1 个 full-attn 层的量）。构成是
+   HF `repeat_kv` 的 GQA 拷贝（K/V 2→16 头，0.52GiB/chunk/层）叠加
+   cache cat 与 stash 的 fp32 副本。efficient backend 本身不物化
+   scores（探针已证），但绕不开 repeat_kv 的实体拷贝。
+3. **OOM 点**：chunk52/59（k≈54.7k，prefill 88%），gpu1 peak 77.5
+   顶墙。N=16 能通过只是因为同样的棘轮减半。
+
+### Step C：修法（enable_gqa 绕过 repeat_kv）
+
+峰值里最大最无谓的一块是 repeat_kv 拷贝（N=32/64k ≈ 28GB，纯
+内存搬运，数学零贡献）。`enable_gqa=True` 让 efficient kernel 按
+stride 直读 K/V，不实体化 8× 插值拷贝。harness 的 stash wrapper
+以"逐位委托 HF 原函数"为正确性铁律，所以**先探针验证两条路径位级
+等价，非零差异就否决此路**。
+
+**C1. 取远程 transformers 的 sdpa_attention_forward 源码**（照抄其
+余步骤用，避免版本差异）：
+
+```bash
+python -c "import inspect, transformers.integrations.sdpa_attention as m; print(inspect.getsource(m.sdpa_attention_forward))"
+```
+
+**C2. 同步 `tools/probe_gqa.py`（本地已写好）并跑位级等价探针**：
+
+```bash
+python tools/probe_gqa.py
+```
+
+判定：三行全 `bitwise_equal=True` → 走 C3；任何一行非零 → 放弃
+enable_gqa，直接跑 Step D（按 N≤16 收尾 64k/128k）。
+
+**C3.（探针全过后才做）** 在 `attention_scores.py` 的 `_sdpa_stash`
+里加 env 开关分支：`SERVE_NO_GQA_COPY=1` 时复刻
+sdpa_attention_forward 但跳过 repeat_kv、改传 `enable_gqa=True`
+（源码从 C1 的输出照抄），然后用 memlog 诊断命令原样重跑验证
+N=32/64k 通过。通过后再跑 Step D 全矩阵。
+
+### Step D：按修法重跑 64k/128k
+
+修法定案后：先删被污染 cell（当前确认污染：
+`results/concurrency_65536/m4_k8v8_n32.json`、`m4_k8v8_n64.json`；
+`full_n*` 各 cell 状态先 `ls results/concurrency_65536/` 确认），
+再跑 §9 的两条命令（64k 完再 128k，手动串行），最后 §10 出表。
