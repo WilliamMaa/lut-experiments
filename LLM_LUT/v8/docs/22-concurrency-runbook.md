@@ -403,17 +403,28 @@ python tools/probe_gqa.py
 `peak_5d ≪ peak_repeat` → 走 C2；否则放弃此路，直接跑 Step D
 （按 N≤16 收尾 64k/128k）。
 
-**C2.（探针全过后才做）** 在 `attention_scores.py` 的 `_sdpa_stash`
-里加 env 开关分支：`SERVE_NO_GQA_COPY=1` 且 K/V 头数不同时，构造
-5-D 视图直调 `F.scaled_dot_product_attention`（mask 为 None 时
-`is_causal=True`，与 HF 语义一致），其余情况照常委托 prev_sdpa。
-然后用 memlog 诊断命令原样重跑（命令前加
-`SERVE_NO_GQA_COPY=1 SERVE_MEMLOG=1`）验证 N=32/64k 通过。通过后再跑
-Step D 全矩阵（两条命令同样加 `SERVE_NO_GQA_COPY=1`）。
+**C1 结果（2026-09-30 实测，三变体 v1/v2/v3 全灭，此路关闭）**：
 
-### Step D：按修法重跑 64k/128k
+- `enable_gqa=True`：torch 2.6 efficient kernel 要求 dense Q/K/V 同头数，
+  带 mask 直接拒（flash 拒 mask）。
+- 5-D stride-0 视图（kernel 报错建议的 expand 路线）：B=8 形状全部 OOM
+  （29.75GiB 单次分配 = fp32 scores 物化，静默落到 math 系 backend）；
+  小形状能跑但 `bitwise_equal=False`（max diff 2.4e-4，kernel/累加序不同），
+  违反 stash wrapper"逐位委托 HF 原函数"的正确性铁律。
+- 结论：**serving 侧接受 repeat_kv 的 GQA 拷贝为已知开销**，不再尝试
+  零拷贝绕过。高并发上限由它 + prefill 满血 KV 共同决定（见 Step B
+  结果节的两条机制）。
 
-修法定案后：先删被污染 cell（当前确认污染：
-`results/concurrency_65536/m4_k8v8_n32.json`、`m4_k8v8_n64.json`；
-`full_n*` 各 cell 状态先 `ls results/concurrency_65536/` 确认），
-再跑 §9 的两条命令（64k 完再 128k，手动串行），最后 §10 出表。
+### Step D：重跑 64k/128k（Plan B 定案版）
+
+**不要删 OOM cell**——`status: oom` 的 JSON 是有效数据点（探到显存墙的
+位置本身就是结论），resume 会 skip 它们。先确认现有 cell：
+
+```bash
+ls results/concurrency_65536/
+```
+
+然后按 §9 两条命令手动串行重跑（64k 完再 128k；resume 自动跳过已有
+ok/oom cell，只补缺的）。预期：64k/128k 下 full 因稳态 KV 线性膨胀
+在 mid-N 即 OOM，m4_k8v8 通过 N=16、N≥32 撞墙（两条机制见 Step B
+结果节）。最后 §10 出表，把机制结论 + 表格回填 docs/21。
