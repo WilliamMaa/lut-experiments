@@ -381,35 +381,35 @@ memlog 显示两类增长，根因双双定位：
 3. **OOM 点**：chunk52/59（k≈54.7k，prefill 88%），gpu1 peak 77.5
    顶墙。N=16 能通过只是因为同样的棘轮减半。
 
-### Step C：修法（enable_gqa 绕过 repeat_kv）
+### Step C：修法（绕过 repeat_kv 的 GQA 拷贝）
 
 峰值里最大最无谓的一块是 repeat_kv 拷贝（N=32/64k ≈ 28GB，纯
-内存搬运，数学零贡献）。`enable_gqa=True` 让 efficient kernel 按
-stride 直读 K/V，不实体化 8× 插值拷贝。harness 的 stash wrapper
-以"逐位委托 HF 原函数"为正确性铁律，所以**先探针验证两条路径位级
-等价，非零差异就否决此路**。
+内存搬运，数学零贡献）。**已否决：`enable_gqa=True`**——torch 2.6 的
+efficient kernel 要求 dense 输入 Q/K/V 同头数，带 mask 时直接拒绝。
+**现行方案：5-D stride-0 视图**（kernel 报错信息自己建议的
+unsqueeze+expand 路线）：K/V 扩成 `[B, H_kv, n_rep, S, D]` stride-0
+视图（零拷贝），Q 用 view 分组——head (a,b)=a·n_rep+b 读 kv-head a，
+与 repeat_kv 的 interleaved 配对逐位一致。harness 的 stash wrapper
+以"逐位委托 HF 原函数"为正确性铁律，所以**先探针验证位级等价且
+无 backend 静默回退，任何非零差异/回退就否决此路**。
 
-**C1. 取远程 transformers 的 sdpa_attention_forward 源码**（照抄其
-余步骤用，避免版本差异）：
-
-```bash
-python -c "import inspect, transformers.integrations.sdpa_attention as m; print(inspect.getsource(m.sdpa_attention_forward))"
-```
-
-**C2. 同步 `tools/probe_gqa.py`（本地已写好）并跑位级等价探针**：
+**C1. 同步 `tools/probe_gqa.py`（本地已写好）并跑位级等价探针**：
 
 ```bash
 python tools/probe_gqa.py
 ```
 
-判定：三行全 `bitwise_equal=True` → 走 C3；任何一行非零 → 放弃
-enable_gqa，直接跑 Step D（按 N≤16 收尾 64k/128k）。
+判定：三行全 `bitwise_equal=True` 且 `fallback_warn=0` 且
+`peak_5d ≪ peak_repeat` → 走 C2；否则放弃此路，直接跑 Step D
+（按 N≤16 收尾 64k/128k）。
 
-**C3.（探针全过后才做）** 在 `attention_scores.py` 的 `_sdpa_stash`
-里加 env 开关分支：`SERVE_NO_GQA_COPY=1` 时复刻
-sdpa_attention_forward 但跳过 repeat_kv、改传 `enable_gqa=True`
-（源码从 C1 的输出照抄），然后用 memlog 诊断命令原样重跑验证
-N=32/64k 通过。通过后再跑 Step D 全矩阵。
+**C2.（探针全过后才做）** 在 `attention_scores.py` 的 `_sdpa_stash`
+里加 env 开关分支：`SERVE_NO_GQA_COPY=1` 且 K/V 头数不同时，构造
+5-D 视图直调 `F.scaled_dot_product_attention`（mask 为 None 时
+`is_causal=True`，与 HF 语义一致），其余情况照常委托 prev_sdpa。
+然后用 memlog 诊断命令原样重跑（命令前加
+`SERVE_NO_GQA_COPY=1 SERVE_MEMLOG=1`）验证 N=32/64k 通过。通过后再跑
+Step D 全矩阵（两条命令同样加 `SERVE_NO_GQA_COPY=1`）。
 
 ### Step D：按修法重跑 64k/128k
 
