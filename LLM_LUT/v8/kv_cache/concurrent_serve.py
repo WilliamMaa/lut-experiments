@@ -151,18 +151,24 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
     # additive masks from the memory-efficient backend and falls back to the
     # math backend, which materializes B*H*chunk*K scores (64GB at N=32/32k
     # — the hh_merge_n32 wall). 8-aligned k_total keeps the efficient
-    # backend, which never materializes scores.
-    # But alignment alone is NOT sufficient: with a 4D additive mask the
-    # efficient backend can still be rejected at high B*K (observed: N=32/
-    # 64k OOM by ~260MiB with GPU at 78.6/79.3GiB, i.e. a ~64GB scores
-    # tensor was materialized on one card = math fallback). So cap the
-    # chunk a second time such that even the math fallback's worst-case
-    # scores (B*16*chunk*S*2B, H=16 full-attn q-heads, K grows to S over
-    # chunks) stay under ~12GB.
-    chunk = max(512, min(8192,
-                         2_000_000_000 // max(B * S, 1),
-                         12_000_000_000 // max(B * 16 * S * 2, 1))) // 8 * 8
+    # backend, which never materializes scores. Probe (tools/probe_sdpa.py,
+    # torch 2.6): efficient accepts every harness shape up to B=64/64k
+    # (peak 63.7GiB, dominated by HF's repeat_kv GQA copies, NOT scores).
+    chunk = max(512, min(8192, 2_000_000_000 // max(B * S, 1))) // 8 * 8
     use_chunk = B * S > 131_072 and chunk < S
+    memlog_on = bool(os.environ.get("SERVE_MEMLOG"))
+
+    def memlog(tag):
+        # SERVE_MEMLOG=1 diagnostic: per-device allocated/high-water (GiB).
+        # Locates resident growth vs transient peaks during chunked prefill.
+        if not memlog_on:
+            return
+        parts = []
+        for i in range(torch.cuda.device_count()):
+            a = torch.cuda.memory_allocated(i) / 2**30
+            p = torch.cuda.max_memory_allocated(i) / 2**30
+            parts.append(f"gpu{i}:{a:.1f}/{p:.1f}")
+        print(f"[memlog] {tag} " + " ".join(parts), flush=True)
     with torch.no_grad():
         if not use_chunk:
             # logits_to_keep=1: full-seq logits would be B*len*vocab*2B
@@ -180,7 +186,8 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
             # O(B*S^2).
             next_ids = None
             k_so_far = 0
-            for start in range(0, S, chunk):
+            for ci, start in enumerate(range(0, S, chunk)):
+                memlog(f"turn_prefill chunk{ci} k_in={k_so_far} begin")
                 cur = input_ids[:, start:start + chunk]
                 m = cur.shape[1]
                 k_total = k_so_far + m
@@ -196,6 +203,8 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
                             logits_to_keep=1)
                 past = out.past_key_values
                 k_so_far = k_total
+                memlog(f"turn_prefill chunk{ci} k={k_so_far} end")
+            memlog("turn_prefill done")
             next_ids = out.logits[:, -1, :].argmax(dim=-1)  # [B]
     sync()
     ttft = time.perf_counter() - t0
@@ -213,6 +222,7 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
     pad_counts = [input_ids.shape[1] - r for r in real_lens]
     pad_t = torch.tensor(pad_counts, device=device).unsqueeze(1)  # [B, 1]
     has_pads = any(p > 0 for p in pad_counts)
+    memlog("decode begin (first step triggers eviction)")
 
     # Decode masks are derived HARNESS-SIDE, never from cache internals:
     # out.past_key_values may be a rewrapped object whose reported content
