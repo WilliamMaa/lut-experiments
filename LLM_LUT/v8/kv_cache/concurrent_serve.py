@@ -152,7 +152,16 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
     # math backend, which materializes B*H*chunk*K scores (64GB at N=32/32k
     # — the hh_merge_n32 wall). 8-aligned k_total keeps the efficient
     # backend, which never materializes scores.
-    chunk = max(512, min(8192, 2_000_000_000 // max(B * S, 1))) // 8 * 8
+    # But alignment alone is NOT sufficient: with a 4D additive mask the
+    # efficient backend can still be rejected at high B*K (observed: N=32/
+    # 64k OOM by ~260MiB with GPU at 78.6/79.3GiB, i.e. a ~64GB scores
+    # tensor was materialized on one card = math fallback). So cap the
+    # chunk a second time such that even the math fallback's worst-case
+    # scores (B*16*chunk*S*2B, H=16 full-attn q-heads, K grows to S over
+    # chunks) stay under ~12GB.
+    chunk = max(512, min(8192,
+                         2_000_000_000 // max(B * S, 1),
+                         12_000_000_000 // max(B * 16 * S * 2, 1))) // 8 * 8
     use_chunk = B * S > 131_072 and chunk < S
     with torch.no_grad():
         if not use_chunk:

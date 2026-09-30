@@ -220,20 +220,32 @@ PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python
 ```
 
 64k / 128k 两端对比（full vs m4_k8v8；64k 全 ladder，128k 预计 full 在 mid-N
-即 OOM 可砍到 1,8,16）：
+即 OOM）。**两条独立命令，手动串行**：先启动 64k，等进程退出（`ps -ef | grep
+concurrent_serve` 无输出）再启动 128k。不要用 for 循环 + `&`（循环体内的 `&`
+会让两次跑同时抢卡）。
 
 ```bash
-for T in 65536 131072; do
-  PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python kv_cache/concurrent_serve.py \
-    --model_path /home/u/downloads/models/Qwen3.6-35B-A3B \
-    --data_file data/longctx_multi_turn_${T}.jsonl \
-    --configs full,m4_k8v8 --concurrency-list 1,8,16,32,64 \
-    --turns 8 --max-new-tokens 128 \
-    --kv-budget-gb 512 \
-    --device_map balanced_low_0 --torch_dtype bfloat16 \
-    --output-dir results/concurrency_${T} \
-    > logs/concurrency_${T}.log 2>&1 &
-done
+# 第一条：64k
+PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python kv_cache/concurrent_serve.py \
+  --model_path /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --data_file data/longctx_multi_turn_65536.jsonl \
+  --configs full,m4_k8v8 --concurrency-list 1,8,16,32,64 \
+  --turns 8 --max-new-tokens 128 \
+  --kv-budget-gb 512 \
+  --device_map balanced_low_0 --torch_dtype bfloat16 \
+  --output-dir results/concurrency_65536 \
+  > logs/concurrency_65536.log 2>&1 &
+
+# 64k 跑完后再跑这条：128k
+PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python kv_cache/concurrent_serve.py \
+  --model_path /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --data_file data/longctx_multi_turn_131072.jsonl \
+  --configs full,m4_k8v8 --concurrency-list 1,8,16,32,64 \
+  --turns 8 --max-new-tokens 128 \
+  --kv-budget-gb 512 \
+  --device_map balanced_low_0 --torch_dtype bfloat16 \
+  --output-dir results/concurrency_131072 \
+  > logs/concurrency_131072.log 2>&1 &
 ```
 
 **断点续跑语义**（2026-09-30 版 harness）：已有 cell JSON 且 `status: ok/oom` →
