@@ -41,8 +41,9 @@ for B, H, H_kv, q, k in SHAPES:
     k5 = kh[:, :, None, :, :].expand(B, H_kv, n, k, 256)
     v5 = vh[:, :, None, :, :].expand(B, H_kv, n, k, 256)
     variants = {
-        "v2_mask_full": m[:, None, None].expand(B, H_kv, n, q, k),
-        "v3_mask_hkv": m[:, None, None].expand(B, H_kv, 1, q, k),
+        "v1_mask_b11": m[:, None],                                    # [B,1,1,q,k]
+        "v2_mask_full": m[:, None].expand(B, H_kv, n, q, k),          # stride-0
+        "v3_mask_hkv": m[:, None].expand(B, H_kv, 1, q, k),           # stride-0
     }
     print(f"--- B={B} q={q} k={k} peak_repeat={peak1:.1f}GiB ---", flush=True)
     for name, m5 in variants.items():
