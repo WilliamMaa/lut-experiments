@@ -60,6 +60,19 @@ HBM ≤ 预算 **且** EOS ≥ 同 N 下 full 配置的 EOS − 2pp。
   grep -n "SERVE_MEMLOG" kv_cache/concurrent_serve.py   # 期望: memlog_on / def memlog 等多行
   grep -n "S_REAL" tools/probe_sdpa.py                  # 期望: S_REAL = 60380 等 2 行
   ```
+- [ ] （2026-09-30 反馈后批，docs/23）三个文件已同步：
+  `kv_cache/concurrent_serve.py`（新增 `hbm_allocated_gb` /
+  `fact_details` / 稳态 HBM 探针 / `--hbm-budget-gb` 改名 /
+  `--max-cache-len` 覆盖）、`tools/analyze_concurrency.py`（新增
+  steady / kv 两列）、`tools/paired_analysis.py`（新文件）。
+  **验证（缺任何一条 = 没同步，不要开跑）**：
+  ```bash
+  grep -n "hbm_allocated_gb" kv_cache/concurrent_serve.py     # 期望: def hbm_allocated_gb(...) 行
+  grep -n "fact_details" kv_cache/concurrent_serve.py         # 期望: 多处
+  grep -n "max-cache-len" kv_cache/concurrent_serve.py        # 期望: add_argument 行
+  grep -n "steady" tools/analyze_concurrency.py               # 期望: METRICS 定义行
+  ls tools/paired_analysis.py                                 # 期望: 文件存在
+  ```
 - [ ] GPU 空闲：`nvidia-smi` 确认无残留进程（历史 CUDA 死锁教训，见红线 5）
 - [ ] 磁盘空间：`results/concurrency/` 每 cell JSON 数 MB 级，无压力
 - [ ] 目录存在：`mkdir -p results logs data`
@@ -431,7 +444,7 @@ ok/oom cell，只补缺的）。预期：64k/128k 下 full 因稳态 KV 线性�
 结果节）。最后 §10 出表，把机制结论 + 表格回填 docs/21。
 
 **128k 补跑（单行版，整行复制——多行反斜杠命令在复制时会被吃掉
-空格，不要再手抄多行版，不是这个问题，是他妈的傻逼kimi他妈的在chat里吐出来的指令没一个是对的，他妈他自己吞character）**：
+空格导致 argparse 报错，一律用下面的单行版）**：
 
 ```bash
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python kv_cache/concurrent_serve.py --model_path /home/u/downloads/models/Qwen3.6-35B-A3B --data_file data/longctx_multi_turn_131072.jsonl --configs full,m4_k8v8 --concurrency-list 1,8,16,18,32,64 --turns 8 --max-new-tokens 128 --kv-budget-gb 512 --device_map balanced_low_0 --torch_dtype bfloat16 --output-dir results/concurrency_131072 > logs/concurrency_131072.log 2>&1 &
@@ -439,3 +452,110 @@ PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python
 
 （64k 若需补跑同理：把 `131072` 换成 `65536`、`concurrency_131072`
 换成 `concurrency_65536`、log 文件名换掉，其余不动。）
+
+
+---
+
+## 13. 追加：docs/23 反馈后实验（2026-09-30）
+
+背景：docs/23（同事/导师反馈）10 条意见全部成立，docs/21 已按此修订。harness
+已扩展出新字段与新工具，但**旧 cell JSON（results/concurrency{,_65536,_131072}/）
+没有这些字段**——它们是老版本 harness 跑的。本节给出获取新数据的命令。
+
+### 13a. 重跑 cell 以获得新字段（fact_details / 稳态 HBM 列）
+
+新 cell JSON 相比旧的多三个关键数据：
+
+- `fact_details`：per-question `{session, turn, qtype, correct}` →
+  `tools/paired_analysis.py` 的原料（docs/23 第 10 条）；
+- `steady_decode_hbm_gb`：decode 循环后的稳态 HBM（首次淘汰后）；
+- `kv_resident_bytes_end`：turn 结束时 cache 精确字节 →
+  analyzer 的 steady / kv 两列（docs/23 第 6 条："压缩省 HBM"迄今无直接证据，
+  这两列就是补证据的）。
+
+**resume 语义注意**：已有且 `status: ok/oom` 的 cell 会被 **skip，不会重跑**。
+要新数据只有两个办法：换 `--output-dir`（推荐，旧档保留可对照），或删掉想重跑
+的 cell JSON。建议新档 `results/concurrency_v2/` 整档重跑 32k 主矩阵（旧档
+results/concurrency/ 一个字节都不动）：
+
+```bash
+PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python kv_cache/concurrent_serve.py --model_path /home/u/downloads/models/Qwen3.6-35B-A3B --data_file data/longctx_multi_turn_32768.jsonl --configs full,hh,hh_merge,hh_merge_m4,m4_k8v8 --concurrency-list 1,8,16,32,64 --turns 8 --max-new-tokens 128 --hbm-budget-gb 512 --device_map balanced_low_0 --torch_dtype bfloat16 --output-dir results/concurrency_v2 > logs/concurrency_v2_32k.log 2>&1 &
+```
+
+**砍单建议**（GPU 时间有限时，按价值排序保留）：
+1. `full` 只保 N=8（EOS 基线 + 稳态对照），其余 N 用旧档数字；
+2. 64k EOS 复现格（docs/23 第 3 条）：`m4_k8v8` × N=16 跑 **2–3 次**（每次
+   换 output-dir 或先删 JSON），判定 0.953 是并发所致还是 run 级波动；
+3. 压缩四配置 × N∈{8,32} 是 paired analysis 性价比最高的格子（n=64/格，
+   McNemar 检出力最大）。
+
+出表（analyzer 自动多 steady / kv 两列，旧档 JSON 无字段会显示空白，属正常）：
+
+```bash
+python tools/analyze_concurrency.py results/concurrency_v2 --markdown
+```
+
+### 13b. 组件配对分析（docs/23 第 10 条：ladder 叙事不成立）
+
+需要 13a 的新 cell（有 `fact_details`）。对同一道题跨配置算 2×2 转移计数 +
+精确二项 McNemar p，回答"M4 修了哪些题、merge 破坏了哪些题"：
+
+```bash
+python tools/paired_analysis.py results/concurrency_v2 --matrix
+python tools/paired_analysis.py results/concurrency_v2 -n 8 -a hh_merge_m4 -b m4_k8v8
+```
+
+**判定**：`k8v8` vs `hh_merge_m4` 的 discordant 对（b+c）若 McNemar p>0.05，
+则"INT8 不比 bf16-M4 差"成立，ladder 最后一级的质量损失叙事要改写；若 p<0.05
+且 c>b，则量化确实在特定题上更差，需要看 qtype 分布找规律（输出里没有 qtype
+分列，必要时把 fact_details 导出来按 qtype 手动分桶）。
+
+### 13c. budget × context × fact Pareto 扫描（docs/23 第 9 条，真正的科学问题）
+
+问题：128-slot 预算对长上下文 factual recall 过于激进（fact 0.44-0.53 vs
+full ~1.0），Pareto 前沿在哪？扫
+`max_cache_len ∈ {128,256,512,1024,2048} × {32k,64k,128k}`，测 fact / TPOT /
+稳态 KV bytes。
+
+harness 已支持 `--max-cache-len`（覆盖所有压缩配置的 128 默认值；配置名不变，
+**每个 budget 必须用独立 output-dir**，否则 resume 会 skip）。
+
+模板（**每个 budget 一条命令，手动串行**；先小档 pilot 再铺矩阵）：
+
+```bash
+PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python kv_cache/concurrent_serve.py --model_path /home/u/downloads/models/Qwen3.6-35B-A3B --data_file data/longctx_multi_turn_32768.jsonl --configs m4_k8v8 --concurrency-list 8 --max-cache-len 256 --turns 8 --max-new-tokens 128 --hbm-budget-gb 512 --device_map balanced_low_0 --torch_dtype bfloat16 --output-dir results/budget_256_32k > logs/budget_256_32k.log 2>&1 &
+```
+
+- 只扫 `m4_k8v8`（末端配置，前面 hh/hh_merge/hh_merge_m4 的递进已被第 10 条
+  证伪，不必重复）；
+- N 先固定 8（质量问题的检出力来自 n=64 题数，不来自并发档数）；拿到
+  初步 Pareto 后再决定是否补 N=16；
+- 128 档不用跑（= results/concurrency_v2 已有）；2048 档预计 TPOT 优势收窄，
+  但它回答"前沿在哪一端饱和"；
+- 出表：各 budget 目录各跑一次 `analyze_concurrency.py`（看 fact + steady +
+  kv 三列），手动拼 Pareto 表回填 docs/21。
+
+### 13d. HBM 五分解 profiling（docs/23 第 5 条：74GB 未解释差额）
+
+目标：把峰值拆成 weights / resident KV / stash / repeat_kv transient / other，
+定位 compressed path 的 b·B·K 项。现有工具可分三步做，**不需要改代码**：
+
+1. `SERVE_MEMLOG=1` 重跑 64k N=16 的 m4_k8v8 与 full 两个对照 cell
+   （命令同 §12 Step B，把 `--concurrency-list` 改成 16、`--data_file` 换
+   65536、`--output-dir` 换 `results/memdiag_64k_n16`），逐 chunk 对比两配置
+   的 allocated 曲线差——差值从第几个 chunk 开始出现、斜率多少，直接圈定
+   b·B·K 是累积型还是 transient 型；
+2. 新 cell 的 `kv_resident_bytes_end`（13a）给稳态 KV 精确值，
+   `steady_decode_hbm_gb` − KV bytes ≈ weights + stash 常驻 + allocator；
+3. repeat_kv transient 用探针公式直接算（2·B·16·K·256·2B，chunk 无关），
+   从峰值里减掉，剩下就是 stash + other。
+
+**stash 目前无禁用开关**（`attention_scores.py` 无 env 开关），如果第 1 步的
+差值曲线确认 stash 是主嫌，再考虑加 `--no-stash` 诊断开关（一次性改动，不进
+正式配置）。
+
+### 13e. 参数改名备忘
+
+`--kv-budget-gb` 仍是 `--hbm-budget-gb` 的兼容别名，旧命令照跑不误；但新命令
+一律写 `--hbm-budget-gb`（它是聚合进程 HBM 峰值预算，**不是 KV budget**——
+docs/23 第 7 条）。固定 KV budget 的问题由 13c 的 budget 扫描回答。

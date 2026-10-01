@@ -32,6 +32,7 @@ Self-tests:
 import argparse
 import json
 import os
+import re
 import statistics
 import subprocess
 import sys
@@ -64,12 +65,13 @@ LADDER = {
 }
 
 
-def build_patch(name: str) -> HeavyHitterAttnScorePatch:
+def build_patch(name: str, max_cache_len: int | None = None) -> HeavyHitterAttnScorePatch:
     cfg = LADDER[name]
     if cfg is None:
         return None
     return HeavyHitterAttnScorePatch(
-        max_cache_len=128, sink_tokens=4, recent_tokens=32, obs_window=64,
+        max_cache_len=max_cache_len if max_cache_len else 128,
+        sink_tokens=4, recent_tokens=32, obs_window=64,
         merge_evicted=cfg["merge_evicted"], k_bits=cfg["k_bits"],
         v_bits=cfg["v_bits"], span_window=cfg["span_window"],
     )
@@ -113,6 +115,33 @@ def left_pad(sequences, pad_id, device):
         input_ids[i, lmax - lens[i]:] = s
         mask[i, lmax - lens[i]:] = 1
     return input_ids.to(device), mask.to(device), lens
+
+
+def hbm_allocated_gb():
+    """Aggregate live allocation across all visible devices (GiB).
+
+    Distinct from measure_peak_memory_mb (high-water): this reads CURRENT
+    resident bytes, i.e. the steady-state HBM the feedback (docs/23) asks to
+    report separately from the prefill-dominated peak.
+    """
+    if not torch.cuda.is_available():
+        return None
+    return sum(torch.cuda.memory_allocated(i)
+               for i in range(torch.cuda.device_count())) / 2**30
+
+
+def kv_resident_bytes(past):
+    """Exact resident KV bytes (any dtype, incl. quantized) in a cache object."""
+    try:
+        total = 0
+        for layer in past.layers:
+            for attr in ("keys", "values"):
+                t = getattr(layer, attr, None)
+                if torch.is_tensor(t):
+                    total += t.nbytes
+        return total
+    except Exception:
+        return None
 
 
 def run_batched_turn(model, tokenizer, patch, device, messages_list,
@@ -208,6 +237,11 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
             next_ids = out.logits[:, -1, :].argmax(dim=-1)  # [B]
     sync()
     ttft = time.perf_counter() - t0
+    # Resident HBM right after prefill, BEFORE the first decode step (which
+    # is where the compressed cache performs its first eviction): the
+    # pre-eviction residency docs/23 §6 asks to report separately from the
+    # transient-dominated peak.
+    hbm_post_prefill = hbm_allocated_gb()
 
     # ---- greedy decode loop ----
     gen_ids = [[] for _ in range(B)]
@@ -318,41 +352,43 @@ def run_batched_turn(model, tokenizer, patch, device, messages_list,
         "decode_steps": n_steps,
         "padded_prompt_len": padded_len,
         "padding_overhead": 1.0 - sum(real_lens) / (B * padded_len),
+        "hbm_post_prefill_gb": hbm_post_prefill,
+        "hbm_post_decode_gb": hbm_allocated_gb(),
+        "kv_resident_bytes": kv_resident_bytes(past),
     }
 
 
+_GT_PAT_CACHE = {}
+
+
+def _gt_pattern(key):
+    """Compiled gt matcher. Digit/percent answers get a non-digit boundary so
+    gt "9%" does not false-positive inside "19%"."""
+    pat = _GT_PAT_CACHE.get(key)
+    if pat is None:
+        if re.search(r"[0-9]$", key) or "%" in key:
+            pat = re.compile(r"(?<![0-9.])" + re.escape(key) + r"(?![0-9])")
+        else:
+            pat = re.compile(re.escape(key))
+        _GT_PAT_CACHE[key] = pat
+    return pat
+
+
+def fact_correct(gt, output):
+    """True iff every gt string appears in the (whitespace-normalized) output."""
+    norm_out = "".join(str(output).split())
+    gts = gt if isinstance(gt, list) else [gt]
+    return all(bool(_gt_pattern(str(g)).search(norm_out)) for g in gts)
+
+
 def fact_accuracy(records, gt_list, qtype_list):
-    """Ground-truth match, per question type. gt None -> skipped.
-
-    gt may be a string or a list of strings (multi_instruction: ALL must
-    appear). Digit/percent answers are matched with a non-digit boundary so
-    gt "9%" does not false-positive inside "19%".
-    """
-    import re
-    cache = {}
-
-    def match_one(gt, norm_out):
-        key = str(gt)
-        pat = cache.get(key)
-        if pat is None:
-            if re.search(r"[0-9]$", key) or "%" in key:
-                pat = re.compile(r"(?<![0-9.])" + re.escape(key) + r"(?![0-9])")
-            else:
-                pat = re.compile(re.escape(key))
-            cache[key] = pat
-        return bool(pat.search(norm_out))
-
-    def norm(s):
-        return "".join(str(s).split())
-
+    """Ground-truth match, per question type. gt None -> skipped."""
     per_type = {}
     n_correct = n_total = 0
     for r, gt, qt in zip(records, gt_list, qtype_list):
         if gt is None:
             continue
-        gts = gt if isinstance(gt, list) else [gt]
-        norm_out = norm(r["output"])
-        ok = all(match_one(g, norm_out) for g in gts)
+        ok = fact_correct(gt, r["output"])
         per_type.setdefault(qt, [0, 0])
         per_type[qt][0] += int(ok)
         per_type[qt][1] += 1
@@ -379,6 +415,7 @@ def run_cell(model, tokenizer, patch, device, sessions, turns, max_new_tokens,
     total_padded_prompt_tokens = 0
 
     histories = [[] for _ in sessions]
+    fact_details = []
     for t in range(turns):
         messages = [
             build_turn_messages(s["document"], s["questions"], t, histories[i])
@@ -406,6 +443,13 @@ def run_cell(model, tokenizer, patch, device, sessions, turns, max_new_tokens,
                 gt = sessions[i]["answers"][t]
                 qt = sessions[i].get("qtype", ["factoid"] * len(sessions[i]["questions"]))[t]
             fact_records.append((gen, gt, qt))
+            if gt is not None:
+                # Per-question correctness, keyed by (session, turn): enables
+                # paired analysis across configs (docs/23 §10) without reruns.
+                fact_details.append({
+                    "session": i, "turn": t, "qtype": qt,
+                    "correct": bool(fact_correct(gt, r["output"])),
+                })
 
     wall = time.perf_counter() - t_start
     gen_metrics = compute_generation_metrics(all_turn_gen)
@@ -414,6 +458,7 @@ def run_cell(model, tokenizer, patch, device, sessions, turns, max_new_tokens,
                          [qt for _, _, qt in fact_records])
     ttfts = [s["ttft_s"] for s in turn_stats]
     steps = [s["step_time_mean_s"] for s in turn_stats]
+    last = turn_stats[-1] if turn_stats else {}
     return {
         "wall_time_s": wall,
         "ttft_mean_s": statistics.fmean(ttfts) if ttfts else 0.0,
@@ -425,10 +470,15 @@ def run_cell(model, tokenizer, patch, device, sessions, turns, max_new_tokens,
         "output_tokens_per_s": total_out_tokens / wall if wall > 0 else 0.0,
         "prompt_tokens_per_s_real": total_real_prompt_tokens / wall if wall > 0 else 0.0,
         "peak_hbm_mb": measure_peak_memory_mb(),
+        # Steady-state probes (docs/23 §6): post-eviction decode residency and
+        # exact resident KV bytes — the columns peak alone cannot show.
+        "steady_decode_hbm_gb": last.get("hbm_post_decode_gb"),
+        "kv_resident_bytes_end": last.get("kv_resident_bytes"),
         "eos_success_rate": gen_metrics["eos_success_rate"],
         "repetition_rate": gen_metrics["repetition_rate"],
         "avg_output_length": gen_metrics["avg_output_length"],
         "fact_accuracy": fact,
+        "fact_details": fact_details,
         "per_turn": turn_stats,
     }
 
@@ -633,8 +683,18 @@ def main():
     parser.add_argument("--turns", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--num-docs", type=int, default=8, help="distinct documents in the pool")
-    parser.add_argument("--kv-budget-gb", type=float, default=512.0,
-                        help="HBM budget for the sustainability criterion")
+    parser.add_argument("--max-cache-len", type=int, default=None,
+                        help="override the 128-slot budget for all compressed "
+                             "configs (budget-sweep experiments). The config "
+                             "name stays the same, so use a distinct "
+                             "--output-dir per budget value.")
+    parser.add_argument("--hbm-budget-gb", "--kv-budget-gb", dest="hbm_budget_gb",
+                        type=float, default=512.0,
+                        help="aggregate process HBM peak budget in GB for the "
+                             "sustainability criterion. NOT a KV-only budget: "
+                             "peak_hbm includes weights, activations, attention "
+                             "transients and the score stash. --kv-budget-gb is "
+                             "kept as a deprecated alias.")
     parser.add_argument("--eos-tolerance-pp", type=float, default=2.0,
                         help="sustainable if EOS >= full-config EOS at same N minus this (percentage points)")
     parser.add_argument("--device_map", default="balanced_low_0")
@@ -674,7 +734,7 @@ def main():
     baseline_eos = {}  # concurrency -> full-config EOS, for the sustainability rule
 
     for name in configs:
-        patch = build_patch(name)
+        patch = build_patch(name, args.max_cache_len)
         if patch is not None:
             patch.install(model)
         print(f"\n[serve] config={name} storage={patch.storage_stats() if patch else 'full KV'}")
@@ -703,7 +763,7 @@ def main():
                 "concurrency": N,
                 "patch": patch.config() if patch else {"name": "full"},
                 "storage_stats": patch.storage_stats() if patch else {},
-                "kv_budget_gb": args.kv_budget_gb,
+                "hbm_budget_gb": args.hbm_budget_gb,
                 "turns": args.turns,
                 "max_new_tokens": args.max_new_tokens,
             }
@@ -714,7 +774,7 @@ def main():
                 record["status"] = "ok"
                 if name == "full":
                     baseline_eos[N] = result["eos_success_rate"]
-                sustainable = result["peak_hbm_mb"] / 1024 <= args.kv_budget_gb
+                sustainable = result["peak_hbm_mb"] / 1024 <= args.hbm_budget_gb
                 if name != "full" and N in baseline_eos:
                     sustainable = sustainable and (
                         result["eos_success_rate"] >=

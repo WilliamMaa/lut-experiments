@@ -155,19 +155,35 @@ python tools/analyze_concurrency.py results/concurrency
 python tools/analyze_concurrency.py results/concurrency --markdown > results/concurrency/table.md
 ```
 
-## 判定标准（不是回到 baseline）
+## 判定标准（不是回到 baseline；2026-09-30 按 docs/23 反馈修订）
 
-某 config 在并发 N 下**可持续**，当且仅当：
+harness 内建的"sustainable"规则是 **quality-blind** 的，它只回答"这个
+cell 有没有在预算内跑完、EOS 有没有异常掉落"：
 
-1. `peak_hbm_mb/1024 ≤ --kv-budget-gb`（默认 512GB）；
-2. `eos_success_rate ≥ full 配置同 N 的 EOS − 2pp`（Fact accuracy 同时记录、
-   随表报告，但不作为硬门槛——合成 gt 子串判定是下界）。
+1. `peak_hbm_mb/1024 ≤ --hbm-budget-gb`（默认 512GB）。注意这是**聚合
+   进程 HBM 峰值预算**（含权重/激活/attention transient/stash），
+   **不是 KV budget**；`--kv-budget-gb` 仅为兼容保留的别名。固定 KV
+   budget 下的 concurrency 问题需用稳态列（`steady_decode_hbm_gb`、
+   `kv_resident_bytes_end`，2026-09-30 起 cell JSON 自带）另行分析。
+2. `eos_success_rate ≥ full 配置同 N 的 EOS − 2pp`。Fact accuracy
+   只记录不设门槛（合成 gt 子串判定是下界）。
 
-预期看到的结论形态：full 的 HBM 随 N 线性涨（128k 时每路 ~2.6GB）、decode 注意力
-随上下文线性变慢；m_sp4/k8v8 的 HBM 平线（每路 ~2.6MB/13MB 级）、TTFT 各配置
-持平、TPOT 与 HBM 在高档 N 拉开数量级差距、sustainable N 差出 1-2 个数量级。
+⚠️ **该规则不能当作"serving 质量可持续"**：EOS 正常 ≠ 回答正确。按
+当前 fact 数据（压缩 ~0.44-0.53 vs full ~1.0），若要求 fact 接近
+full，**m4_k8v8 在本 benchmark 上 N=1 也不达标**。因此结果必须三项
+分报：**memory-feasible N**（HBM 预算内）、**EOS-feasible N**（规则 2）、
+**fact-quality 曲线**（随 N 的变化），不再硬压成单个 "max sustainable
+N"。
+
+预期看到的结论形态：full 的 HBM 随 N 线性涨、decode 注意力随上下文
+线性变慢；压缩配置 TPOT 与稳态 HBM 在墙内大幅占优、峰值 HBM 被
+prefill transient 主导不占优（见结果节发现 3 与机制拆解）。
 
 ## 结果
+
+> **2026-09-30 按 `docs/23-feedback.md` 10 条反馈修订本节**（判定标准重写、
+> 质量过度声称收回、64k EOS 措辞、128k 墙定律归因重写、下一步重排）。
+> 修订前的原始表述以 git 历史为准。
 
 **32k 全矩阵（2026-09-29/30 夜跑完）**：5 配置 × N∈{1,8,16,32,64}，turns=8，
 max_new=128，kv-budget 512GB。机器为 7×A800-80GB（`_auto_pick_gpus` 剔除被
@@ -198,7 +214,13 @@ m4_k8v8                    140.6ms   174.1ms   179.8ms   204.2ms       OOM
 
 full 的 TPOT 从 N=1 到 N=64 恶化 **10.8×**（lockstep 批处理下每步都要读
 32k×N 量级的 KV 注意力）；压缩配置只恶化 **~1.45×**（每步读 128 slot，与 N
-基本无关）。**N=32 时 full 逐步解码比 m4_k8v8 慢 3.9×**。TTFT 上压缩配置在
+基本无关）。**N=32 时 full 逐步解码比 m4_k8v8 慢 3.9×**。三个上下文长度
+（32k/64k/128k）的压缩收益稳定落在 **3.4–3.9×**，机理明确（decode 每步
+KV 读取从 32k/64k/128k 降到 128 slot），是本批**最可靠的正结果**。
+
+⚠️ 但按 docs/23 第 8 条：**这是 decode-step latency reduction，不是
+throughput speedup**。harness 是 lockstep 批处理 + 手写 decode 循环，
+绝对吞吐不代表生产 serving；吞吐结论需迁 vLLM 类栈后再测。TTFT 上压缩配置在
 低 N 略慢 ~5%（stash 16-head 循环 + 淘汰 + 量化的 prefill 税），但第 2 轮起
 prefill 只对 128 slot 做注意力，长对话下 prefill 优势显现（N=32：full 194.6s
 vs m4_k8v8 218.0s——注意此时压缩 prefill 还背着未淘汰的全量 KV，差距没拉开）。
@@ -216,10 +238,17 @@ m4_k8v8                     0.750     0.484     0.469     0.531       OOM
 ```
 
 128-slot 淘汰在 32k 上下文的事实题上固定损失 25-40pp（B=1 即如此，与
-docs/16 两阶段档案一致）；**N=1→32 全程平坦**——批处理并发没有引入新的质量
-损失（m4_k8v8: 0.75→0.48→0.47→0.53，噪声内）。EOS 同趋势（full 1.0 全程，
-压缩 0.89-1.0 无 N 趋势）。**并发 serving 对压缩配置是安全的**。
-注意 N=1 格 n=8，fact 误差棒极大；n 随 N 增大（N=64 时 n=512）。
+docs/16 两阶段档案一致）。**但压缩本身的事实质量已经很差**（0.47-0.53
+vs full ~1.0），这一点必须和并发效应并述。并发方面，能下的结论只是：
+**在 N≥8 的较大样本区间，没有观察到随 concurrency 单调恶化的趋势**
+（m4_k8v8: 0.484→0.469→0.531@32k，0.500→0.500→0.438@64k，
+0.469@128k/N=8，均在噪声内）；EOS 同趋势（full 1.0 全程，压缩 0.89-1.0
+无 N 趋势）。注意 N=1 格 n=8，fact 误差棒极大，N=1→8 的下降（0.75→0.48）
+既可能是小样本波动也可能是真实退化，**现有数据两者都无法证明**。
+因此准确表述是：**批处理并发没有表现出超出 128-slot 压缩本身巨大
+质量损失之外的额外退化**（"batching does not show additional
+degradation beyond the substantial quality loss already introduced by
+the 128-slot compression regime"）——而不是"并发 serving 是安全的"。
 
 **3. 显存：与预期倒挂——压缩配置先撞墙（N=64 全 OOM，full 反而过）**
 
@@ -249,6 +278,14 @@ fp32 临时张量。**KV 压缩的收益是稳态 HBM（decode 之后），不�
   另立项）或在更大上下文验证（64k/128k 下 full 的稳态 KV 线性膨胀，倒挂应
   正过来）。
 - 预判之外的发现：并发批处理对质量零额外损失（finding 2）是干净的新结论。
+- **组件 ladder 叙事不成立**（docs/23 第 10 条）：32k 聚合 fact 上
+  hh→hh_merge→hh_merge_m4→m4_k8v8 并非单调改善（N=8：0.469→0.406→
+  0.453→0.484；N=32：0.391→0.406→0.484→0.531），且 **k8v8 没有比
+  bf16-M4 更差、部分格反而更高**——这违反"INT8 量化带来轻微质量损失"
+  的预期，可能是统计波动也可能是量化改变了生成轨迹。聚合均值回答不了
+  "M4 修了哪些题、merge 破坏了哪些题"，需 per-question 配对分析
+  （McNemar / 转移矩阵，`tools/paired_analysis.py` 已备好；需带
+  `fact_details` 字段的新 cell JSON，见 runbook §13）。
 
 ## 长上下文两端对比（2026-09-30，full vs m4_k8v8）
 
@@ -286,8 +323,14 @@ m4_k8v8                     0.500     0.500     0.438       OOM       OOM
 
 max sustainable N（规则判定）：full=32（N=64 OOM）；m4_k8v8=8——但
 N=16 仅因 EOS 0.953 < full_n16(1.0)−2pp=0.98 跌破规则线（HBM 279GB
-远在预算内），属规则线噪声（同 32k hh_merge 先例），HBM 意义下的真实
-上限是 N=16。
+远在预算内）。
+
+⚠️ 按 docs/23 第 3 条，这一格**不能再叫"规则线噪声"**：N=16×8 turns
+≈128 个样本，0.953 意味着约 6 次 EOS 失败，是可测的下降，不像 32k
+hh_merge 的 N=8（0.969≈2/64）那样容易归为小样本波动。**单次运行
+无法区分这是并发所致还是 run 级波动，需补 2–3 次重复才能定性**。
+在补 reps 之前，HBM 意义下的真实上限按 N=16 计，但 EOS 结论保持
+"待复现"。
 
 **发现 1：延迟红利随上下文放大。** N=16 时 full TPOT 651.6ms vs
 m4_k8v8 184.6ms，压缩配置逐步解码 **3.5×** 更快（32k N=32 时为
@@ -359,8 +402,9 @@ EOS 0.969 < 0.98 判 1，同前属规则线噪声；HBM 292.5GB 在预算内）�
 m4_k8v8 在 N=8/128k 存活：TPOT 196.7ms vs full 666.8ms（**3.4×**），
 fact 0.469 与 64k 档持平，并发无质量损失复现第三次。
 
-**发现 4：墙的位置由 B×K（并发×上下文）决定，与是否压缩 KV 无关。**
-三档长度的 max N 精确反比于上下文：
+**发现 4：两种路径的墙都近似随 B×K（并发×上下文）缩放，但压缩路径
+的比例常数约大一半，因此早一倍撞墙。** 三档长度的 max N 精确反比于
+上下文：
 
 ```text
               32k    64k    128k     B×K @ 墙
@@ -368,13 +412,33 @@ full          64     32      18      ~2.0-2.4M
 m4_k8v8       32     16       8      ~1.0M
 ```
 
-memlog + 探针已把墙拆清：prefill 期 repeat_kv 的 GQA 拷贝
-（∝ B×K：2·B·16·K·256·2B）+ deferred eviction 的满血 KV 常驻
-（∝ B×K：20KB/token），两者都与"稳态 KV 多大"无关——所以 KV 压缩
-在"能开多少并发"这个维度上**没有扩大墙**，它买到的是墙内每步
-3.4-3.9× 的 TPOT 和 decode 后的 MB 级稳态 HBM。要扩大墙本身，优先
-事项是 kernel 级去掉 repeat_kv（升级 torch / flash varlen / vLLM
-类栈，软件绕过已用探针排除，见"下一步"）。
+修订说明（docs/23 第 4 条）：旧版此处写"与是否压缩 KV 无关"，与上表
+自相矛盾——compressed 墙的 B×K 常数恰为 full 的一半，正确的表述是
+"两边都 ∝ B×K，但 compressed 更早 OOM"。
+
+memlog + 探针把**公共**那部分墙拆清了：prefill 期 repeat_kv 的 GQA
+拷贝（∝ B×K：2·B·16·K·256·2B）+ deferred eviction 的满血 KV 常驻
+（∝ B×K：20KB/token），两者对 full 和 compressed 完全相同。
+
+**但公共项解释不了 compressed 为什么早一倍撞墙**（docs/23 第 5 条）。
+最直接的证据：64k N=16 峰值 **full 205.4GB vs m4_k8v8 279.4GB，差
+74GB**——此时两边都还在 prefill（都做全量 prefill、都走 repeat_kv、
+都未首次淘汰），74GB 只能来自 compression-specific 开销。嫌疑项：
+attention-score stash 的逐 head 循环中间张量、fp32 score 累积、量化/
+折叠簿记、或额外 attention 计算，均 ∝ B×K。内存模型应为：
+
+```text
+M_full       = M_weights + a·B·K + M_KV
+M_compressed = M_weights + a·B·K + M_KV + b·B·K + M_compression   (b 未定位)
+```
+
+这 74GB 是**下一步最优先的 profiling 目标**（HBM 五分解：weights /
+resident KV / stash / repeat_kv transient / other，配合
+`SERVE_MEMLOG=1`、新增稳态列 `steady_decode_hbm_gb` /
+`kv_resident_bytes_end`、以及一次 stash-disabled 诊断 cell）。在 b 被
+定位之前，"第一瓶颈就是 repeat_kv"的说法不成立——准确表述是：
+repeat_kv 解释了一块主要的公共 B×K transient，但 compression-specific
+的额外 B×K 开销仍未解释。
 
 ### 已知的坑（复现本表前必读）
 
@@ -392,10 +456,28 @@ memlog + 探针已把墙拆清：prefill 期 repeat_kv 的 GQA 拷贝
 - 早批 cell（13 个 ok + 若干 oom）部分记录在邻居污染期，最终表以
   2026-09-30 凌晨重跑批为准。
 
-### 下一步
+### 下一步（2026-09-30 按 docs/23 重排：不再继续扫更多 N）
 
-- （可选）prefill 内滚动淘汰，把峰值 HBM 的 resident 半块压下来——需重新
-  标定与 docs/16 档案的一致性。
-- （serving 栈层面）repeat_kv 拷贝需要 kernel 级支持才能去掉：升级 torch
-  （enable_gqa for efficient）、flash varlen GQA、或迁 vLLM 类 serving 栈。
-  本批已用探针排除软件绕过路线。
+按 docs/23 的意见，"max sustainable N" 已接近榨干，继续扫 N 的价值
+很低。优先级重排为三件：
+
+1. **HBM 分解 profiling（最优先，回答 docs/23 第 5 条的未解释 b·B·K）。**
+   把峰值拆成 weights / resident KV / stash / repeat_kv transient /
+   other 五项，定位 compressed path 为什么在 full 一半 B×K 就 OOM
+   （64k N=16 差 74GB）。工具已备好：`SERVE_MEMLOG=1`（每 chunk 8 卡
+   allocated/peak）、新 cell 字段 `steady_decode_hbm_gb` /
+   `kv_resident_bytes_end`、以及一次 stash-disabled 诊断 cell（分离
+   stash 贡献）。
+2. **budget × context × fact Pareto 扫描（docs/23 第 9 条：这才是 v8
+   真正要回答的科学问题）。** 新 benchmark 已经证明 128-slot 预算对
+   长上下文 factual recall 过于激进（fact 0.44-0.53 vs full ~1.0），
+   下一步不是继续冲 2000×，而是扫
+   `max_cache_len ∈ {128,256,512,1024,2048} × {32k,64k,128k}`，测
+   fact / TPOT / 稳态 KV bytes，画 Pareto 前沿。命令模板见 runbook §13。
+3. **kernel 级去 repeat_kv（serving 栈层面）。** 升级 torch（enable_gqa
+   for efficient）、flash varlen GQA、或迁 vLLM 类栈。本批已用探针排除
+   软件绕过路线。此项是工程迁移，不是算法迭代。
+
+降级的旧条目：prefill 内滚动淘汰（改 cache 语义、需重标定 docs/16
+档案一致性）与 per-question 配对分析（工具已备好
+`tools/paired_analysis.py`，随反馈后重跑 cell 顺带出数）。

@@ -23,6 +23,8 @@ METRICS = {
     "tpot": ("tpot_mean_s", "{:8.1f}ms", "TPOT (mean)"),
     "tput": ("output_tokens_per_s", "{:8.1f}", "Output tok/s (wall-clock)"),
     "hbm": ("peak_hbm_mb", "{:8.1f}", "Peak HBM (GB)"),
+    "steady": ("steady_decode_hbm_gb", "{:8.1f}", "Steady decode HBM (GB)"),
+    "kv": ("kv_resident_bytes_end", "{:8.1f}", "KV resident (MB)"),
     "eos": ("eos_success_rate", "{:8.3f}", "EOS success"),
     "fact": ("fact_accuracy", None, "Fact accuracy"),
     "wall": ("wall_time_s", "{:8.0f}s", "Cell wall time"),
@@ -42,6 +44,9 @@ def fmt(metric_key, record):
         v *= 1000.0
     elif metric_key == "hbm":
         v /= 1024.0
+    elif metric_key == "kv":
+        v = v / 2**20 if v is not None else None
+        return f"{v:8.1f}" if v is not None else "     n/a"
     elif metric_key == "fact":
         v = v.get("overall") if isinstance(v, dict) else v
         return f"{v:8.3f}" if v is not None else "     n/a"
@@ -87,7 +92,8 @@ def main():
                 row += f"{fmt(mk, cells.get((c, n))) + marker(cells.get((c, n))):>10s}"
             print(row)
 
-    print("\n### Max sustainable concurrency (EOS within tolerance of full, HBM within budget)")
+    print("\n### Max memory/EOS-feasible N (quality-blind rule: HBM budget + "
+          "EOS vs full; fact accuracy NOT gated — see docs/21 and docs/23 feedback)")
     print(f"{'config':24s}{'max N':>8s}")
     print("-" * 32)
     for c in configs:
