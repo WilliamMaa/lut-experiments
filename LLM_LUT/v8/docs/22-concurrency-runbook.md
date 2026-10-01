@@ -464,6 +464,12 @@ PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python
 
 ### 13a. 重跑 cell 以获得新字段（fact_details / 稳态 HBM 列）
 
+> **状态（2026-09-30 晚）：32k 全矩阵已在 `results/concurrency_v2/` 跑完**
+> （命令即本节单行版），结果（稳态 HBM / KV 常驻表 + 配对分析 McNemar
+> 矩阵 + v1-vs-v2 噪声底标定）已回填 docs/21 "v2 重跑"小节。**不要重跑。**
+> 仍缺的：64k/128k 的 v2 cell（带新字段）与 64k m4_k8v8 N=16 的 EOS
+> 复现 reps（§13a 砍单建议第 2 条）。
+
 新 cell JSON 相比旧的多三个关键数据：
 
 - `fact_details`：per-question `{session, turn, qtype, correct}` →

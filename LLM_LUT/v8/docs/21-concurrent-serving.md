@@ -183,7 +183,9 @@ prefill transient 主导不占优（见结果节发现 3 与机制拆解）。
 
 > **2026-09-30 按 `docs/23-feedback.md` 10 条反馈修订本节**（判定标准重写、
 > 质量过度声称收回、64k EOS 措辞、128k 墙定律归因重写、下一步重排）。
-> 修订前的原始表述以 git 历史为准。
+> 修订前的原始表述以 git 历史为准。**同日晚 v2 重跑**（
+> `results/concurrency_v2/`，带 fact_details / 稳态列）补上了第 6 条
+> 直接证据与第 10 条配对分析，见下文"v2 重跑"小节。
 
 **32k 全矩阵（2026-09-29/30 夜跑完）**：5 配置 × N∈{1,8,16,32,64}，turns=8，
 max_new=128，kv-budget 512GB。机器为 7×A800-80GB（`_auto_pick_gpus` 剔除被
@@ -440,6 +442,87 @@ resident KV / stash / repeat_kv transient / other，配合
 repeat_kv 解释了一块主要的公共 B×K transient，但 compression-specific
 的额外 B×K 开销仍未解释。
 
+### v2 重跑：稳态 HBM / KV 常驻直接测量 + 组件配对分析（2026-09-30 晚）
+
+`results/concurrency_v2/`：同一负载，带 `fact_details` /
+`steady_decode_hbm_gb` / `kv_resident_bytes_end` 的新 harness 整档重跑
+32k 全矩阵（命令与 resume 语义见 runbook §13a）。TTFT/TPOT/Peak/EOS/
+Fact 五张表与首跑同趋势、不复述；这里只报新字段与配对分析。
+
+**稳态 HBM 与 KV 常驻（docs/23 第 6 条补证：压缩省 HBM 的直接证据）**
+
+```text
+Steady decode HBM (GB)         N=1       N=8      N=16      N=32      N=64
+--------------------------------------------------------------------------
+full                         65.3      75.2      80.2      90.7     107.3
+hh                           64.7      70.5      70.9      71.5       OOM
+hh_merge                     64.7      70.6      71.1      72.1       OOM
+hh_merge_m4                  64.7      65.3      66.0      67.4       OOM
+m4_k8v8                      64.7      70.6      70.7      66.8       OOM
+
+KV resident (MB)               N=1       N=8      N=16      N=32      N=64
+--------------------------------------------------------------------------
+full                          612      4912      9823     19715     39453
+hh/hh_merge/hh_merge_m4       2.5        20        40        80       OOM
+m4_k8v8                       1.2        10        20        40       OOM
+```
+
+三项直接结论：
+
+1. **KV 常驻的压缩比在稳态直接兑现**：N=32 时 full 19.7GB vs
+   m4_k8v8 40MB（**实测 ~500×**）。标称 2000× 偏乐观约 4×——按
+   `kv_resident_bytes` 逐字节记账才是可靠口径，标称值只做展示。
+2. **但稳态进程 HBM 只差 ~24GB**（N=32：full 90.7 vs m4_k8v8 66.8）：
+   7 卡分片后 weights+激活 ~65GB 垫底，KV 从 20GB 压到 40MB 也只省出
+   差值里的一小半——32k 档下"省 HBM"的上限被权重项封死；上下文更长
+   （full 的 KV 随 K 线性涨）时这笔账才会放大。压缩配置稳态内部的
+   ±5GB 抖动（m4_k8v8 N=8 70.6 > N=32 66.8，非单调）是 stash/allocator
+   瞬时残留，不影响平线结论。
+3. **稳态列同时给发现 3 的机制补了闭环**：压缩配置稳态 ~66-72GB 与
+   N 无关（平线），full 线性涨；而峰值与稳态之差（N=32 m4_k8v8：
+   317−67 ≈ 250GB）几乎全在 prefill 期——倒挂 100% 发生在 prefill
+   transient，与 memlog 归因一致。至此"KV 压缩的收益在稳态、代价在
+   峰值"两头都有直接测量，不再是推断。
+
+**Run 级波动标定（docs/23 第 3 条的副产品，重要）**：v1 vs v2 同配置
+同 N 重跑，fact 差普遍 **5–15pp**（hh N=8：0.469→0.344；m4_k8v8 N=32：
+0.531→0.453），EOS 判格在两个 run 间互换（v1 m4_k8v8 N=8 过规则线，
+v2 掉到 0.891 不过）。这就是本 benchmark 的**噪声底**：n=64–256 的格
+也压不住 ±10pp。两个含义：(a) 64k 那格 EOS 0.953 与 run 波动同量级，
+更需专门 reps 才能定量，原判断不变；(b) v1 ladder 内部 5–10pp 的
+fact 差异（0.484 vs 0.469 vs 0.531 之争）**全部在噪声底内，聚合比较
+不具分辨率**——这正是 docs/23 第 10 条要求配对分析的原因，下面的
+McNemar 把信号从噪声里捞了回来。
+
+**组件配对分析（docs/23 第 10 条）：ladder 叙事修订**
+
+`tools/paired_analysis.py results/concurrency_v2 --matrix`，McNemar 精确
+二项 p（discordant = 同题一对一错的对数）：
+
+| 配对 | N=8 (n=64) | N=16 (n=128) | N=32 (n=256) |
+|---|---|---|---|
+| hh vs hh_merge | p=0.23 | p=0.29 | **p=0.002**（merge>hh） |
+| hh vs hh_merge_m4 | **p=0.008**（m4>hh） | p=0.86 | **p=0.014**（m4>hh） |
+| hh_merge vs hh_merge_m4 | p=0.12 | p=0.54 | p=0.70 |
+| hh_merge_m4 vs m4_k8v8 | p=0.34 | p=1.00 | p=0.065 |
+| hh_merge vs m4_k8v8 | p=0.61 | p=0.54 | **p=0.044**（k8v8>merge） |
+| full vs 任一压缩 | 全部 p<1e-4 | 同 | 同 |
+
+结论：
+
+1. **INT8 量化质量中性**：m4_k8v8 vs hh_merge_m4 三个 N 全部不显著
+   （p=0.34 / 1.00 / 0.065）。"INT8 轻微质量损失"的旧叙事**被否**——
+   2000× 档相对 1000× 档在本 benchmark 分辨率内不付 fact 代价。
+2. **M4（span_window=4）的增益主要体现在无 merge 兜底时**：对原始
+   hh 显著（N=8、N=32 均 p<0.05），对 hh_merge 不显著。
+3. **merge 单独的价值弱**，仅 N=32 显著（p=0.002）。
+4. **full vs 压缩的 discordant 完全单向**（如 N=8 m4_k8v8：a=30
+   b=34 c=0 d=0——full 全对的 64 题里压缩错 34 题，且没有一题是压缩
+   对而 full 错）：压缩的质量损失是系统性的逐题损失，不存在缓冲带。
+5. **修订后的 ladder 叙事**：hh(选择) → +merge（弱，仅高 N 显著）→
+   +M4（显著，主要在无 merge 时）→ +INT8（中性）。v1 在聚合均值上
+   "看不出单调"是噪声底所致，不是组件无效。
+
 ### 已知的坑（复现本表前必读）
 
 - 共享机邻居：GPU3 常年被占 20GB，`N>=32` 的 cell 曾全天 OOM 在其上；
@@ -467,7 +550,11 @@ repeat_kv 解释了一块主要的公共 B×K transient，但 compression-specif
    （64k N=16 差 74GB）。工具已备好：`SERVE_MEMLOG=1`（每 chunk 8 卡
    allocated/peak）、新 cell 字段 `steady_decode_hbm_gb` /
    `kv_resident_bytes_end`、以及一次 stash-disabled 诊断 cell（分离
-   stash 贡献）。
+   stash 贡献）。**进度（2026-09-30 晚）**：v2 重跑的稳态列已把
+   resident 一项闭环（压缩配置稳态 ~66-72GB 平线 vs full 线性涨，
+   见"v2 重跑"小节），剩下的未解释差额全部在 **prefill transient**——
+   即峰值减稳态那 ~250GB 的内部构成（stash fp32 / repeat_kv / 折叠
+   簿记的相对占比），这是本项现在真正要切的点。
 2. **budget × context × fact Pareto 扫描（docs/23 第 9 条：这才是 v8
    真正要回答的科学问题）。** 新 benchmark 已经证明 128-slot 预算对
    长上下文 factual recall 过于激进（fact 0.44-0.53 vs full ~1.0），
