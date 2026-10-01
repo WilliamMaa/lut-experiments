@@ -250,6 +250,132 @@ fp32 临时张量。**KV 压缩的收益是稳态 HBM（decode 之后），不�
   正过来）。
 - 预判之外的发现：并发批处理对质量零额外损失（finding 2）是干净的新结论。
 
+## 长上下文两端对比（2026-09-30，full vs m4_k8v8）
+
+### 64k 结果
+
+`results/concurrency_65536/`，turns=8，max_new=128，kv-budget 512GB。
+m4_k8v8 的 N=32/64 为 OOM 数据点（显存墙，见机制节）。
+
+```text
+TTFT (mean)                    N=1       N=8      N=16      N=32      N=64
+--------------------------------------------------------------------------
+full                       16.14s   129.57s   255.47s   567.13s       OOM
+m4_k8v8                    16.01s   135.39s   276.76s       OOM       OOM
+
+TPOT (mean)                    N=1       N=8      N=16      N=32      N=64
+--------------------------------------------------------------------------
+full                       117.5ms   439.7ms   651.6ms  1250.2ms       OOM
+m4_k8v8                    151.2ms   192.0ms   184.6ms       OOM       OOM
+
+Peak HBM (GB)                  N=1       N=8      N=16      N=32      N=64
+--------------------------------------------------------------------------
+full                        132.1     151.8     205.4     311.7       OOM
+m4_k8v8                     134.0     188.5     279.4       OOM       OOM
+
+EOS success                    N=1       N=8      N=16      N=32      N=64
+--------------------------------------------------------------------------
+full                        1.000     1.000     1.000     1.000       OOM
+m4_k8v8                     1.000     1.000     0.953       OOM       OOM
+
+Fact accuracy                  N=1       N=8      N=16      N=32      N=64
+--------------------------------------------------------------------------
+full                        1.000     1.000     1.000     1.000       OOM
+m4_k8v8                     0.500     0.500     0.438       OOM       OOM
+```
+
+max sustainable N（规则判定）：full=32（N=64 OOM）；m4_k8v8=8——但
+N=16 仅因 EOS 0.953 < full_n16(1.0)−2pp=0.98 跌破规则线（HBM 279GB
+远在预算内），属规则线噪声（同 32k hh_merge 先例），HBM 意义下的真实
+上限是 N=16。
+
+**发现 1：延迟红利随上下文放大。** N=16 时 full TPOT 651.6ms vs
+m4_k8v8 184.6ms，压缩配置逐步解码 **3.5×** 更快（32k N=32 时为
+3.9×）；full N=32 已恶化到 1250ms/步。TTFT 上压缩配置继续付出 ~5-8%
+的 prefill 税（分块 + stash + 首次 decode 淘汰）。
+
+**发现 2：质量代价由上下文长度决定，仍与并发无关。** m4_k8v8 fact 从
+32k 档的 0.75（N=1）降到 64k 档的 0.50——同样 128 个槽位覆盖 2× 上下
+文，淘汰更狠；但 N=1→16 全程平坦（0.50→0.50→0.438，噪声内），并发
+不引入新损失的结论在 64k 复现。
+
+**发现 3：HBM 倒挂没有翻正——而且第一瓶颈不是 KV，是 serving 栈的
+GQA 拷贝。** 预判"64k 下 full 稳态 KV 线性膨胀、倒挂翻正"只兑现了一
+半：full 的 N=64 确实从 32k 的"通过（357GB）"变成 OOM，但 m4_k8v8
+也在 N=32 先撞墙，max N 仍是 full（32）> 压缩（16）。memlog 诊断
+（`SERVE_MEMLOG=1`，N=32/64k 单 cell）把墙拆成了两块：
+
+- **resident**：prefill 期 deferred eviction 让满血 KV 无约束增长
+  （N=32×60k×20KB/token ≈ 39GB，单卡攒 ~30GB）——128-slot 红利
+  只在 decode 第一步后兑现，这就是 32k 倒挂的机制，64k 原样复现；
+- **transient 棘轮**：HF `sdpa_attention_forward` 的 `repeat_kv`
+  把 GQA 的 K/V 从 2 头 expand+reshape 拷贝成 16 头（2×B×16×K×256×
+  2B，与 chunk 无关）：N=32/64k ≈ 28GB、N=64/64k ≈ 64GB，每 chunk
+  棘轮 ~0.52GB/层，OOM 发生在 prefill 第 52/59 chunk（k≈54.7k）。
+  **full 的 N=64 OOM 也是同一堵墙**（repeat 63GB），不是稳态 KV。
+
+绕过尝试（`tools/probe_sdpa.py` / `tools/probe_gqa.py` 实证）：4D mask
+8 对齐后 efficient backend 接受全部形状（math fallback 假说排除）；
+`enable_gqa=True` 被 torch 2.6 efficient kernel 拒绝（dense 输入要求
+Q/K/V 同头数）；5-D stride-0 视图静默落到 math 系 backend 或位级不等。
+**结论：在 torch 2.6 + 逐位委托铁律下，repeat_kv 拷贝是不可绕过的
+serving 开销**；要破墙需要 kernel 层支持（升级 torch / flash varlen /
+vLLM 类栈），不属本批范围。
+
+### 128k 结果
+
+`results/concurrency_131072/`，turns=8，max_new=128，kv-budget 512GB，
+N∈{1,8,16,18,32,64}（N=18 为探墙边界手动加档；n1/n8 为后补）。
+
+```text
+TTFT (mean)                    N=1       N=8      N=16      N=18      N=32      N=64
+------------------------------------------------------------------------------------
+full                       34.72s   385.74s  1156.17s  1433.03s       OOM       OOM
+m4_k8v8                    34.60s   425.51s       OOM       OOM       OOM       OOM
+
+TPOT (mean)                    N=1       N=8      N=16      N=18      N=32      N=64
+------------------------------------------------------------------------------------
+full                       118.3ms   666.8ms  1611.9ms  1890.7ms       OOM       OOM
+m4_k8v8                    140.2ms   196.7ms       OOM       OOM       OOM       OOM
+
+Peak HBM (GB)                  N=1       N=8      N=16      N=18      N=32      N=64
+------------------------------------------------------------------------------------
+full                        196.6     215.6     315.4     350.4       OOM       OOM
+m4_k8v8                     200.2     292.5       OOM       OOM       OOM       OOM
+
+EOS success                    N=1       N=8      N=16      N=18      N=32      N=64
+------------------------------------------------------------------------------------
+full                        1.000     1.000     1.000     1.000       OOM       OOM
+m4_k8v8                     1.000     0.969       OOM       OOM       OOM       OOM
+
+Fact accuracy                  N=1       N=8      N=16      N=18      N=32      N=64
+------------------------------------------------------------------------------------
+full                        1.000     1.000     1.000     1.000       OOM       OOM
+m4_k8v8                     0.500     0.469       OOM       OOM       OOM       OOM
+```
+
+max sustainable N：full=18（N=32 OOM）；m4_k8v8=8（规则口径因 N=8
+EOS 0.969 < 0.98 判 1，同前属规则线噪声；HBM 292.5GB 在预算内）。
+m4_k8v8 在 N=8/128k 存活：TPOT 196.7ms vs full 666.8ms（**3.4×**），
+fact 0.469 与 64k 档持平，并发无质量损失复现第三次。
+
+**发现 4：墙的位置由 B×K（并发×上下文）决定，与是否压缩 KV 无关。**
+三档长度的 max N 精确反比于上下文：
+
+```text
+              32k    64k    128k     B×K @ 墙
+full          64     32      18      ~2.0-2.4M
+m4_k8v8       32     16       8      ~1.0M
+```
+
+memlog + 探针已把墙拆清：prefill 期 repeat_kv 的 GQA 拷贝
+（∝ B×K：2·B·16·K·256·2B）+ deferred eviction 的满血 KV 常驻
+（∝ B×K：20KB/token），两者都与"稳态 KV 多大"无关——所以 KV 压缩
+在"能开多少并发"这个维度上**没有扩大墙**，它买到的是墙内每步
+3.4-3.9× 的 TPOT 和 decode 后的 MB 级稳态 HBM。要扩大墙本身，优先
+事项是 kernel 级去掉 repeat_kv（升级 torch / flash varlen / vLLM
+类栈，软件绕过已用探针排除，见"下一步"）。
+
 ### 已知的坑（复现本表前必读）
 
 - 共享机邻居：GPU3 常年被占 20GB，`N>=32` 的 cell 曾全天 OOM 在其上；
@@ -257,12 +383,19 @@ fp32 临时张量。**KV 压缩的收益是稳态 HBM（decode 之后），不�
 - `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` 必带（碎片曾达 16GB）。
 - 4D mask 必须 8 对齐，否则 sdpa 掉 math backend 物化 B·H·chunk·K scores
   （N=32 时 64GB）——chunk 已在 harness 内对齐。
+- 高 N / 长上下文的第一显存瓶颈是 HF `repeat_kv` 的 GQA 实体拷贝
+  （2·B·16·K·256·2B，chunk 无关）：N=32/64k ≈ 28GB，N=64/64k ≈ 64GB。
+  enable_gqa（torch 2.6 拒）与 5-D stride-0（静默回退/位级不等）均不可行，
+  见 `tools/probe_gqa.py`。
+- 显存排查用 `SERVE_MEMLOG=1`（每 chunk 打 8 卡 allocated/peak），
+  形状/backend 排查用 `tools/probe_sdpa.py`、`tools/probe_gqa.py`。
 - 早批 cell（13 个 ok + 若干 oom）部分记录在邻居污染期，最终表以
   2026-09-30 凌晨重跑批为准。
 
 ### 下一步
 
-- 64k/128k 两端（full vs m4_k8v8）：full 稳态 KV 在 128k×N=64 时 168GB，
-  预计 mid-N 即 OOM；压缩配置稳态 ~MB 级。长上下文才是压缩配置 HBM 主场。
-- （可选）prefill 内滚动淘汰，把峰值 HBM 也压下来——需重新标定与
-  docs/16 档案的一致性。
+- （可选）prefill 内滚动淘汰，把峰值 HBM 的 resident 半块压下来——需重新
+  标定与 docs/16 档案的一致性。
+- （serving 栈层面）repeat_kv 拷贝需要 kernel 级支持才能去掉：升级 torch
+  （enable_gqa for efficient）、flash varlen GQA、或迁 vLLM 类 serving 栈。
+  本批已用探针排除软件绕过路线。

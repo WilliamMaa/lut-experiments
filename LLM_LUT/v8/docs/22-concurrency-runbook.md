@@ -211,8 +211,9 @@ CUDA_LAUNCH_BLOCKING=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup py
 **测什么**：step 1 表格里的全部 cell。每个 cell 独立 JSON，**重跑同配置同 N 即
 覆盖续跑**，中断后从缺的 cell 继续即可。
 
-32k 主档（25 cell，全 ladder × N∈{1,8,16,32,64}）——**以这条为准**（auto-pick
-自动剔除被邻居霸占的卡；`PYTHONUNBUFFERED` 让 log 实时；`-u`/buffered 二选一）：
+32k 主档（25 cell，全 ladder × N∈{1,8,16,32,64}）——**实际执行请用
+§12 Step D 的单行版命令**（多行反斜杠版仅供阅读，复制时换行处空格
+会被吃掉导致 argparse 报错）：
 
 ```bash
 PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python kv_cache/concurrent_serve.py \
@@ -232,7 +233,7 @@ PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python
 64k N=32/64 的小缺口 OOM 根因尚未定位，直接重跑会原样复现）。**两条独立
 命令，手动串行**：先启动 64k，等进程退出（`ps -ef | grep concurrent_serve`
 无输出）再启动 128k。不要用 for 循环 + `&`（循环体内的 `&`
-会让两次跑同时抢卡）。
+会让两次跑同时抢卡）。单行版同样见 §12 Step D。
 
 ```bash
 # 第一条：64k
@@ -428,3 +429,13 @@ ls results/concurrency_65536/
 ok/oom cell，只补缺的）。预期：64k/128k 下 full 因稳态 KV 线性膨胀
 在 mid-N 即 OOM，m4_k8v8 通过 N=16、N≥32 撞墙（两条机制见 Step B
 结果节）。最后 §10 出表，把机制结论 + 表格回填 docs/21。
+
+**128k 补跑（单行版，整行复制——多行反斜杠命令在复制时会被吃掉
+空格，不要再手抄多行版，不是这个问题，是他妈的傻逼kimi他妈的在chat里吐出来的指令没一个是对的，他妈他自己吞character）**：
+
+```bash
+PYTHONUNBUFFERED=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True nohup python kv_cache/concurrent_serve.py --model_path /home/u/downloads/models/Qwen3.6-35B-A3B --data_file data/longctx_multi_turn_131072.jsonl --configs full,m4_k8v8 --concurrency-list 1,8,16,18,32,64 --turns 8 --max-new-tokens 128 --kv-budget-gb 512 --device_map balanced_low_0 --torch_dtype bfloat16 --output-dir results/concurrency_131072 > logs/concurrency_131072.log 2>&1 &
+```
+
+（64k 若需补跑同理：把 `131072` 换成 `65536`、`concurrency_131072`
+换成 `concurrency_65536`、log 文件名换掉，其余不动。）
