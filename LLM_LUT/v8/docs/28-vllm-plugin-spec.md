@@ -564,31 +564,35 @@ CUDA graph、prefix caching、SLA/排队模型。
 ## 8. 远程 runbook
 
 ```bash
-# 0) 环境（vLLM 源码目录有自家 AGENTS.md：跑 python 必须用 uv）
-cd ~/lut-experiments/LLM_LUT/v8/spike/vllm-src
-uv venv --seed && uv pip install -e .            # 或按该目录 AGENTS.md 的指引
-# 确认版本支持 Qwen3_5Moe（registry 里有 qwen3_5）
-uv run python -c "from vllm.model_executor.models.registry import ModelRegistry; print('Qwen3_5MoeForCausalLM' in ModelRegistry.get_supported_archs())"
+# 0) 环境：新 conda env + nightly wheel（不要源码编译 spike/vllm-src，那是本地只读参考副本）
+conda create -n vllm_py310 python=3.10 -y
+conda activate vllm_py310
+pip install vllm --pre --extra-index-url https://wheels.vllm.ai/nightly
+# 确认 Qwen3.6 arch 受支持（True 才能继续）：
+python -c "from vllm.model_executor.models.registry import ModelRegistry; print('Qwen3_5MoeForCausalLM' in ModelRegistry.get_supported_archs())"
+# 版本对齐说明：插件代码按 main@58b32984（2026-10-02）写的；nightly 接口若有漂移，
+# R1-R6 症状表（§7）会暴露，按症状改一行即可。别装 release 版——Qwen3_5Moe 太新，release 大概率没有。
+# 把本地 vllm_plugin/ 同步到远程 ~/lut-experiments/LLM_LUT/v8/ 后：
 
-# 1) 静态验证（不用 GPU，先过一遍 TODO 表 1/2/3/4/7/8/10）
-cd ~/lut-experiments/LLM_LUT/v8
-python -m py_compile vllm_plugin/*.py
+# 1) 静态验证（不用 GPU）：
+cd ~/lut-experiments/LLM_LUT/v8 && python -m py_compile vllm_plugin/*.py && echo OK
 
-# 2) smoke：单请求 8k，确认 patch 生效 + spec 生效
-V8_COMPRESS_SLOTS=512 python -m vllm_plugin.serve serve \
-  /home/u/downloads/models/Qwen3.6-35B-A3B \
-  --enforce-eager --max-model-len 16384 --max-num-seqs 4 \
-  > logs/vllm_smoke.log 2>&1 &
-# 期待日志: customize_spec 打出 CompressedKVSpec；nvidia-smi 显存不随 prompt 长度涨
+# 2) smoke：8k 单请求，确认 patch + spec 生效（在 v8 目录跑，包按相对目录可导入）：
+cd ~/lut-experiments/LLM_LUT/v8 && V8_COMPRESS_SLOTS=512 python -m vllm_plugin.serve serve /home/u/downloads/models/Qwen3.6-35B-A3B --enforce-eager --max-model-len 16384 --tensor-parallel-size 2 --max-num-seqs 4 --port 18001 > logs/vllm_smoke.log 2>&1 &
+# 期待: 日志出现 [v8_plugin] first obs scoring / first eviction；并发请求时 nvidia-smi 显存不随 prompt 长度涨
+# 发一个请求验证（换真实 prompt 即可）：
+curl -s localhost:18001/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"/home/u/downloads/models/Qwen3.6-35B-A3B","messages":[{"role":"user","content":"用一句话介绍你自己"}],"max_tokens":64}'
 
-# 3) 正确性对拍：64k 单请求 vs results/budget_512_32k 的答案集
-#    （turn-0 fact 正确性同水平即可，不逐字）
+# 3) 正确性对拍：不再依赖旧 harness 结果（已删）。基准改为同机 vLLM full-KV：
+#    先不带插件跑同一数据（普通 vllm serve = full），再带插件跑，比 fact acc。
+#    绝对红线沿用记录在案的数字：64k 负载 512 档旧 harness 实测 0.734
+#    （docs/21-24，结果文件已删但数字在文档里），压缩版不应显著低于它。
+cd ~/lut-experiments/LLM_LUT/v8 && python -m vllm_plugin.serve serve /home/u/downloads/models/Qwen3.6-35B-A3B --enforce-eager --max-model-len 131072 --tensor-parallel-size 2 --max-num-seqs 4 --port 18002 > logs/vllm_64k_check.log 2>&1 &
 
 # 4) 并发扫描：N ∈ {1, 8, 16, 32} × slots ∈ {512, 1024}，出 Pareto
-#    指标：max concurrent seqs（allocator 不再 OOM 的上限）、TTFT/TPOT、
-#    fact acc（复用 tools/ 里的判定脚本口径）
+#    指标：max concurrent seqs（allocator 不再 OOM 的上限）、TTFT/TPOT、fact acc
 ```
 
 **判废标准**（任一命中即回 docs/27 复盘，不硬撑）：单请求 64k 出现语义崩坏（fact acc 显著低于 0.73——
-budget_512_32k 实测 0.734）；allocator 层面仍随 seq_len 涨显存（说明 spec 没被采纳）；
+budget_512_32k 旧 harness 实测 0.734，结果文件已删、数字记录在案）；allocator 层面仍随 seq_len 涨显存（说明 spec 没被采纳）；
 `--enforce-eager` 下 TPOT 比 full 慢 5 倍以上（逐请求循环的 Python 开销失控，需先优化形态再继续）。

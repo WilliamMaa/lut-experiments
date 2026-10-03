@@ -21,14 +21,14 @@ def main() -> None:
     from . import patch
     patch()
 
-    from vllm.entrypoints.openai import api_server
-
-    if hasattr(api_server, "main"):
-        # vLLM entrypoints expose either main() (argparse from sys.argv)
-        api_server.main()
-    else:  # or run_server(parsed_args)
-        args = api_server.parse_args()
-        api_server.run_server(args)
+    # vLLM commit 58b32984: entry moved to vllm.entrypoints.launchers.api_server
+    # (old vllm.entrypoints.openai.api_server is a deprecated re-export with no
+    # main/parse_args). Fall back to the legacy path for older installs.
+    try:
+        from vllm.entrypoints.launchers.api_server.entry import main as _main
+    except ImportError:
+        from vllm.entrypoints.openai.api_server import main as _main
+    _main()
 
 
 if __name__ == "__main__":
