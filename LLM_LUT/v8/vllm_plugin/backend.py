@@ -150,7 +150,13 @@ def register_backend_enum() -> None:
     member._value_ = "vllm_plugin.backend.CompressedKVBackend"
     AttentionBackendEnum._member_map_["V8_COMPRESSED"] = member
     AttentionBackendEnum._value2member_map_[member._value_] = member
-    setattr(AttentionBackendEnum, "V8_COMPRESSED", member)
+    try:
+        # Enum.__setattr__ refuses member names; the C-level slot bypasses
+        # the check. Class attribute is only for debug access —
+        # AttentionBackendEnum[name] resolves via _member_map_.
+        type.__setattr__(AttentionBackendEnum, "V8_COMPRESSED", member)
+    except AttributeError:
+        pass
 
 
 def patch_allocator() -> None:
