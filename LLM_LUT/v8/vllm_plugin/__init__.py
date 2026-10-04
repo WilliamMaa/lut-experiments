@@ -74,9 +74,12 @@ def _patch_get_kv_cache_spec() -> None:
 
     def patched_get_spec(self, vllm_config):
         spec = orig_get_spec(self, vllm_config)
-        ok, _ = _target_model()
-        if (ok
-                and type(spec) is FullAttentionSpec  # not SlidingWindowSpec
+        # No _target_model() gate here: this runs during engine init and
+        # may sit outside set_current_vllm_config (get_current_vllm_config
+        # would raise and silently skip conversion). The backend-name check
+        # is sufficient — V8_COMPRESSED implies our injection already gated
+        # on arch at layer construction time.
+        if (type(spec) is FullAttentionSpec  # not SlidingWindowSpec
                 and self.attn_backend is not None
                 and self.attn_backend.get_name() == "V8_COMPRESSED"):
             if not _spec_converted[0]:
