@@ -29,6 +29,12 @@ def patch() -> None:
     from .backend import patch_allocator
     patch_allocator()
     _patched = True
+    # Runs in the API-server process: this line in the log proves patch()
+    # executed and which code version is live. Absent => stale files or
+    # serve.py never reached patch().
+    print(f"[v8_plugin] patch() installed v{config.PLUGIN_VERSION}, "
+          f"TARGET_ARCH={config.TARGET_ARCH}, "
+          f"slots={config.V8_COMPRESS_SLOTS}", flush=True)
 
 
 def _patch_attention_backend() -> None:
@@ -39,12 +45,20 @@ def _patch_attention_backend() -> None:
     orig_init = Attention.__init__
 
     def patched_init(self, *args, **kwargs):
-        if kwargs.get("attn_backend") is None and _target_model():
+        ok, reason = _target_model()
+        if _first_attn_init[0] is None:
+            _first_attn_init[0] = (ok, reason)
+            print(f"[v8_plugin] first Attention init: target={ok} ({reason})",
+                  flush=True)
+        if kwargs.get("attn_backend") is None and ok:
             kwargs["attn_backend"] = CompressedKVBackend
             _log_inject_once()
         orig_init(self, *args, **kwargs)
 
     Attention.__init__ = patched_init
+
+
+_first_attn_init = [None]
 
 
 def _patch_get_kv_cache_spec() -> None:
@@ -57,26 +71,37 @@ def _patch_get_kv_cache_spec() -> None:
 
     def patched_get_spec(self, vllm_config):
         spec = orig_get_spec(self, vllm_config)
-        if (_target_model()
+        ok, _ = _target_model()
+        if (ok
                 and type(spec) is FullAttentionSpec  # not SlidingWindowSpec
                 and self.attn_backend is not None
                 and self.attn_backend.get_name() == "V8_COMPRESSED"):
+            if not _spec_converted[0]:
+                _spec_converted[0] = True
+                print("[v8_plugin] FullAttentionSpec -> CompressedKVSpec "
+                      f"(v{config.PLUGIN_VERSION})", flush=True)
             return spec_from_full(spec)
         return spec
 
     Attention.get_kv_cache_spec = patched_get_spec
 
 
-def _target_model() -> bool:
+_spec_converted = [False]
+
+
+def _target_model():
+    """Returns (is_target, reason). Never raises — failures are reported."""
     try:
         from vllm.config import get_current_vllm_config
         archs = get_current_vllm_config().model_config.architectures
-    except Exception:
-        return False
+    except Exception as e:
+        return False, f"get_current_vllm_config failed: {type(e).__name__}: {e}"
     if not archs:
-        return False
-    return any(t in a for t in config.TARGET_ARCH.split(",")
-               for a in archs)
+        return False, "architectures is empty"
+    hit = any(t in a for t in config.TARGET_ARCH.split(",") for a in archs)
+    if hit:
+        return True, f"arch matched: {archs}"
+    return False, f"arch mismatch: {archs} vs TARGET_ARCH={config.TARGET_ARCH}"
 
 
 _inject_logged = False
@@ -87,4 +112,5 @@ def _log_inject_once() -> None:
     if not _inject_logged:
         _inject_logged = True
         print("[v8_plugin] injected CompressedKVBackend into full-attn "
-              f"layers (slots={config.V8_COMPRESS_SLOTS})", flush=True)
+              f"layers v{config.PLUGIN_VERSION} "
+              f"(slots={config.V8_COMPRESS_SLOTS})", flush=True)
