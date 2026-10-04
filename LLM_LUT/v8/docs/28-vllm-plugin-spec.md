@@ -633,13 +633,10 @@ python tools/dump_eval_answers.py --results results/eval_64k_compressed.json
 
 # 3c) slots 扫描（方法 collapse 的响应，docs/28 优先级：先同规模改进，不回退）：
 #    显存不是约束（compressed spec 后 36.75GiB 仅用零头），slots 拉大是 MB 级成本。
-for S in 1024 2048 4096; do
-  pkill -f "vllm_plugin.serve" ; sleep 3
-  CUDA_VISIBLE_DEVICES=0,1 V8_COMPRESS_SLOTS=$S python -m vllm_plugin.serve /home/u/downloads/models/Qwen3.6-35B-A3B --enforce-eager --max-model-len 131072 --tensor-parallel-size 2 --max-num-seqs 4 --port 18002 > logs/vllm_64k_s${S}.log 2>&1 &
-  sleep 240
-  curl -s localhost:18002/health && echo " UP slots=$S"
-  python tools/eval_longctx_server.py --base-url http://localhost:18002 --model /home/u/downloads/models/Qwen3.6-35B-A3B --data data/longctx_multi_turn_65536.jsonl --out results/eval_64k_slots${S}.json
-done
+#    已封装为脚本（推荐：整文件传输，杜绝粘贴掉字符；health 轮询代替盲等 240s）：
+bash tools/run_slots_sweep.sh
+#    跑完自动汇总三档 fact_acc。加档/换数据用环境变量：
+#    SLOTS_LIST="512 8192" DATA=data/longctx_multi_turn_32768.jsonl bash tools/run_slots_sweep.sh
 #    产出 Pareto：slots {512,1024,2048,4096} × fact_acc × prefill 秒数，写报告用。
 
 # 4) 并发扫描：N ∈ {1, 8, 16, 32} × slots ∈ {512, 1024, 2048, 4096}，出 Pareto
