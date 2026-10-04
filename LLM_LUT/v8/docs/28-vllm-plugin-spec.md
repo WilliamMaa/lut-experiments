@@ -1,9 +1,12 @@
 # docs/28: vLLM 压缩 KV backend — 实施规格（spike③ 开工文档）
 
-> 状态：待开工。本文档自包含：读完即可写代码，不需要再回 vLLM 源码调研。
-> 唯一例外是 §7 的 TODO 表 —— 那些点必须在远程环境用一条 grep/一次 smoke run 确认，每条都给了验证方法。
+> 状态：代码已写完（按 vLLM **0.19.1** 接口，py_compile 通过），待远程实机验证。
+> 目标版本变更记录：本文最初按 main@58b32984（0.30 时代 nightly）设计，但远程机器驱动 550.90.07（CUDA 12.4）
+> 无法升级，torch 2.11+ 硬性拒绝该驱动，只有 torch ≤2.10 的 minor 版本兼容能跑 → 目标版本降为 **vllm 0.19.1 + torch 2.10.0+cu128**。
+> 因此 §2 架构图和 §4 代码清单里凡与 0.30 接口相关的描述（customize_spec、registry、pool [nb,H,bs,2D] 等）**全部作废，
+> 以 `v8/vllm_plugin/` 代码和 §7 的 0.19.1 接口表为准**。vLLM 源码参考副本：`v8/spike/vllm-src-019`（v0.19.1 浅克隆，只读）。
 >
-> 上游结论见 docs/26（计划）、docs/27（spike 报告 GO）。vLLM 源码参考副本：`v8/spike/vllm-src`（commit 58b32984，只读）。
+> 上游结论见 docs/26（计划）、docs/27（spike 报告 GO）。
 
 ## 1. 目标与验证口径
 
@@ -535,46 +538,56 @@ if __name__ == "__main__":
 **v1 不做**（后续工作项，别顺手加）：k8v8 量化（Pareto 已证 INT8 中性但 v1 先 bf16）、shared_selection、
 CUDA graph、prefix caching、SLA/排队模型。
 
-## 7. 接口确认状态（2026-10-08 更新：代码已按确认接口写完，见 `v8/vllm_plugin/`）
+## 7. 接口确认状态（2026-10-09 更新：已按 vLLM 0.19.1 重写完毕，见 `v8/vllm_plugin/`）
 
-**本地对照 spike/vllm-src（commit 58b32984）已确认并写入代码**：
+**本地对照 spike/vllm-src-019（v0.19.1 浅克隆）已确认并写入代码**：
 
-| 点 | 结论 |
-|----|------|
-| spec 结构 | 照 `HiSparseHotSpec`：`blocks_per_request` 字段 + `max_memory_usage_bytes = blocks × page_size_bytes` + `max_num_blocks_per_req` 常数 + `prefix_cacheable=False` + `block_table_token_alignment=None`；`page_size_bytes` 直接继承 AttentionSpec（整块页公式） |
-| 注册 | `register_kv_cache_spec(CompressedKVSpec)` 命令式调用（spec.py 末尾） |
-| customize_spec 调用点 | 中心式：worker `attn_utils.py` 对每层 spec 调 `attn_module.get_attn_backend().customize_spec(spec)`，模型层不用改 |
-| backend 注入 | `Attention.__init__(..., attn_backend=None)`（attention.py:289）；monkeypatch 注入类即可。GDN 层不构造 Attention，所以按 arch 门控足够 |
-| impl 接口 | `forward(layer, q, k, v, kv_cache, attn_metadata, output, output_scale=None, output_block_scale=None)`；q/k/v 是 **3-D** [tokens, heads, D]（不是 4-D）；output 预分配 [T, H, D]，返回 [T, H*D] |
-| pool 布局 | kv_cache 每层视图 `[num_blocks, H_kv, block_size, 2*D]`，K=`[..., :D]`，V=`[..., D:]`（flash do_kv_cache_update 同款切法） |
-| metadata | `FlashAttentionMetadata`（query_start_loc GPU）；builder.build(common_prefix_len, common_attn_metadata) 吃 CommonAttentionMetadata（有 query_start_loc_cpu，无 req_ids → 用 block id 元组当请求键） |
-| merge | `FullAttentionSpec.merge` 会丢子类字段 → CompressedKVSpec 自己 override（校验全等后 deepcopy） |
+| 点 | 0.19.1 的结论 | 与 0.30 草案的差异 |
+|----|---------------|---------------------|
+| spec 注册 | **0.19 没有 spec registry**，不注册，直接用 | 0.30 要 `register_kv_cache_spec` |
+| spec 替换钩子 | **0.19 没有 customize_spec**。monkeypatch `Attention.get_kv_cache_spec`：精确 `type(spec) is FullAttentionSpec` 时换成 CompressedKVSpec（排除 SlidingWindowSpec） | 0.30 走 backend.customize_spec 中心式调用 |
+| blocks cap | 0.19.1 allocator 按 token 数要块，spec 无钩子 → monkeypatch `SingleTypeKVCacheManager.get_num_blocks_to_allocate`，对 CompressedKVSpec 把 num_tokens clamp 到 `blocks_per_request*block_size` | 0.30 草案靠 max_memory_usage_bytes |
+| backend 注入 | monkeypatch `Attention.__init__` 注入 backend 类，按 TARGET_ARCH 门控 | 相同思路 |
+| builder `__init__` | 签名 `(kv_cache_spec, layer_names, vllm_config, device)` 四参，定义 `__init__(*args, **kwargs)` 兼容 | — |
+| per-request 键 | 0.19 的 CommonAttentionMetadata 有 query_start_loc_cpu 但**无 req_ids** → 用 block id 元组当请求键 | 0.30 有 req_ids |
+| pool 布局 | **0.19.1 是 `[2, num_blocks, block_size, H_kv, D]`**：`kv_cache.unbind(0)` 得 K/V | 0.30 是 `[nb, bs, H, 2D]`，K=`[...,:D]` |
+| merge | `FullAttentionSpec.merge` 会丢子类字段 → CompressedKVSpec 自己 override（校验全等后 deepcopy） | 相同 |
+| serve 入口 | 优先 0.30 launchers 入口（model_tag→--model 映射），ImportError fallback：runpy 跑 `vllm.entrypoints.openai.api_server` 的 `__main__` | — |
 
 **仍需远程验证（代码里已带防御/日志，按顺序跑 smoke 即可暴露）**：
 
 | # | 待确认 | 失败时的症状 |
 |---|--------|--------------|
-| R1 | `register_kv_cache_spec` 签名 | import 即报错，按 registry 文件改一行 |
-| R2 | builder `__init__` 签名 / `super().build()` 返回后 setattr 是否被后续流程接受 | 启动期 TypeError |
-| R3 | Qwen3.6 config 是否带 MTP/spec-decode 层（第二条 attention 路径） | 若启动挂了 speculative 相关栈，加 `--speculative-config` 禁用 |
-| R4 | `api_server.main` 入口名 | serve.py 有 fallback 分支，都缺则按文件改一行 |
-| R5 | pool 视图在 spec `has_layer_views` 默认下确实按 [nb, H_kv, bs, 2D] 给到 forward | 第一次 forward 的 gather 形状 assert（日志里打 kv_cache.shape） |
-| R6 | 单卡 TP 下 num_kv_heads=2 与 customize_spec 字段透传 | 启动期字段缺失 TypeError |
+| R1 | vllm 0.19.1 wheel 的 CUDA flavor 是 cu128（与 torch 2.10.0+cu128 ABI 匹配） | import vllm 报 `libcudart.so` / `undefined symbol` → 换 0.18.x 或查 wheel flavor |
+| R2 | builder 初始化参不匹配 / metadata setattr 被后续流程拒绝 | 启动期 TypeError/AttributeError |
+| R3 | Qwen3.6 config 是否带 MTP/spec-decode 层（第二条 attention 路径） | 启动挂 speculative 栈 → 查 0.19 arg_utils 加禁用 flag |
+| R4 | GDN/Mamba 组与 full-attn 组的 spec 分组冲突（hybrid 模型两类 spec 共存） | 启动期 spec merge/grouping 报错 |
+| R5 | pool 视图在 spec `has_layer_views` 默认下确实按 [2,nb,bs,H,D] 给到 forward | 第一次 forward 的 gather 形状 assert（日志打 kv_cache.shape） |
+| R6 | TP=2 下 num_kv_heads=2 的切分与本插件的交互 | 启动期字段缺失 TypeError 或 forward 形状错 |
 
 ## 8. 远程 runbook
 
-```bash
-# 0) 环境：新 conda env + nightly wheel（不要源码编译 spike/vllm-src，那是本地只读参考副本）
-conda create -n vllm_py310 python=3.10 -y
-conda activate vllm_py310
-pip install vllm --pre --extra-index-url https://wheels.vllm.ai/nightly
-# 确认 Qwen3.6 arch 受支持（True 才能继续）：
-python -c "from vllm.model_executor.models.registry import ModelRegistry; print('Qwen3_5MoeForCausalLM' in ModelRegistry.get_supported_archs())"
-# 版本对齐说明：插件代码按 main@58b32984（2026-10-02）写的；nightly 接口若有漂移，
-# R1-R6 症状表（§7）会暴露，按症状改一行即可。别装 release 版——Qwen3_5Moe 太新，release 大概率没有。
-# 把本地 vllm_plugin/ 同步到远程 ~/lut-experiments/LLM_LUT/v8/ 后：
+**环境硬约束（实测确定，勿再试错）**：
+- 驱动 550.90.07（CUDA 12.4），共享机器**不能动驱动**。
+- torch 2.11+ 启动时硬性拒绝 <12.8 驱动；**只有 torch ≤2.10 的 minor 版本兼容可用**（cu128 runtime 跑在 12.4 驱动上，gemma4_infer env 已实测）。
+- PyPI pin 对照：vllm 0.18.0–0.19.1 → `torch==2.10.0`；0.20+ → 2.11/2.13（死路）。
+- **最终组合：vllm==0.19.1 + torch 2.10.0+cu128**，清华镜像安装。0.30 路线（libcudart.so.13 ABI 死局）已放弃。
+- 换 torch 时必须连带其配套 nvidia-* 包整体重装，混装出 `undefined symbol: ncclCommResume`。
 
-# 1) 静态验证（不用 GPU）：
+```bash
+# 0) 修 vllm_py310 env（之前装过 0.30.0 / 0.30.1rc1 nightly，都是 cu13 坏件，先清掉）：
+conda activate vllm_py310
+pip uninstall -y vllm
+pip install vllm==0.19.1 -i https://pypi.tuna.tsinghua.edu.cn/simple
+# 如 torch 不是 2.10.0+cu128（pip list 检查），先装 torch 再装 vllm：
+# pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128 -i https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 验证 import + CUDA + 驱动兼容（R1）：
+python -c "import torch; torch.zeros(1).cuda(); import vllm; print('ok', vllm.__version__)"
+# 确认 Qwen3.6 arch 受支持（True 才能继续）：
+python -c "from vllm.model_executor.models.registry import ModelRegistry; print('Qwen3_5MoeForConditionalGeneration' in ModelRegistry.get_supported_archs())"
+
+# 1) 静态验证（不用 GPU）：把本地 vllm_plugin/ 同步到远程 ~/lut-experiments/LLM_LUT/v8/ 后：
 cd ~/lut-experiments/LLM_LUT/v8 && python -m py_compile vllm_plugin/*.py && echo OK
 
 # 2) smoke：8k 单请求，确认 patch + spec 生效（在 v8 目录跑，包按相对目录可导入）：

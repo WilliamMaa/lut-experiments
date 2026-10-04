@@ -1,12 +1,12 @@
-"""CompressedKVImpl: full rewrite of the attention forward.
+"""CompressedKVImpl: full rewrite of the attention forward (vLLM 0.19.1).
 
-Interface (verified against vLLM commit 58b32984):
+Interface (verified against v0.19.1):
 - forward(layer, query, key, value, kv_cache, attn_metadata, output,
           output_scale=None, output_block_scale=None)
-  query [T, H, D]; key/value [T, H_kv, D]; output [T, H, D] (preallocated
-  view); returns [T, H*D].
-- kv_cache (per-layer pool view): [num_blocks, H_kv, block_size, 2*D];
-  K = [..., :D], V = [..., D:].
+  query [T, H, D]; key/value [T, H_kv, D]; output preallocated [T, H, D]
+  (None only in exotic paths; Attention.forward always passes it).
+- kv_cache (per-layer pool view, 0.19.1 layout): [2, num_blocks, block_size,
+  H_kv, D]; K = kv_cache[0], V = kv_cache[1] (see do_kv_cache_update unbind).
 - attn_metadata: CompressedKVMetadata with req_states / qsl_cpu /
   seq_lens_cpu attached by the builder.
 
@@ -26,7 +26,7 @@ import torch.nn.functional as F
 from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
 
 from . import eviction
-from .backend import CompressedKVMetadata
+from . import config
 
 
 class CompressedKVImpl(FlashAttentionImpl):
@@ -34,21 +34,16 @@ class CompressedKVImpl(FlashAttentionImpl):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.cfg = {  # snapshot at load; matches CompressedKVSpec defaults
-            "retention": 512, "sink": 4, "recent": 32,
-            "obs": 64, "span": 4,
-        }
-        from . import config
-        self.cfg.update({
+        self.cfg = {
             "retention": config.V8_COMPRESS_SLOTS,
             "sink": config.V8_SINK_TOKENS,
             "recent": config.V8_RECENT_TOKENS,
             "obs": config.V8_OBS_WINDOW,
             "span": config.V8_SPAN_WINDOW,
-        })
+        }
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
-                output, output_scale=None, output_block_scale=None):
+                output=None, output_scale=None, output_block_scale=None):
         if output_scale is not None or output_block_scale is not None:
             raise NotImplementedError(
                 "fused output quantization not supported for CompressedKV")
@@ -74,8 +69,6 @@ class CompressedKVImpl(FlashAttentionImpl):
     def _update_and_attend(self, st, kv_cache, q, k_new, v_new,
                            n_computed, H_kv, bs, output, qs, qe):
         C = q.shape[0]
-        D = q.shape[-1]
-        H = q.shape[1]
         device = q.device
         cfg = self.cfg
         budget = cfg["retention"]
@@ -83,7 +76,7 @@ class CompressedKVImpl(FlashAttentionImpl):
         recent_n = min(cfg["recent"], budget - sink_n)
         hh_budget = budget - sink_n - recent_n
 
-        st.ensure_gpu(device, H_kv, 0)
+        st.ensure_gpu(device)
         st.grow(max(n_computed + C + 1, budget + bs), device, H_kv)
 
         L = st.compact_len
@@ -92,16 +85,19 @@ class CompressedKVImpl(FlashAttentionImpl):
             arange_cap = torch.arange(budget + bs, device=device)
             st._gpu = (device, st.blk_tensor, arange_cap)
 
+        # 0.19.1 pool layout: kv_cache = [2, num_blocks, bs, H_kv, D].
+        k_cache, v_cache = kv_cache.unbind(0)
+
         # --- gather compact K/V from the request's private blocks ---
         # slot s -> block slot s//bs -> physical block st.blk[s//bs], offset
-        # s%bs. Pool layout: [num_blocks, H_kv, bs, 2*D].
+        # s%bs.
         k_comp = v_comp = None
         if L > 0:
             jb = arange_cap[:L] // bs
             off = arange_cap[:L] % bs
             bid = st.blk_tensor[jb]
-            k_comp = kv_cache[bid, :, off, :D].permute(1, 0, 2)  # [H_kv, L, D]
-            v_comp = kv_cache[bid, :, off, D:].permute(1, 0, 2)
+            k_comp = k_cache[bid, off].permute(1, 0, 2)  # [H_kv, L, D]
+            v_comp = v_cache[bid, off].permute(1, 0, 2)
 
         # --- combined (orig-order) view: [compact; new chunk] ---
         orig_new = n_computed + arange_cap[:C]
@@ -174,11 +170,11 @@ class CompressedKVImpl(FlashAttentionImpl):
         jb2 = arange_cap[:L2] // bs
         off2 = arange_cap[:L2] % bs
         bid2 = st.blk_tensor[jb2]
-        kv_cache[bid2, :, off2, :D] = k_all.permute(1, 0, 2)
-        kv_cache[bid2, :, off2, D:] = v_all.permute(1, 0, 2)
+        k_cache[bid2, off2] = k_all.permute(1, 0, 2)
+        v_cache[bid2, off2] = v_all.permute(1, 0, 2)
 
         # --- attention ---
-        n_rep = H // H_kv
+        n_rep = q.shape[1] // H_kv
         k_attn = k_all.repeat_interleave(n_rep, dim=0)   # [H, L2(+C), D]
         v_attn = v_all.repeat_interleave(n_rep, dim=0)
         q_h = q.permute(1, 0, 2)                          # [H, C, D]

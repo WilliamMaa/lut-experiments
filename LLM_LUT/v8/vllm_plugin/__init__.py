@@ -1,16 +1,19 @@
-"""v8 compressed-KV vLLM plugin.
+"""v8 compressed-KV vLLM plugin (vLLM 0.19.1 target).
 
-Importing this package and calling patch() (or using `python -m
-vllm_plugin.serve`) injects CompressedKVBackend into every full-attention
-layer of the target model (default Qwen3_5MoeForCausalLM). GDN/linear
-layers never construct vllm Attention modules, so gating on the model arch
-is sufficient — every Attention built during Qwen3.6 model init is a
-full-attn layer.
+patch() performs three monkeypatches:
+1. Attention.__init__: inject CompressedKVBackend into every full-attention
+   layer of the target model. GDN/linear layers never construct vllm
+   Attention modules, so gating on the model arch is sufficient.
+2. Attention.get_kv_cache_spec: convert the layer's FullAttentionSpec into
+   CompressedKVSpec (0.19.1 has no customize_spec hook). Without this the
+   allocator group keeps the stock max_model_len-sized spec.
+3. SingleTypeKVCacheManager.get_num_blocks_to_allocate: cap per-request
+   blocks at spec.blocks_per_request (see backend.patch_allocator).
 
-v1 constraints (enforced/documented, not optional):
+v1 constraints (enforced in serve.py, not optional):
 - --enforce-eager (per-request Python state, no CUDA graphs)
-- no prefix caching for the compressed group (spec reports
-  prefix_cacheable=False)
+- prefix caching disabled (block reuse would alias compact regions; 0.19.1
+  has no per-spec prefix_cacheable flag, so it is forced off on the CLI)
 """
 from . import config  # noqa: F401  (env constants, imported by all modules)
 
@@ -21,6 +24,14 @@ def patch() -> None:
     global _patched
     if _patched:
         return
+    _patch_attention_backend()
+    _patch_get_kv_cache_spec()
+    from .backend import patch_allocator
+    patch_allocator()
+    _patched = True
+
+
+def _patch_attention_backend() -> None:
     from vllm.model_executor.layers.attention.attention import Attention
 
     from .backend import CompressedKVBackend
@@ -33,7 +44,26 @@ def patch() -> None:
         orig_init(self, *args, **kwargs)
 
     Attention.__init__ = patched_init
-    _patched = True
+
+
+def _patch_get_kv_cache_spec() -> None:
+    from vllm.model_executor.layers.attention.attention import Attention
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    from .backend import spec_from_full
+
+    orig_get_spec = Attention.get_kv_cache_spec
+
+    def patched_get_spec(self, vllm_config):
+        spec = orig_get_spec(self, vllm_config)
+        if (_target_model()
+                and type(spec) is FullAttentionSpec  # not SlidingWindowSpec
+                and self.attn_backend is not None
+                and self.attn_backend.get_name() == "V8_COMPRESSED"):
+            return spec_from_full(spec)
+        return spec
+
+    Attention.get_kv_cache_spec = patched_get_spec
 
 
 def _target_model() -> bool:

@@ -1,14 +1,21 @@
-"""CompressedKVBackend + metadata builder.
+"""CompressedKVBackend + metadata builder + allocator cap patch.
 
-Integration facts (vLLM commit 58b32984, verified against source):
-- customize_spec is applied centrally per attention module at
-  vllm/v1/worker/gpu/attn_utils.py, after the model builds the layer spec.
-- The builder sees CommonAttentionMetadata (query_start_loc_cpu, seq_lens,
-  block_table_tensor, ...). There is no req_id here, so per-request state is
-  keyed by the request's block ids (unique while alive; a reused id means the
-  old request finished -> mismatch check recreates the state).
-- v1 is eager-only: per-request state is a Python object with GPU tensors,
-  which cannot be CUDA-graph captured. --enforce-eager is mandatory.
+Integration facts (vLLM v0.19.1, verified against spike/vllm-src-019):
+- Attention.__init__ accepts attn_backend=... (attention.py:202) — injected
+  by monkeypatch (vllm_plugin/__init__.py).
+- No customize_spec in 0.19.1: Attention.get_kv_cache_spec returns
+  FullAttentionSpec directly (attention.py:537) — the monkeypatch converts it.
+- Builder signature in 0.19.1: (kv_cache_spec, layer_names, vllm_config,
+  device) — our __init__ takes (*args, **kwargs).
+- Builder.build(common_prefix_len, common_attn_metadata, fast_build=False)
+  consumes CommonAttentionMetadata (query_start_loc_cpu, seq_lens,
+  block_table_tensor, ...). No req_ids: per-request state is keyed by the
+  request's block-id tuple (unique while alive; reuse => recreate).
+- Allocator: single_type_kv_cache_manager.get_num_blocks_to_allocate
+  computes cdiv(num_tokens, block_size) with no spec hook — monkeypatched
+  to clamp at spec.blocks_per_request (see patch_allocator).
+- v1 is eager-only: per-request Python state cannot be CUDA-graph captured.
+  --enforce-eager is mandatory (enforced in serve.py).
 """
 import torch
 from vllm.v1.attention.backends.flash_attn import (
@@ -42,7 +49,7 @@ class RequestKVState:
         self.snap_len = 0
         self._gpu = None                # (device, blk_tensor, arange_cache)
 
-    def ensure_gpu(self, device, h_kv, cap_hint):
+    def ensure_gpu(self, device):
         if self._gpu is not None and self._gpu[0] == device:
             return
         blk = torch.tensor(self.blocks, dtype=torch.long, device=device)
@@ -56,7 +63,8 @@ class RequestKVState:
         new_cap = max(needed, 2 * cap, 4096)
         orig = torch.zeros(new_cap, dtype=torch.long, device=device)
         snap = torch.zeros(new_cap, dtype=torch.float32, device=device)
-        snap_ph = torch.zeros(h_kv, new_cap, dtype=torch.float32, device=device)
+        snap_ph = torch.zeros(h_kv, new_cap, dtype=torch.float32,
+                              device=device)
         if self.orig is not None:
             orig[:cap] = self.orig
             snap[:cap] = self.snap
@@ -76,7 +84,6 @@ class CompressedKVMetadata(FlashAttentionMetadata):
     """
 
     req_states: list = None
-    # CPU copies for chunk bookkeeping (one small .cpu() per forward).
     qsl_cpu: object = None
     seq_lens_cpu: object = None
 
@@ -95,33 +102,12 @@ class CompressedKVBackend(FlashAttentionBackend):
     def get_builder_cls():
         return CompressedKVMetadataBuilder
 
-    @classmethod
-    def customize_spec(cls, spec):
-        # Only full-attention layers of the target model; Mamba/GDN specs and
-        # already-compressed specs pass through untouched.
-        if isinstance(spec, CompressedKVSpec):
-            return spec
-        if not isinstance(spec, FullAttentionSpec):
-            return spec
-        return CompressedKVSpec(
-            block_size=spec.block_size,
-            num_kv_heads=spec.num_kv_heads,
-            head_size=spec.head_size,
-            head_size_v=spec.head_size_v,
-            dtype=spec.dtype,
-            kv_quant_mode=spec.kv_quant_mode,
-            retention_tokens=config.V8_COMPRESS_SLOTS,
-            sink_tokens=config.V8_SINK_TOKENS,
-            recent_tokens=config.V8_RECENT_TOKENS,
-            obs_window=config.V8_OBS_WINDOW,
-            span_window=config.V8_SPAN_WINDOW,
-        )
-
 
 class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
-    def __init__(self, kv_cache_spec, vllm_config):
-        super().__init__(kv_cache_spec, vllm_config)
-        self.spec = kv_cache_spec
+    def __init__(self, *args, **kwargs):
+        # 0.19.1 signature: (kv_cache_spec, layer_names, vllm_config, device)
+        super().__init__(*args, **kwargs)
+        self.spec = args[0] if args else kwargs["kv_cache_spec"]
         self.states: dict[int, RequestKVState] = {}
 
     def build(self, common_prefix_len, common_attn_metadata,
@@ -129,8 +115,9 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
         md = super().build(common_prefix_len, common_attn_metadata,
                            fast_build)
         nblk = self.spec.blocks_per_request
-        # block_table_tensor: [num_reqs, max_blocks] (GPU). Row width for our
-        # group is exactly nblk (max_num_blocks_per_req is constant).
+        # block_table_tensor: [num_reqs, max_blocks] (GPU). Our group's row
+        # holds the request's private blocks at [0, blocks_per_request);
+        # entries beyond are padding and never touched by us.
         bt = common_attn_metadata.block_table_tensor[:, :nblk].cpu()
         req_states = []
         for i in range(common_attn_metadata.num_reqs):
@@ -145,3 +132,49 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
         md.qsl_cpu = common_attn_metadata.query_start_loc_cpu
         md.seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
         return md
+
+
+def patch_allocator() -> None:
+    """Clamp per-request block allocation to blocks_per_request.
+
+    0.19.1 has no spec hook here: get_num_blocks_to_allocate derives the
+    requirement from the token count, which would demand 4096 blocks for a
+    64k request and defeat the compression. Clamping num_tokens passed to
+    the original implementation caps both the initial allocation and all
+    growth, keeping the request's footprint at blocks_per_request blocks.
+    """
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        SingleTypeKVCacheManager)
+
+    if getattr(SingleTypeKVCacheManager, "_v8_patched", False):
+        return
+    orig = SingleTypeKVCacheManager.get_num_blocks_to_allocate
+
+    def patched(self, request_id, num_tokens, new_computed_blocks,
+                total_computed_tokens, num_tokens_main_model):
+        spec = self.kv_cache_spec
+        if isinstance(spec, CompressedKVSpec):
+            cap_tokens = spec.blocks_per_request * spec.block_size
+            if num_tokens > cap_tokens:
+                num_tokens = cap_tokens
+        return orig(self, request_id, num_tokens, new_computed_blocks,
+                    total_computed_tokens, num_tokens_main_model)
+
+    SingleTypeKVCacheManager.get_num_blocks_to_allocate = patched
+    SingleTypeKVCacheManager._v8_patched = True
+
+
+def spec_from_full(spec: FullAttentionSpec) -> CompressedKVSpec:
+    """Convert a layer's FullAttentionSpec (built by Attention layer)."""
+    return CompressedKVSpec(
+        block_size=spec.block_size,
+        num_kv_heads=spec.num_kv_heads,
+        head_size=spec.head_size,
+        head_size_v=spec.head_size_v,
+        dtype=spec.dtype,
+        retention_tokens=config.V8_COMPRESS_SLOTS,
+        sink_tokens=config.V8_SINK_TOKENS,
+        recent_tokens=config.V8_RECENT_TOKENS,
+        obs_window=config.V8_OBS_WINDOW,
+        span_window=config.V8_SPAN_WINDOW,
+    )
