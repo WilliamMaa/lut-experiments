@@ -655,6 +655,12 @@ bash tools/run_slots_sweep.sh
 - API server 的 prompt 长度校验读 `model_config.max_model_len`；报 "maximum context length is 163"
   这类怪数先 `grep "Using max model len" logs/xxx.log`，十有八九是启动命令 max-model-len 写错或
   端口被旧进程占用，与插件无关。
+- **pkill 杀不干净 vLLM**：`pkill -f "vllm_plugin.serve"` 只杀 APIServer 主进程；spawn 的
+  EngineCore/Worker 子进程 cmdline 是 `spawn_main`，不匹配模式，变孤儿继续占显存（实测 GPU 0/1
+  堆到 73GB，新服务报 `ValueError: Free memory (5.77/79.32 GiB) < desired (0.9)`）。
+  **解法（已封装进 tools/run_slots_sweep.sh 的 cleanup()）**：pkill 主进程后，按目标 GPU 的
+  compute-apps 表查 pid，只杀自己 uid 的；起服务前显存 >10GiB 就等。**教训：重启类脚本不能只
+  pkill 主进程，必须验证显存真的释放了。**
 - 推理模型（Qwen3 thinking）会烧光 max_tokens：所有评测/召回请求必须带
   `"chat_template_kwargs": {"enable_thinking": False}`，否则答案全是 thinking 过程。
 

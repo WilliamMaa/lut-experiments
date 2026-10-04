@@ -21,9 +21,55 @@ STARTUP_SLEEP="${STARTUP_SLEEP:-240}"
 cd "$(dirname "$0")/.." || exit 1
 mkdir -p results logs
 
+# pkill -f "vllm_plugin.serve" only kills the APIServer main process; the
+# spawned EngineCore/Worker children have `spawn_main` cmdlines that don't
+# match, turn into orphans, and keep holding GPU memory (实测堆到 73GB 后
+# 新服务 ValueError: Free memory ... less than desired)。清理必须走 GPU
+# 占用表，且只杀自己 uid 的进程（共享机，不能误伤别人）。
+cleanup() {
+    pkill -f "vllm_plugin.serve" 2>/dev/null
+    sleep 3
+    local me gpu pid owner
+    me=$(id -u)
+    for gpu in ${GPUS//,/ }; do
+        for pid in $(nvidia-smi --query-compute-apps=pid --format=csv,noheader --id="$gpu" 2>/dev/null); do
+            owner=$(stat -c %u "/proc/$pid" 2>/dev/null)
+            if [ "$owner" = "$me" ]; then
+                echo "  killing leftover pid=$pid on GPU $gpu"
+                kill "$pid" 2>/dev/null
+            fi
+        done
+    done
+    sleep 5
+}
+
+# refuse to start until every target GPU has < 10 GiB residue (fresh server
+# needs ~40 GiB per GPU for this model)
+wait_gpus_free() {
+    local gpu used_mib retries=0 ok
+    while [ "$retries" -lt 30 ]; do
+        ok=1
+        for gpu in ${GPUS//,/ }; do
+            used_mib=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits --id="$gpu" 2>/dev/null | head -1)
+            if [ "${used_mib:-99999}" -gt 10000 ]; then
+                echo "  GPU $gpu still used: ${used_mib} MiB, waiting..."
+                ok=0
+            fi
+        done
+        [ "$ok" = "1" ] && return 0
+        sleep 10
+        retries=$((retries + 1))
+    done
+    echo "GPUs did not free up in 300s; check nvidia-smi and kill leftovers manually"
+    return 1
+}
+
 for S in $SLOTS_LIST; do
     echo "=== slots=$S ==="
-    pkill -f "vllm_plugin.serve" 2>/dev/null ; sleep 3
+    cleanup
+    if ! wait_gpus_free; then
+        continue
+    fi
 
     CUDA_VISIBLE_DEVICES="$GPUS" V8_COMPRESS_SLOTS="$S" \
         python -m vllm_plugin.serve "$MODEL" \
