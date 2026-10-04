@@ -134,6 +134,18 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
         return md
 
 
+def register_spec_manager() -> None:
+    """Map CompressedKVSpec -> FullAttentionManager in the coordinator's
+    spec_manager_map (engine-core proc). Behaviorally we are full attention
+    with a clamped per-request budget (patch_allocator), so the stock
+    manager fits; without this, get_manager_for_kv_cache_spec KeyErrors.
+    """
+    from vllm.v1.core.single_type_kv_cache_manager import (
+        FullAttentionManager, spec_manager_map)
+
+    spec_manager_map.setdefault(CompressedKVSpec, FullAttentionManager)
+
+
 def register_backend_enum() -> None:
     """Attention.__init__ (attention.py:350) resolves
     ``AttentionBackendEnum[self.attn_backend.get_name()]``; the enum is

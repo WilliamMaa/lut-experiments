@@ -26,8 +26,10 @@ def patch() -> None:
         return
     _patch_attention_backend()
     _patch_get_kv_cache_spec()
-    from .backend import patch_allocator, register_backend_enum
+    from .backend import (patch_allocator, register_backend_enum,
+                          register_spec_manager)
     register_backend_enum()
+    register_spec_manager()
     patch_allocator()
     _patched = True
     # Runs in the API-server process: this line in the log proves patch()
