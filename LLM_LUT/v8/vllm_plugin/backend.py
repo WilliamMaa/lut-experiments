@@ -153,7 +153,8 @@ def register_backend_enum() -> None:
     setattr(AttentionBackendEnum, "V8_COMPRESSED", member)
 
 
-def patch_allocator() -> None:    """Clamp per-request block allocation to blocks_per_request.
+def patch_allocator() -> None:
+    """Clamp per-request block allocation to blocks_per_request.
 
     0.19.1 has no spec hook here: get_num_blocks_to_allocate derives the
     requirement from the token count, which would demand 4096 blocks for a
