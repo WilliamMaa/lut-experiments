@@ -596,6 +596,9 @@ cd ~/lut-experiments/LLM_LUT/v8 && python -m py_compile vllm_plugin/*.py && echo
 
 # 2) smoke：8k 单请求，确认 patch + spec 生效（在 v8 目录跑，包按相对目录可导入）：
 cd ~/lut-experiments/LLM_LUT/v8 && V8_COMPRESS_SLOTS=512 python -m vllm_plugin.serve /home/u/downloads/models/Qwen3.6-35B-A3B --enforce-eager --max-model-len 16384 --tensor-parallel-size 2 --max-num-seqs 4 --port 18001 > logs/vllm_smoke.log 2>&1 &
+
+python tools/check_compressed_serve.py --model /home/u/downloads/models/Qwen3.6-35B-A3B --log logs/vllm_smoke.log
+
 # 期待: 日志出现 [v8_plugin] first obs scoring / first eviction；并发请求时 nvidia-smi 显存不随 prompt 长度涨
 # 发一个请求验证（换真实 prompt 即可）：
 curl -s localhost:18001/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"/home/u/downloads/models/Qwen3.6-35B-A3B","messages":[{"role":"user","content":"用一句话介绍你自己"}],"max_tokens":64}'

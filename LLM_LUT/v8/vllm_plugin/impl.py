@@ -81,8 +81,13 @@ class CompressedKVImpl(FlashAttentionImpl):
 
         L = st.compact_len
         arange_cap = st._gpu[2]
-        if arange_cap is None or arange_cap.numel() < budget + bs:
-            arange_cap = torch.arange(budget + bs, device=device)
+        # arange_cap must cover C (chunk length), not just budget+bs —
+        # a 2065-token prefill with bs=32 needs 2065 entries, and a
+        # truncated slice would silently shrink orig_all (debugged from
+        # "Number of indices (544) != source.size(2065)").
+        need_ar = max(n_computed + C + 1, budget + bs)
+        if arange_cap is None or arange_cap.numel() < need_ar:
+            arange_cap = torch.arange(need_ar, device=device)
             st._gpu = (device, st.blk_tensor, arange_cap)
 
         # 0.19.1 pool layout: kv_cache = [2, num_blocks, bs, H_kv, D].
