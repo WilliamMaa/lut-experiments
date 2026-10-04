@@ -32,9 +32,11 @@ def patch() -> None:
     # Runs in the API-server process: this line in the log proves patch()
     # executed and which code version is live. Absent => stale files or
     # serve.py never reached patch().
+    import os
     print(f"[v8_plugin] patch() installed v{config.PLUGIN_VERSION}, "
           f"TARGET_ARCH={config.TARGET_ARCH}, "
-          f"slots={config.V8_COMPRESS_SLOTS}", flush=True)
+          f"slots={config.V8_COMPRESS_SLOTS}, "
+          f"mp={os.environ.get('VLLM_WORKER_MULTIPROC_METHOD')}", flush=True)
 
 
 def _patch_attention_backend() -> None:

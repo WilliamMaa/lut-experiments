@@ -553,6 +553,7 @@ CUDA graph、prefix caching、SLA/排队模型。
 | pool 布局 | **0.19.1 是 `[2, num_blocks, block_size, H_kv, D]`**：`kv_cache.unbind(0)` 得 K/V | 0.30 是 `[nb, bs, H, 2D]`，K=`[...,:D]` |
 | merge | `FullAttentionSpec.merge` 会丢子类字段 → CompressedKVSpec 自己 override（校验全等后 deepcopy） | 相同 |
 | serve 入口 | 优先 0.30 launchers 入口（model_tag→--model 映射），ImportError fallback：runpy 跑 `vllm.entrypoints.openai.api_server` 的 `__main__`。**0.19 的 api_server 自己不做 model_tag→--model 映射**（在 cli/serve.py 里，被 bypass），serve.py 已手动补 | 实机踩过：不补会回落默认模型 `Qwen/Qwen3-0.6B` 去连 HF |
+| **子进程启动方式** | **0.19 的 OpenAI 入口强制 `VLLM_WORKER_MULTIPROC_METHOD=spawn`**（entrypoints/utils.py），spawn 的子进程全新解释器，**API server 进程里的 monkeypatch 根本到不了 EngineCore/Worker** → 症状：patch() 日志在、注入日志全无、服务正常跑 stock attention | 实机踩过。serve.py 顶部 `os.environ.setdefault(..., "fork")` 解决（在 CUDA 初始化前设置，`_maybe_force_spawn` 不会覆盖） |
 
 **仍需远程验证（代码里已带防御/日志，按顺序跑 smoke 即可暴露）**：
 

@@ -10,7 +10,16 @@ v1 requires --enforce-eager (checked below). Prefix caching is force-
 disabled: block reuse across requests would alias per-request compact
 regions (0.19.1 has no per-spec prefix_cacheable flag).
 """
+import os
 import sys
+
+# vLLM's OpenAI entrypoint forces VLLM_WORKER_MULTIPROC_METHOD=spawn
+# (vllm/entrypoints/utils.py), which discards our monkeypatches: spawned
+# EngineCore/Worker procs re-import vllm in fresh interpreters. The patch
+# MUST live in those procs (model lives there), so force fork. Safe here:
+# set before any vllm import and before CUDA init, so _maybe_force_spawn
+# has no reason to override.
+os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "fork")
 
 _PREFIX_FLAGS = ("--no-enable-prefix-caching", "--enable-prefix-caching",
                  "--disable-prefix-caching")
