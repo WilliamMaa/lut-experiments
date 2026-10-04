@@ -13,13 +13,20 @@ regions (0.19.1 has no per-spec prefix_cacheable flag).
 import os
 import sys
 
-# vLLM's OpenAI entrypoint forces VLLM_WORKER_MULTIPROC_METHOD=spawn
-# (vllm/entrypoints/utils.py), which discards our monkeypatches: spawned
-# EngineCore/Worker procs re-import vllm in fresh interpreters. The patch
-# MUST live in those procs (model lives there), so force fork. Safe here:
-# set before any vllm import and before CUDA init, so _maybe_force_spawn
-# has no reason to override.
-os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "fork")
+# vLLM 0.19.1 forces VLLM_WORKER_MULTIPROC_METHOD=spawn for this model
+# (multimodal init initializes CUDA in the API-server proc, so fork gets
+# overridden and in-process monkeypatches never reach EngineCore/Worker
+# procs). With spawn, every child re-runs a fresh interpreter — so we make
+# each child patch itself: put the plugin and its _bootstrap dir (holding a
+# sitecustomize.py) on PYTHONPATH and flip the autopath switch. Every
+# spawned interpreter then applies the patch at startup, before vllm loads
+# the model. Must happen before any vllm import.
+os.environ["V8_PLUGIN_AUTOPATCH"] = "1"
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_HERE)
+_BOOTSTRAP = os.path.join(_HERE, "_bootstrap")
+os.environ["PYTHONPATH"] = os.pathsep.join(
+    p for p in (_ROOT, _BOOTSTRAP, os.environ.get("PYTHONPATH", "")) if p)
 
 _PREFIX_FLAGS = ("--no-enable-prefix-caching", "--enable-prefix-caching",
                  "--disable-prefix-caching")

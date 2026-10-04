@@ -36,7 +36,7 @@ def patch() -> None:
     print(f"[v8_plugin] patch() installed v{config.PLUGIN_VERSION}, "
           f"TARGET_ARCH={config.TARGET_ARCH}, "
           f"slots={config.V8_COMPRESS_SLOTS}, "
-          f"mp={os.environ.get('VLLM_WORKER_MULTIPROC_METHOD')}", flush=True)
+          f"pid={os.getpid()}", flush=True)
 
 
 def _patch_attention_backend() -> None:
