@@ -191,7 +191,8 @@ class CompressedKVImpl(FlashAttentionImpl):
             mask = torch.zeros(1, 1, C, L2 + C, device=device,
                                dtype=torch.float32)
             mask[..., L2:] = causal
-            attn_mask = mask
+            # SDPA requires attn_mask dtype == query dtype (bf16 here).
+            attn_mask = mask.to(q_h.dtype)
         else:
             attn_mask = None
         o = F.scaled_dot_product_attention(
