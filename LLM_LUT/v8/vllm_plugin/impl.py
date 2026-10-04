@@ -132,7 +132,7 @@ class CompressedKVImpl(FlashAttentionImpl):
             if not getattr(self, "_v8_scored_logged", False):
                 self._v8_scored_logged = True
                 print(f"[v8_plugin] first obs scoring: L={L} C={C} "
-                      f"W={W} snap_len={st.snap_len}")
+                      f"W={W} snap_len={st.snap_len}", flush=True)
 
         # --- evict (before the chunk becomes visible: invariant 4) ---
         if total_len > budget:
@@ -165,7 +165,8 @@ class CompressedKVImpl(FlashAttentionImpl):
                 self._v8_evict_logged = True
                 print(f"[v8_plugin] first eviction: kept="
                       f"{int(kept.shape[0])} L={st.compact_len} "
-                      f"orig=[{int(new_orig[0])}..{int(new_orig[-1])}]")
+                      f"orig=[{int(new_orig[0])}..{int(new_orig[-1])}]",
+                      flush=True)
         else:
             st.orig[:total_len] = orig_all
             st.compact_len = total_len

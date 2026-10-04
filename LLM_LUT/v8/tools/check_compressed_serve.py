@@ -18,6 +18,8 @@ Usage (remote, from LLM_LUT/v8):
 
 Stdlib only. Exit code 0 iff all tests pass.
 """
+SCRIPT_VERSION = "v2"  # v2: no_thinking + version banner
+
 import argparse
 import json
 import sys
@@ -114,6 +116,8 @@ def main():
     args = ap.parse_args()
 
     scan = LogScan(args.log)
+    print(f"[check_compressed_serve] script {SCRIPT_VERSION}, "
+          f"base={args.base_url}")
     failures = []
 
     def check(name, ok, detail=""):
