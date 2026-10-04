@@ -14,7 +14,7 @@ MODEL="${MODEL:-/home/u/downloads/models/Qwen3.6-35B-A3B}"
 DATA="${DATA:-data/longctx_multi_turn_65536.jsonl}"
 SLOTS_LIST="${SLOTS_LIST:-1024 2048 4096}"
 PORT="${PORT:-18002}"
-GPUS="${GPUS:-0,1}"
+GPUS="${GPUS:-6,7}"
 MAX_LEN=131072
 STARTUP_SLEEP="${STARTUP_SLEEP:-240}"
 
