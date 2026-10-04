@@ -11,8 +11,10 @@ V8_RECENT_TOKENS = int(os.environ.get("V8_RECENT_TOKENS", "32"))
 V8_OBS_WINDOW = int(os.environ.get("V8_OBS_WINDOW", "64"))
 V8_SPAN_WINDOW = int(os.environ.get("V8_SPAN_WINDOW", "4"))
 
-# Only this arch gets the compressed backend injected.
-TARGET_ARCH = os.environ.get("V8_TARGET_ARCH", "Qwen3_5MoeForCausalLM")
+# Only this arch gets the compressed backend injected. Comma-separated
+# substring match against config.architectures.
+TARGET_ARCH = os.environ.get(
+    "V8_TARGET_ARCH", "Qwen3_5MoeForConditionalGeneration")
 
 # Margin (in blocks) added on top of the retention budget. Eviction keeps
 # L <= retention strictly, the margin only covers decode append-then-evict

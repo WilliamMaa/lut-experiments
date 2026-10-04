@@ -41,6 +41,7 @@ def _patch_attention_backend() -> None:
     def patched_init(self, *args, **kwargs):
         if kwargs.get("attn_backend") is None and _target_model():
             kwargs["attn_backend"] = CompressedKVBackend
+            _log_inject_once()
         orig_init(self, *args, **kwargs)
 
     Attention.__init__ = patched_init
@@ -72,4 +73,18 @@ def _target_model() -> bool:
         archs = get_current_vllm_config().model_config.architectures
     except Exception:
         return False
-    return any(config.TARGET_ARCH in a for a in (archs or []))
+    if not archs:
+        return False
+    return any(t in a for t in config.TARGET_ARCH.split(",")
+               for a in archs)
+
+
+_inject_logged = False
+
+
+def _log_inject_once() -> None:
+    global _inject_logged
+    if not _inject_logged:
+        _inject_logged = True
+        print("[v8_plugin] injected CompressedKVBackend into full-attn "
+              f"layers (slots={config.V8_COMPRESS_SLOTS})", flush=True)
