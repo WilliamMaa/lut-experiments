@@ -134,8 +134,26 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
         return md
 
 
-def patch_allocator() -> None:
-    """Clamp per-request block allocation to blocks_per_request.
+def register_backend_enum() -> None:
+    """Attention.__init__ (attention.py:350) resolves
+    ``AttentionBackendEnum[self.attn_backend.get_name()]``; the enum is
+    closed, so inject a V8_COMPRESSED member at runtime. The value follows
+    the enum's convention (default class path), so get_path()/get_class()
+    resolve without register_backend overrides.
+    """
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+
+    if "V8_COMPRESSED" in AttentionBackendEnum._member_map_:
+        return
+    member = object.__new__(AttentionBackendEnum)
+    member._name_ = "V8_COMPRESSED"
+    member._value_ = "vllm_plugin.backend.CompressedKVBackend"
+    AttentionBackendEnum._member_map_["V8_COMPRESSED"] = member
+    AttentionBackendEnum._value2member_map_[member._value_] = member
+    setattr(AttentionBackendEnum, "V8_COMPRESSED", member)
+
+
+def patch_allocator() -> None:    """Clamp per-request block allocation to blocks_per_request.
 
     0.19.1 has no spec hook here: get_num_blocks_to_allocate derives the
     requirement from the token count, which would demand 4096 blocks for a

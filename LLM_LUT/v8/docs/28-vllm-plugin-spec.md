@@ -554,6 +554,7 @@ CUDA graph、prefix caching、SLA/排队模型。
 | merge | `FullAttentionSpec.merge` 会丢子类字段 → CompressedKVSpec 自己 override（校验全等后 deepcopy） | 相同 |
 | serve 入口 | 优先 0.30 launchers 入口（model_tag→--model 映射），ImportError fallback：runpy 跑 `vllm.entrypoints.openai.api_server` 的 `__main__`。**0.19 的 api_server 自己不做 model_tag→--model 映射**（在 cli/serve.py 里，被 bypass），serve.py 已手动补 | 实机踩过：不补会回落默认模型 `Qwen/Qwen3-0.6B` 去连 HF |
 | **子进程启动方式** | **0.19 的 OpenAI 入口强制 `VLLM_WORKER_MULTIPROC_METHOD=spawn`**（entrypoints/utils.py）。Qwen3.6 是多模态模型，mm 初始化在 API server 进程就初始化了 CUDA → `_maybe_force_spawn` 以 "CUDA is initialized" 为由**强制覆盖 fork**。spawn 的子进程全新解释器，API server 里的 monkeypatch 到不了 EngineCore/Worker → 症状：patch() 日志在、注入日志全无、服务正常跑 stock attention | 实机踩过（fork 方案被覆盖）。**解法：sitecustomize 自举**——serve.py 把插件根目录和 `_bootstrap/`（含 sitecustomize.py）注入 PYTHONPATH 并设 `V8_PLUGIN_AUTOPATCH=1`；spawn 子进程解释器启动时自动 import sitecustomize → 各进程自己 patch 自己。patch 失败时 sitecustomize 直接 sys.exit(1)，拒绝静默回退 stock attention |
+| **AttentionBackendEnum** | `Attention.__init__` 会执行 `AttentionBackendEnum[backend.get_name()]`（attention.py:350），枚举是闭集，`V8_COMPRESSED` 不在其中 → ValueError。**解法：运行时给枚举注入成员**（`backend.register_backend_enum()`，value 按惯例填类路径，get_path/get_class 无需 override） | 实机踩过 |
 
 **仍需远程验证（代码里已带防御/日志，按顺序跑 smoke 即可暴露）**：
 
