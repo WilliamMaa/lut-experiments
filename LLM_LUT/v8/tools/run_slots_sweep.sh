@@ -39,8 +39,9 @@ for S in $SLOTS_LIST; do
         fi
         sleep 10
         if [ "$i" -eq $((STARTUP_SLEEP / 10)) ]; then
-            echo "FAILED to start slots=$S, last log lines:"
-            tail -20 "logs/vllm_64k_s${S}.log"
+            echo "FAILED to start slots=$S, root cause (Traceback sections):"
+            grep -n -A30 "Traceback" "logs/vllm_64k_s${S}.log" | head -120
+            echo "--- (log: logs/vllm_64k_s${S}.log) ---"
             continue 2
         fi
     done

@@ -635,7 +635,11 @@ python tools/dump_eval_answers.py --results results/eval_64k_compressed.json
 #    显存不是约束（compressed spec 后 36.75GiB 仅用零头），slots 拉大是 MB 级成本。
 #    已封装为脚本（推荐：整文件传输，杜绝粘贴掉字符；health 轮询代替盲等 240s）：
 bash tools/run_slots_sweep.sh
-#    跑完自动汇总三档 fact_acc。加档/换数据用环境变量：
+#    跑完自动汇总三档 fact_acc。启动失败会自动 grep Traceback 段打印根因（
+#    外层 RuntimeError: Engine core initialization failed 只是包装，根因永远在更上面）。
+#    已知的两类根因：端口被旧进程占用（pkill 没杀干净，lsof -i:18002 查）；
+#    显存没释放（上一进程 GPU 0,1 还挂着，nvidia-smi 查）。
+#    修法都是杀掉残留进程后重跑，脚本幂等，直接再 bash 一次即可。加档/换数据用环境变量：
 #    SLOTS_LIST="512 8192" DATA=data/longctx_multi_turn_32768.jsonl bash tools/run_slots_sweep.sh
 #    产出 Pareto：slots {512,1024,2048,4096} × fact_acc × prefill 秒数，写报告用。
 
