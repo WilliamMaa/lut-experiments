@@ -558,7 +558,9 @@ CUDA graph、prefix caching、SLA/排队模型。
 | **spec_manager_map** | EngineCore 的 coordinator 用 `spec_manager_map[type(spec)]` 选管理器类（single_type_kv_cache_manager.py:1129），自定义 spec 不在表里 → KeyError。**解法：patch() 里 `spec_manager_map.setdefault(CompressedKVSpec, FullAttentionManager)`**（行为上=预算被 clamp 的 full attention） | 实机踩过 |
 | **get_kv_cache_spec 时序** | worker 在 `_initialize_kv_caches` 里对每个 Attention 实例调 `get_kv_cache_spec()`（gpu_model_runner.py:6926），此时**可能不在 `set_current_vllm_config` 上下文内** → `get_current_vllm_config()` 抛异常；若转换函数里做 arch 门控并吞异常会静默跳过（症状：patch/注入日志都在、并发上限数字不变）。**解法：转换处不做 config 依赖的门控**（backend 名字已足以证明身份） | 实机踩过（g 版修复，采纳后并发上限 192x→729x） |
 
-**仍需远程验证（代码里已带防御/日志，按顺序跑 smoke 即可暴露）**：
+| **prefill chunk 长度** | vLLM 按 8192 chunk 一次喂入（C 可达数千），arange 辅助张量只按 `budget+bs`（544）开 → `arange_cap[:C]` 静默截断 → `index_copy_` 报 `Number of indices (544) != source.size(2065)`（v2026-10-04j 实机踩过）。**解法：`need_ar = max(n_computed + C + 1, budget + bs)`，不够大就重建** | 同类坑：凡按 token 开表的辅助张量都要按 C 校验 |
+
+**远程验证状态（2026-10-04 smoke ALL PASS 后更新）**：R1–R6 全部实机通过——0.19.1+cu128 import 正常、builder/metadata 无 TypeError、无 MTP 第二路径、GDN 组与 full-attn 组 spec 共存未炸、pool 布局确为 [2,nb,bs,H_kv,D]、TP=2 正常。原表留档：
 
 | # | 待确认 | 失败时的症状 |
 |---|--------|--------------|
@@ -594,24 +596,66 @@ python -c "from vllm.model_executor.models.registry import ModelRegistry; print(
 # 1) 静态验证（不用 GPU）：把本地 vllm_plugin/ 同步到远程 ~/lut-experiments/LLM_LUT/v8/ 后：
 cd ~/lut-experiments/LLM_LUT/v8 && python -m py_compile vllm_plugin/*.py && echo OK
 
-# 2) smoke：8k 单请求，确认 patch + spec 生效（在 v8 目录跑，包按相对目录可导入）：
+# 2) smoke：8k 单请求 + 淘汰路径 + 跨轮召回（2026-10-04 实测 ALL PASS，版本 v2026-10-04k）：
 cd ~/lut-experiments/LLM_LUT/v8 && V8_COMPRESS_SLOTS=512 python -m vllm_plugin.serve /home/u/downloads/models/Qwen3.6-35B-A3B --enforce-eager --max-model-len 16384 --tensor-parallel-size 2 --max-num-seqs 4 --port 18001 > logs/vllm_smoke.log 2>&1 &
+sleep 90
+grep -c "v2026-10-04k" logs/vllm_smoke.log   # 必须 = 4（4 个进程各自 patch，版本铁证）
 
+# 4 项自检：短请求 / 2048-token 淘汰（断言日志出现 first eviction）/ 多轮数字召回 / 8k 跨 chunk：
 python tools/check_compressed_serve.py --model /home/u/downloads/models/Qwen3.6-35B-A3B --log logs/vllm_smoke.log
+# 期待 ALL PASS，且 eviction 行 kept=476 L=512（512 = sink 4 + HH 476 + recent 32）
 
-# 期待: 日志出现 [v8_plugin] first obs scoring / first eviction；并发请求时 nvidia-smi 显存不随 prompt 长度涨
-# 发一个请求验证（换真实 prompt 即可）：
-curl -s localhost:18001/v1/chat/completions -H 'Content-Type: application/json' -d '{"model":"/home/u/downloads/models/Qwen3.6-35B-A3B","messages":[{"role":"user","content":"用一句话介绍你自己"}],"max_tokens":64}'
+# 3) 64k 单请求对拍（红线：压缩版 fact acc 不显著低于 0.734，基准 = 同机 full-KV）：
+#    两个服务同时起，各占 2 张卡（机器 8×A800）。基准用原生 api_server，绝不带插件。
+pkill -f "vllm_plugin.serve" ; pkill -f "api_server" ; sleep 3
+cd ~/lut-experiments/LLM_LUT/v8 && mkdir -p results
+CUDA_VISIBLE_DEVICES=0,1 V8_COMPRESS_SLOTS=512 python -m vllm_plugin.serve /home/u/downloads/models/Qwen3.6-35B-A3B --enforce-eager --max-model-len 131072 --tensor-parallel-size 2 --max-num-seqs 4 --port 18002 > logs/vllm_64k_compressed.log 2>&1 &
+CUDA_VISIBLE_DEVICES=6,7 python -m vllm.entrypoints.openai.api_server --model /home/u/downloads/models/Qwen3.6-35B-A3B --enforce-eager --max-model-len 131072 --tensor-parallel-size 2 --max-num-seqs 4 --port 18003 > logs/vllm_64k_baseline.log 2>&1 &
+sleep 240
+curl -s localhost:18002/health && echo " COMPRESSED_UP"
+curl -s localhost:18003/health && echo " BASELINE_UP"
 
-# 3) 正确性对拍：不再依赖旧 harness 结果（已删）。基准改为同机 vLLM full-KV：
-#    先不带插件跑同一数据（普通 vllm serve = full），再带插件跑，比 fact acc。
-#    绝对红线沿用记录在案的数字：64k 负载 512 档旧 harness 实测 0.734
-#    （docs/21-24，结果文件已删但数字在文档里），压缩版不应显著低于它。
-cd ~/lut-experiments/LLM_LUT/v8 && python -m vllm_plugin.serve /home/u/downloads/models/Qwen3.6-35B-A3B --enforce-eager --max-model-len 131072 --tensor-parallel-size 2 --max-num-seqs 4 --port 18002 > logs/vllm_64k_check.log 2>&1 &
+# 同一脚本各打一遍（64k 档 = 65536 文件，8 篇 × ~60k token，每篇 8 问多轮会话）：
+python tools/eval_longctx_server.py --base-url http://localhost:18002 --model /home/u/downloads/models/Qwen3.6-35B-A3B --data data/longctx_multi_turn_65536.jsonl --out results/eval_64k_compressed.json
+python tools/eval_longctx_server.py --base-url http://localhost:18003 --model /home/u/downloads/models/Qwen3.6-35B-A3B --data data/longctx_multi_turn_65536.jsonl --out results/eval_64k_baseline.json
+# 对比两份输出的 OVERALL fact_acc 和 per-qtype（digit_span 是硬骨头）；结果落盘 results/ 供写报告
 
-# 4) 并发扫描：N ∈ {1, 8, 16, 32} × slots ∈ {512, 1024}，出 Pareto
+# 3b) 64k 对拍结果判读（2026-10-04 首跑实测）：
+#    基准 full-KV：fact_acc = 1.0000 (64/64)，37-50s/篇 —— 数据本身无难度。
+#    压缩 512 slots：fact_acc = 0.0000 (0/64)，70-85s/篇 —— 全崩，且 prefill 慢约 2 倍。
+#    判读工具（区分"方法 collapse"还是"代码 bug"）：
+python tools/dump_eval_answers.py --results results/eval_64k_compressed.json
+#    - 答案相干但事实是错的  -> 方法 collapse：512/60000 保留率不可能记住中段记录，
+#      属预期方向，响应 = slots 扫描（见 3c），不是回退插件。
+#    - 答案是乱码/复读/空    -> 真 bug：把 dump 输出发出来修压缩路径。
+#    prefill 慢 2 倍也记进报告：per-chunk/per-layer 的 Python 循环 + repeat_interleave
+#    全 eager 开销；判废线是 TPOT 慢 5 倍，目前未触发但必须在报告里量化。
+
+# 3c) slots 扫描（方法 collapse 的响应，docs/28 优先级：先同规模改进，不回退）：
+#    显存不是约束（compressed spec 后 36.75GiB 仅用零头），slots 拉大是 MB 级成本。
+for S in 1024 2048 4096; do
+  pkill -f "vllm_plugin.serve" ; sleep 3
+  CUDA_VISIBLE_DEVICES=0,1 V8_COMPRESS_SLOTS=$S python -m vllm_plugin.serve /home/u/downloads/models/Qwen3.6-35B-A3B --enforce-eager --max-model-len 131072 --tensor-parallel-size 2 --max-num-seqs 4 --port 18002 > logs/vllm_64k_s${S}.log 2>&1 &
+  sleep 240
+  curl -s localhost:18002/health && echo " UP slots=$S"
+  python tools/eval_longctx_server.py --base-url http://localhost:18002 --model /home/u/downloads/models/Qwen3.6-35B-A3B --data data/longctx_multi_turn_65536.jsonl --out results/eval_64k_slots${S}.json
+done
+#    产出 Pareto：slots {512,1024,2048,4096} × fact_acc × prefill 秒数，写报告用。
+
+# 4) 并发扫描：N ∈ {1, 8, 16, 32} × slots ∈ {512, 1024, 2048, 4096}，出 Pareto
 #    指标：max concurrent seqs（allocator 不再 OOM 的上限）、TTFT/TPOT、fact acc
+#    （脚本待写：tools/bench_concurrency.py，跑法同 3，只起压缩版、逐档重启换 V8_COMPRESS_SLOTS）
 ```
+
+**今日实测坑位补充**（2026-10-04，全部真金白银踩过）：
+- worker 进程 stdout 是**块缓冲**：服务健康不崩时 print 一直卡在缓冲区，日志里看不到任何运行时标记。
+  所有 `[v8_plugin]` 运行时标记必须 `print(..., flush=True)`（v2026-10-04k 已修）。之前"标记没出现"
+  不等于代码没跑到——先用 flush 排除观测问题，再怀疑逻辑。
+- API server 的 prompt 长度校验读 `model_config.max_model_len`；报 "maximum context length is 163"
+  这类怪数先 `grep "Using max model len" logs/xxx.log`，十有八九是启动命令 max-model-len 写错或
+  端口被旧进程占用，与插件无关。
+- 推理模型（Qwen3 thinking）会烧光 max_tokens：所有评测/召回请求必须带
+  `"chat_template_kwargs": {"enable_thinking": False}`，否则答案全是 thinking 过程。
 
 **判废标准**（任一命中即回 docs/27 复盘，不硬撑）：单请求 64k 出现语义崩坏（fact acc 显著低于 0.73——
 budget_512_32k 旧 harness 实测 0.734，结果文件已删、数字记录在案）；allocator 层面仍随 seq_len 涨显存（说明 spec 没被采纳）；
