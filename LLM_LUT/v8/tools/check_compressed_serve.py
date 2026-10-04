@@ -27,14 +27,19 @@ import urllib.request
 MARKERS = ("first obs scoring", "first eviction")
 
 
-def chat(base_url, model, messages, max_tokens):
+def chat(base_url, model, messages, max_tokens, no_thinking=False):
+    payload = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+    }
+    if no_thinking:
+        # Qwen3 reasoning models burn the whole budget on thinking
+        # otherwise; recall checks need the final answer to fit.
+        payload["chat_template_kwargs"] = {"enable_thinking": False}
     req = urllib.request.Request(
         f"{base_url}/v1/chat/completions",
-        data=json.dumps({
-            "model": model,
-            "messages": messages,
-            "max_tokens": max_tokens,
-        }).encode(),
+        data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
     )
     t0 = time.time()
@@ -122,7 +127,7 @@ def main():
         body, dt = chat(args.base_url, args.model,
                         [{"role": "user",
                           "content": "Reply with the single word: ok"}],
-                        max_tokens=8)
+                        max_tokens=8, no_thinking=True)
         ok = "choices" in body and len(content_of(body)) > 0
         check("short_prompt", ok,
               f"{body.get('usage', {}).get('total_tokens', '?')} tokens "
@@ -142,7 +147,7 @@ def main():
             [{"role": "user",
               "content": doc + "\n\nIn one sentence: what does this text "
                              "describe?"}],
-            max_tokens=48)
+            max_tokens=48, no_thinking=True)
         markers = scan.new_plugin_lines()
         evict = [m for m in markers if "first eviction" in m]
         check("long_prompt_eviction",
@@ -164,7 +169,7 @@ def main():
              {"role": "user",
               "content": "What number did I ask you to remember? "
                          "Answer with digits only."}],
-            max_tokens=16)
+            max_tokens=32, no_thinking=True)
         check("multiturn_recall", digit in content_of(body),
               f"answer={content_of(body)[:40]!r} ({dt:.1f}s)")
     except Exception as e:
@@ -180,7 +185,7 @@ def main():
             args.base_url, args.model,
             [{"role": "user",
               "content": doc + "\n\nIn one sentence: what is the topic?"}],
-            max_tokens=48)
+            max_tokens=48, no_thinking=True)
         check("multichunk_prefill", "choices" in body,
               f"prompt={ntok} tokens in {dt:.1f}s")
     except Exception as e:
