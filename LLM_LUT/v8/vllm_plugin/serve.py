@@ -49,6 +49,13 @@ def main() -> None:
 
 def _serve_019(argv) -> None:
     """vLLM 0.19.1 path: run the OpenAI api_server module as __main__."""
+    # api_server.__main__ parses the positional model_tag but never maps it
+    # onto args.model (that mapping lives in vllm/entrypoints/cli/serve.py,
+    # which we bypass) — without this, args.model falls back to the
+    # "Qwen/Qwen3-0.6B" default and startup tries to fetch from HF.
+    if argv and not argv[0].startswith("-"):
+        model = argv.pop(0)
+        argv = ["--model", model] + argv
     sys.argv = ["api_server", *argv]
     import runpy
     runpy.run_module("vllm.entrypoints.openai.api_server",

@@ -552,7 +552,7 @@ CUDA graph、prefix caching、SLA/排队模型。
 | per-request 键 | 0.19 的 CommonAttentionMetadata 有 query_start_loc_cpu 但**无 req_ids** → 用 block id 元组当请求键 | 0.30 有 req_ids |
 | pool 布局 | **0.19.1 是 `[2, num_blocks, block_size, H_kv, D]`**：`kv_cache.unbind(0)` 得 K/V | 0.30 是 `[nb, bs, H, 2D]`，K=`[...,:D]` |
 | merge | `FullAttentionSpec.merge` 会丢子类字段 → CompressedKVSpec 自己 override（校验全等后 deepcopy） | 相同 |
-| serve 入口 | 优先 0.30 launchers 入口（model_tag→--model 映射），ImportError fallback：runpy 跑 `vllm.entrypoints.openai.api_server` 的 `__main__` | — |
+| serve 入口 | 优先 0.30 launchers 入口（model_tag→--model 映射），ImportError fallback：runpy 跑 `vllm.entrypoints.openai.api_server` 的 `__main__`。**0.19 的 api_server 自己不做 model_tag→--model 映射**（在 cli/serve.py 里，被 bypass），serve.py 已手动补 | 实机踩过：不补会回落默认模型 `Qwen/Qwen3-0.6B` 去连 HF |
 
 **仍需远程验证（代码里已带防御/日志，按顺序跑 smoke 即可暴露）**：
 
