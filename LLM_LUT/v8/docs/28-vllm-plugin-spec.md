@@ -661,9 +661,36 @@ bash tools/run_slots_sweep.sh
 #    SLOTS_LIST="512 8192" DATA=data/longctx_multi_turn_32768.jsonl bash tools/run_slots_sweep.sh
 #    产出 Pareto：slots {512,1024,2048,4096} × fact_acc × prefill 秒数，写报告用。
 
-# 4) 并发扫描：N ∈ {1, 8, 16, 32} × slots ∈ {512, 1024, 2048, 4096}，出 Pareto
-#    指标：max concurrent seqs（allocator 不再 OOM 的上限）、TTFT/TPOT、fact acc
-#    （脚本待写：tools/bench_concurrency.py，跑法同 3，只起压缩版、逐档重启换 V8_COMPRESS_SLOTS）
+# 3d) slots 扫描实测结果（2026-10-05，插件版本 v2026-10-04o，64k 数据 8 篇 × 8 问）：
+#    修复链：l 版 deferred eviction（问题必须在场才参与打分）→ n 版 async-stale
+#    自愈（chunk 元数据滞后一个 chunk，heal 日志证实）→ o 版 prefill 瞬态 OOM
+#    （enable_gqa + bf16 mask + util 0.88）。
+#    slots=1024: fact_acc = 0.8594 (55/64)，166-199s/篇
+#    slots=2048: fact_acc = 0.8438 (54/64)，159-201s/篇
+#    slots=4096: fact_acc = 0.9375 (60/64)，163-187s/篇（doc 7 从 0/8 升到 6/8）
+#    基准 full-KV：fact_acc = 1.0000 (64/64)，37-86s/篇
+#    结论：三档全部越过 0.734 红线；2048 略低于 1024 是 1 题噪声，非单调性待复跑确认。
+#    doc 7 是难度离群点（1024/2048 档 0/8）——保留率 1.7%-3.4% 时该篇中段记录全丢，
+#    符合"方法 collapse"判读，不是 bug（答案相干但事实错）。
+#    速度必须进报告：压缩版 ~175s/篇 ≈ 基准 45s/篇 的 3.9 倍（prefill Python 循环 +
+#    手写 attention 全 eager）。判废线"TPOT 慢 5 倍"未触发，但 prefill 差距已超 2 倍
+#    量化线，如实写进报告。
+#    补 512 档（对标旧 harness 512@32k=0.734）：
+SLOTS_LIST="512" bash tools/run_slots_sweep.sh
+
+# 4) 并发扫描（工具已就绪：tools/bench_concurrency.py + tools/run_concurrency_sweep.sh）：
+#    固定工作量（数据文件全部 8 篇多轮会话）、变并发 N：每个 worker 独立驱动一篇的
+#    完整多轮会话，session 前加唯一 nonce 防 vLLM prefix cache 命中（否则重复 doc
+#    秒回，吞吐虚高）。指标：wall time / session dur mean·median·max /
+#    fact_acc / questions/s。每档 slots 只重启一次服务，N 逐档打：
+bash tools/run_concurrency_sweep.sh
+#    默认 SLOTS_LIST="1024 4096" N_LIST="1 8 16"（N=1 约 25 分钟，N=8/16 约 5-8 分钟；
+#    全矩阵 ×4 档 slots 太久，先两端档探scaling形态，需要中间档再加）。
+#    注意：--max-num-seqs 4 限制同时在飞的 batch 为 4，N>4 测的是排队+KV 压力行为，
+#    如实报告。换档：
+SLOTS_LIST="512 2048" N_LIST="1 8 16 32" bash tools/run_concurrency_sweep.sh
+#    对拍基准：原生 api_server（无插件，同 util 0.88）起在别的端口后单独跑：
+python tools/bench_concurrency.py --base-url http://localhost:18003     --model /home/u/downloads/models/Qwen3.6-35B-A3B     --data data/longctx_multi_turn_65536.jsonl --concurrency 8     --out results/bench_c8_baseline.json
 ```
 
 **今日实测坑位补充**（2026-10-04，全部真金白银踩过）：
