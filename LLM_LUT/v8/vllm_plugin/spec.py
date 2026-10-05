@@ -1,4 +1,4 @@
-"""CompressedKVSpec: per-request constant-footprint KV spec (vLLM 0.19.1 API).
+"""CompressedKVSpec: per-request KV spec (vLLM 0.19.1 API).
 
 Differences from the 0.30-era draft (docs/28 history):
 - No @register_kv_cache_spec registry in 0.19.1: KVCacheSpec.merge asserts
@@ -10,9 +10,16 @@ Differences from the 0.30-era draft (docs/28 history):
   the CLI by vllm_plugin.serve (block reuse would alias per-request compact
   regions).
 
-The allocator-side cap (blocks per request independent of token count) comes
-from the SingleTypeKVCacheManager monkeypatch: 0.19.1's
+The allocator-side cap (blocks per request) comes from the
+SingleTypeKVCacheManager monkeypatch: 0.19.1's
 get_num_blocks_to_allocate is cdiv(num_tokens, block_size) with no spec hook.
+
+v2026-10-04l semantics change: eviction is DEFERRED to the first decode
+step (see impl.py header), so a request's blocks must cover its whole
+prompt up to V8_MAX_SEQ_TOKENS — the constant-footprint claim now holds
+for the decode steady state only, same memory profile as the old harness
+and the full-KV baseline during prefill. Mid-request block freeing is a
+separate phase.
 """
 import copy
 from dataclasses import dataclass
@@ -34,13 +41,19 @@ class CompressedKVSpec(FullAttentionSpec):
     def __post_init__(self):
         super().__post_init__()
         bs = self.block_size
-        n = (self.retention_tokens + bs - 1) // bs + config.BLOCK_MARGIN
+        # v2026-10-04l: deferred eviction — blocks must hold the WHOLE
+        # prompt (up to V8_MAX_SEQ_TOKENS), not just the retention budget.
+        # Blocks are allocated lazily by the scheduler as prefill advances;
+        # this is only the per-request cap.
+        n = (config.V8_MAX_SEQ_TOKENS + bs - 1) // bs + config.BLOCK_MARGIN
         object.__setattr__(self, "blocks_per_request", n)
 
     def max_memory_usage_bytes(self, vllm_config) -> int:
-        # Constant per request: the whole point. Used by kv_cache_utils for
-        # the max-concurrency estimate; the hard per-request cap comes from
-        # the allocator monkeypatch (see __init__.patch_allocator).
+        # Upper bound for the max-concurrency estimate: a fully-grown
+        # request (max_seq_tokens). Actual usage tracks prompt length and
+        # shrinks to the retention budget's worth of blocks only after
+        # mid-request freeing lands (separate phase); decode attention
+        # itself only ever touches the compact region.
         return self.blocks_per_request * self.page_size_bytes
 
     @classmethod

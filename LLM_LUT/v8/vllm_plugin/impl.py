@@ -12,13 +12,29 @@ Interface (verified against v0.19.1):
 
 Semantics (ported from kv_cache/heavy_hitter_cache.py — see eviction.py
 for the forbidden-variants list):
+
+- DEFERRED EVICTION (v2026-10-04l, semantics fix after the 64k sweep came
+  back 0/64 at every slot count): per-chunk eviction scored keys with only
+  the last-64-token tail of each 8192-token chunk, so the actual question
+  (at the very end of the prompt) never contributed, and mid-document fact
+  records were evicted by filler before the question arrived. The old
+  harness instead accumulated attention column sums over the WHOLE prefill
+  and compressed once at the first decode step (heavy_hitter_cache.py
+  header, lines 11-15). We reproduce that: prefill chunks only score into
+  the snapshot table; nothing is evicted while total <= V8_MAX_SEQ_TOKENS;
+  the first decode step (C==1) finds total >> budget and evicts once, with
+  the question's attention mass present in the snapshot.
 - Prefill chunk (q_len > 1): score with the observation window (last
-  min(obs, C) query rows) against [compact; chunk], evict BEFORE writing
-  the chunk (so all compact keys are causally visible to every chunk query
-  and the additive mask only covers chunk-internal causality), write the
-  new compact layout back into the request's private blocks, then attend.
-- Decode (q_len == 1): append; evict only when over budget; decode tokens
-  compete at the prefill mean attention mass (never +inf).
+  min(obs, C) query rows) against [compact; chunk], scatter into the
+  per-orig-position snapshot, grow compact to the full chunk, write back,
+  then attend (compact cols unmasked, chunk cols causal).
+- Decode (q_len == 1): allowance = budget; append, then evict when over
+  allowance. Decode tokens compete at the prefill mean attention mass
+  (never +inf).
+- Cost model change, stated plainly: per-request block footprint now
+  tracks prompt length up to V8_MAX_SEQ_TOKENS (same as full-KV baseline
+  and the old harness). Constant-footprint decode is unchanged. Real
+  memory savings need mid-request block freeing — a separate phase.
 """
 import torch
 import torch.nn.functional as F
@@ -72,12 +88,22 @@ class CompressedKVImpl(FlashAttentionImpl):
         device = q.device
         cfg = self.cfg
         budget = cfg["retention"]
-        sink_n = min(cfg["sink"], budget)
-        recent_n = min(cfg["recent"], budget - sink_n)
-        hh_budget = budget - sink_n - recent_n
+        # Deferred eviction (v2026-10-04l): prefill chunks accumulate into
+        # the snapshot but do NOT evict to the budget — the question at the
+        # end of the prompt must get to score the keys first (old-harness
+        # semantics). Only decode steps (C==1) enforce the tight budget;
+        # the first decode step after a long prefill does the one-shot
+        # full compress. V8_MAX_SEQ_TOKENS is the prefill safety valve
+        # (and the per-request block cap): beyond it, prefill evicts down
+        # to the allowance instead of growing without bound.
+        allowance = budget if C == 1 else max(budget,
+                                              config.V8_MAX_SEQ_TOKENS)
+        sink_n = min(cfg["sink"], allowance)
+        recent_n = min(cfg["recent"], allowance - sink_n)
+        hh_budget = allowance - sink_n - recent_n
 
         st.ensure_gpu(device)
-        st.grow(max(n_computed + C + 1, budget + bs), device, H_kv)
+        st.grow(max(n_computed + C + 1, allowance + bs), device, H_kv)
 
         L = st.compact_len
         arange_cap = st._gpu[2]
@@ -134,8 +160,8 @@ class CompressedKVImpl(FlashAttentionImpl):
                 print(f"[v8_plugin] first obs scoring: L={L} C={C} "
                       f"W={W} snap_len={st.snap_len}", flush=True)
 
-        # --- evict (before the chunk becomes visible: invariant 4) ---
-        if total_len > budget:
+        # --- evict (deferred: only over the allowance, see header) ---
+        if total_len > allowance:
             mid_end = total_len - recent_n
             mid_orig = orig_all[sink_n:mid_end]
             # Decode-written tokens (orig >= snap_len) compete at the prefill
@@ -165,8 +191,8 @@ class CompressedKVImpl(FlashAttentionImpl):
                 self._v8_evict_logged = True
                 print(f"[v8_plugin] first eviction: kept="
                       f"{int(kept.shape[0])} L={st.compact_len} "
-                      f"orig=[{int(new_orig[0])}..{int(new_orig[-1])}]",
-                      flush=True)
+                      f"orig=[{int(new_orig[0])}..{int(new_orig[-1])}] "
+                      f"allowance={allowance} C={C}", flush=True)
         else:
             st.orig[:total_len] = orig_all
             st.compact_len = total_len

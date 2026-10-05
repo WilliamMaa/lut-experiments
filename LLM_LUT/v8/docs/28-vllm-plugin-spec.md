@@ -522,7 +522,7 @@ if __name__ == "__main__":
 |----|-----------|-----------|------|
 | attention kernel | torch sdpa | mem-efficient SDPA | ~1e-3 舍入差，不对拍逐字 |
 | 并发形态 | 整 batch 同步 step、同长 | continuous batching、乱长短 | 指标不可直接比，只看 per-request 质量 |
-| 淘汰时机 | update() 内、chunk 后 | forward 内、chunk 前（不变量 4） | 数学等价（因果性论证见 §2.1-4），数值路径不同 |
+| 淘汰时机 | 整段 prefill 后、第一个 decode step 一次性压缩 | ~~forward 内、chunk 前~~ → **v2026-10-04l 起同为 deferred**（prefill 只累积打分，首 decode 压缩） | v2026-10-04k 及之前的 per-chunk 淘汰是 64k 全崩（0/64）的直接原因：问题 token 从未参与打分 |
 | per-layer 选择 | 是 | 是（shared_selection 留 TODO） | 与 v8 m4_k8v8 配置对齐 |
 
 ## 6. 移植清单（来自 heavy_hitter_cache.py / attention_scores.py 的实测教训）
@@ -619,6 +619,22 @@ curl -s localhost:18003/health && echo " BASELINE_UP"
 python tools/eval_longctx_server.py --base-url http://localhost:18002 --model /home/u/downloads/models/Qwen3.6-35B-A3B --data data/longctx_multi_turn_65536.jsonl --out results/eval_64k_compressed.json
 python tools/eval_longctx_server.py --base-url http://localhost:18003 --model /home/u/downloads/models/Qwen3.6-35B-A3B --data data/longctx_multi_turn_65536.jsonl --out results/eval_64k_baseline.json
 # 对比两份输出的 OVERALL fact_acc 和 per-qtype（digit_span 是硬骨头）；结果落盘 results/ 供写报告
+
+# 3a+) 首跑 collapse 根因与修复（v2026-10-04l，重要）：
+#    现象：64k 对拍 slots {512,1024,2048,4096} fact_acc 全部 ~0（4096 也只 2/64），
+#    基准 1.0；答案相干（"文中没有提及"），不是乱码 → 不是实现 bug，是淘汰时机错误。
+#    根因：serving 版原来每个 8192 chunk 一过就淘汰，打分 query 只有该 chunk 尾巴
+#    64 个 token ——真正的问题在 prompt 最末尾，轮到它时事实记录早被 filler 挤掉。
+#    旧 harness 语义（heavy_hitter_cache.py:11-15）：整段 prefill 累积注意力列和，
+#    **第一个 decode step 才一次性压缩**。
+#    修复（v2026-10-04l）：prefill 期间不淘汰（V8_MAX_SEQ_TOKENS=131072 为安全阀），
+#    只累积 snapshot；首个 decode step 一次性压到 budget，此时问题已参与打分。
+#    代价（如实记录）：prefill 期间 per-request block 占用 = 全文长度，与 baseline
+#    同 profile；常数占有的卖点只在 decode 稳态成立，真正的省显存要做请求中途
+#    block 回收（独立阶段）。
+#    复跑（先 smoke 再扫）：
+bash tools/run_slots_sweep.sh   # SLOTS_LIST 默认 1024/2048/4096；512 档见 results/eval_64k_compressed.json
+#    预期：first eviction 标记变为 C=1（decode 触发），kept=预算-sink-recent。
 
 # 3b) 64k 对拍结果判读（2026-10-04 首跑实测）：
 #    基准 full-KV：fact_acc = 1.0000 (64/64)，37-50s/篇 —— 数据本身无难度。

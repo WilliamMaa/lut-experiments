@@ -172,13 +172,14 @@ def register_backend_enum() -> None:
 
 
 def patch_allocator() -> None:
-    """Clamp per-request block allocation to blocks_per_request.
+    """Clamp per-request block allocation at blocks_per_request.
 
     0.19.1 has no spec hook here: get_num_blocks_to_allocate derives the
-    requirement from the token count, which would demand 4096 blocks for a
-    64k request and defeat the compression. Clamping num_tokens passed to
-    the original implementation caps both the initial allocation and all
-    growth, keeping the request's footprint at blocks_per_request blocks.
+    requirement from the token count. v2026-10-04l: with deferred eviction
+    the cap is V8_MAX_SEQ_TOKENS worth of blocks (the whole prompt must be
+    holdable until the first decode step compresses it); previously it was
+    the retention budget, which per-chunk eviction made sufficient. The
+    clamp still protects the pool from runaway growth beyond the cap.
     """
     from vllm.v1.core.single_type_kv_cache_manager import (
         SingleTypeKVCacheManager)
