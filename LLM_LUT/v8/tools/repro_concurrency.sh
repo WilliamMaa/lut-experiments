@@ -51,9 +51,12 @@ echo "=== starting server (slots=$SLOTS gpus=$GPUS port=$PORT) ==="
 # All env vars are set INSIDE this script on purpose: pasting env-var
 # prefixes into the terminal has repeatedly eaten characters
 # (e.g. "V8_" vanished, merging into CUDA_VISIBLE_DEVICES).
+# CUDA_LAUNCH_BLOCKING=1: synchronous kernels — a device-side assert then
+# reports at the TRUE launch site instead of a random later sync point.
 CUDA_VISIBLE_DEVICES="$GPUS" \
 V8_COMPRESS_SLOTS="$SLOTS" \
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+CUDA_LAUNCH_BLOCKING=1 \
     python -m vllm_plugin.serve "$MODEL" \
         --enforce-eager --max-model-len "$MAX_LEN" \
         --tensor-parallel-size 2 --max-num-seqs 4 \
@@ -92,7 +95,11 @@ grep -c "state reset" logs/vllm_repro.log
 echo -n "stale metadata healed count (large is OK): "
 grep -c "stale metadata healed" logs/vllm_repro.log
 echo "=== server errors (must be empty; full traceback of the first crash) ==="
-grep -n -A35 "WorkerProc hit an exception" logs/vllm_repro.log | head -80
+grep -n -A45 "WorkerProc hit an exception" logs/vllm_repro.log | head -100
+echo "=== our plugin frames in the worker tracebacks (the real crash site) ==="
+grep -n -A3 "vllm_plugin/impl.py\|vllm_plugin/backend.py\|vllm_plugin/eviction.py" logs/vllm_repro.log | head -40
+echo "=== crashing step, scheduler view (block ids + scheduled tokens) ==="
+grep "Dumping scheduler output" logs/vllm_repro.log | tail -1
 echo "=== sample answers ==="
 python - "results/bench_repro_c${N}.json" <<'PYEOF'
 import json, sys
