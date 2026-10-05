@@ -574,142 +574,65 @@ CUDA graph、prefix caching、SLA/排队模型。
 | R5 | pool 视图在 spec `has_layer_views` 默认下确实按 [2,nb,bs,H,D] 给到 forward | 第一次 forward 的 gather 形状 assert（日志打 kv_cache.shape） |
 | R6 | TP=2 下 num_kv_heads=2 的切分与本插件的交互 | 启动期字段缺失 TypeError 或 forward 形状错 |
 
-## 8. 远程 runbook
+## 8. 远程 runbook（只写操作：跑什么、怎么算过）
 
-**环境硬约束（实测确定，勿再试错）**：
-- 驱动 550.90.07（CUDA 12.4），共享机器**不能动驱动**。
-- torch 2.11+ 启动时硬性拒绝 <12.8 驱动；**只有 torch ≤2.10 的 minor 版本兼容可用**（cu128 runtime 跑在 12.4 驱动上，gemma4_infer env 已实测）。
-- PyPI pin 对照：vllm 0.18.0–0.19.1 → `torch==2.10.0`；0.20+ → 2.11/2.13（死路）。
-- **最终组合：vllm==0.19.1 + torch 2.10.0+cu128**，清华镜像安装。0.30 路线（libcudart.so.13 ABI 死局）已放弃。
-- 换 torch 时必须连带其配套 nvidia-* 包整体重装，混装出 `undefined symbol: ncclCommResume`。
+### 8.0 环境（已装好，勿动）
+- conda env `vllm_py310`；vllm==0.19.1 + torch 2.10.0+cu128；驱动 550.90.07（共享机不能动）。
+- 插件服务固定 GPU 6,7 / 端口 18002；基准固定 GPU 0,1 / 端口 18003。
+- 模型 `/home/u/downloads/models/Qwen3.6-35B-A3B`。
+- 所有起服务的动作都在脚本内部完成（环境变量写死在脚本里），不要在终端手搓 serve 命令。
 
+### 8.1 同步代码后必做（10 秒，防部分同步）
 ```bash
-# 0) 修 vllm_py310 env（之前装过 0.30.0 / 0.30.1rc1 nightly，都是 cu13 坏件，先清掉）：
-conda activate vllm_py310
-pip uninstall -y vllm
-pip install vllm==0.19.1 -i https://pypi.tuna.tsinghua.edu.cn/simple
-# 如 torch 不是 2.10.0+cu128（pip list 检查），先装 torch 再装 vllm：
-# pip install torch==2.10.0 --index-url https://download.pytorch.org/whl/cu128 -i https://pypi.tuna.tsinghua.edu.cn/simple
-
-# 验证 import + CUDA + 驱动兼容（R1）：
-python -c "import torch; torch.zeros(1).cuda(); import vllm; print('ok', vllm.__version__)"
-# 确认 Qwen3.6 arch 受支持（True 才能继续）：
-python -c "from vllm.model_executor.models.registry import ModelRegistry; print('Qwen3_5MoeForConditionalGeneration' in ModelRegistry.get_supported_archs())"
-
-# 1) 静态验证（不用 GPU）：把本地 vllm_plugin/ 同步到远程 ~/lut-experiments/LLM_LUT/v8/ 后：
-cd ~/lut-experiments/LLM_LUT/v8 && python -m py_compile vllm_plugin/*.py && echo OK
-
-# 2) smoke：8k 单请求 + 淘汰路径 + 跨轮召回（2026-10-04 实测 ALL PASS，版本 v2026-10-04k）：
-cd ~/lut-experiments/LLM_LUT/v8 && V8_COMPRESS_SLOTS=512 python -m vllm_plugin.serve /home/u/downloads/models/Qwen3.6-35B-A3B --enforce-eager --max-model-len 16384 --tensor-parallel-size 2 --max-num-seqs 4 --port 18001 > logs/vllm_smoke.log 2>&1 &
-sleep 90
-grep -c "v2026-10-04k" logs/vllm_smoke.log   # 必须 = 4（4 个进程各自 patch，版本铁证）
-
-# 4 项自检：短请求 / 2048-token 淘汰（断言日志出现 first eviction）/ 多轮数字召回 / 8k 跨 chunk：
-python tools/check_compressed_serve.py --model /home/u/downloads/models/Qwen3.6-35B-A3B --log logs/vllm_smoke.log
-# 期待 ALL PASS，且 eviction 行 kept=476 L=512（512 = sink 4 + HH 476 + recent 32）
-
-# 3) 64k 单请求对拍（红线：压缩版 fact acc 不显著低于 0.734，基准 = 同机 full-KV）：
-#    两个服务同时起，各占 2 张卡（机器 8×A800）。基准用原生 api_server，绝不带插件。
-pkill -f "vllm_plugin.serve" ; pkill -f "api_server" ; sleep 3
-cd ~/lut-experiments/LLM_LUT/v8 && mkdir -p results
-CUDA_VISIBLE_DEVICES=0,1 V8_COMPRESS_SLOTS=512 python -m vllm_plugin.serve /home/u/downloads/models/Qwen3.6-35B-A3B --enforce-eager --max-model-len 131072 --tensor-parallel-size 2 --max-num-seqs 4 --port 18002 > logs/vllm_64k_compressed.log 2>&1 &
-CUDA_VISIBLE_DEVICES=6,7 python -m vllm.entrypoints.openai.api_server --model /home/u/downloads/models/Qwen3.6-35B-A3B --enforce-eager --max-model-len 131072 --tensor-parallel-size 2 --max-num-seqs 4 --port 18003 > logs/vllm_64k_baseline.log 2>&1 &
-sleep 240
-curl -s localhost:18002/health && echo " COMPRESSED_UP"
-curl -s localhost:18003/health && echo " BASELINE_UP"
-
-# 同一脚本各打一遍（64k 档 = 65536 文件，8 篇 × ~60k token，每篇 8 问多轮会话）：
-python tools/eval_longctx_server.py --base-url http://localhost:18002 --model /home/u/downloads/models/Qwen3.6-35B-A3B --data data/longctx_multi_turn_65536.jsonl --out results/eval_64k_compressed.json
-python tools/eval_longctx_server.py --base-url http://localhost:18003 --model /home/u/downloads/models/Qwen3.6-35B-A3B --data data/longctx_multi_turn_65536.jsonl --out results/eval_64k_baseline.json
-# 对比两份输出的 OVERALL fact_acc 和 per-qtype（digit_span 是硬骨头）；结果落盘 results/ 供写报告
-
-# 3a+) 首跑 collapse 根因与修复（v2026-10-04l，重要）：
-#    现象：64k 对拍 slots {512,1024,2048,4096} fact_acc 全部 ~0（4096 也只 2/64），
-#    基准 1.0；答案相干（"文中没有提及"），不是乱码 → 不是实现 bug，是淘汰时机错误。
-#    根因：serving 版原来每个 8192 chunk 一过就淘汰，打分 query 只有该 chunk 尾巴
-#    64 个 token ——真正的问题在 prompt 最末尾，轮到它时事实记录早被 filler 挤掉。
-#    旧 harness 语义（heavy_hitter_cache.py:11-15）：整段 prefill 累积注意力列和，
-#    **第一个 decode step 才一次性压缩**。
-#    修复（v2026-10-04l）：prefill 期间不淘汰（V8_MAX_SEQ_TOKENS=131072 为安全阀），
-#    只累积 snapshot；首个 decode step 一次性压到 budget，此时问题已参与打分。
-#    代价（如实记录）：prefill 期间 per-request block 占用 = 全文长度，与 baseline
-#    同 profile；常数占有的卖点只在 decode 稳态成立，真正的省显存要做请求中途
-#    block 回收（独立阶段）。
-#    复跑（先 smoke 再扫）：
-bash tools/run_slots_sweep.sh   # SLOTS_LIST 默认 1024/2048/4096；512 档见 results/eval_64k_compressed.json
-#    预期：first eviction 标记变为 C=1（decode 触发），kept=预算-sink-recent。
-
-# 3b) 64k 对拍结果判读（2026-10-04 首跑实测）：
-#    基准 full-KV：fact_acc = 1.0000 (64/64)，37-50s/篇 —— 数据本身无难度。
-#    压缩 512 slots：fact_acc = 0.0000 (0/64)，70-85s/篇 —— 全崩，且 prefill 慢约 2 倍。
-#    判读工具（区分"方法 collapse"还是"代码 bug"）：
-python tools/dump_eval_answers.py --results results/eval_64k_compressed.json
-#    - 答案相干但事实是错的  -> 方法 collapse：512/60000 保留率不可能记住中段记录，
-#      属预期方向，响应 = slots 扫描（见 3c），不是回退插件。
-#    - 答案是乱码/复读/空    -> 真 bug：把 dump 输出发出来修压缩路径。
-#    prefill 慢 2 倍也记进报告：per-chunk/per-layer 的 Python 循环 + repeat_interleave
-#    全 eager 开销；判废线是 TPOT 慢 5 倍，目前未触发但必须在报告里量化。
-
-# 3c) slots 扫描（方法 collapse 的响应，docs/28 优先级：先同规模改进，不回退）：
-#    显存不是约束（compressed spec 后 36.75GiB 仅用零头），slots 拉大是 MB 级成本。
-#    已封装为脚本（推荐：整文件传输，杜绝粘贴掉字符；health 轮询代替盲等 240s）：
-bash tools/run_slots_sweep.sh
-#    跑完自动汇总三档 fact_acc。启动失败会自动 grep Traceback 段打印根因（
-#    外层 RuntimeError: Engine core initialization failed 只是包装，根因永远在更上面）。
-#    已知的两类根因：端口被旧进程占用（pkill 没杀干净，lsof -i:18002 查）；
-#    显存没释放（上一进程 GPU 0,1 还挂着，nvidia-smi 查）。
-#    修法都是杀掉残留进程后重跑，脚本幂等，直接再 bash 一次即可。加档/换数据用环境变量：
-#    SLOTS_LIST="512 8192" DATA=data/longctx_multi_turn_32768.jsonl bash tools/run_slots_sweep.sh
-#    产出 Pareto：slots {512,1024,2048,4096} × fact_acc × prefill 秒数，写报告用。
-
-# 3d) slots 扫描实测结果（2026-10-05，插件版本 v2026-10-04o，64k 数据 8 篇 × 8 问）：
-#    修复链：l 版 deferred eviction（问题必须在场才参与打分）→ n 版 async-stale
-#    自愈（chunk 元数据滞后一个 chunk，heal 日志证实）→ o 版 prefill 瞬态 OOM
-#    （enable_gqa + bf16 mask + util 0.88）。
-#    slots=1024: fact_acc = 0.8594 (55/64)，166-199s/篇
-#    slots=2048: fact_acc = 0.8438 (54/64)，159-201s/篇
-#    slots=4096: fact_acc = 0.9375 (60/64)，163-187s/篇（doc 7 从 0/8 升到 6/8）
-#    基准 full-KV：fact_acc = 1.0000 (64/64)，37-86s/篇
-#    结论：三档全部越过 0.734 红线；2048 略低于 1024 是 1 题噪声，非单调性待复跑确认。
-#    doc 7 是难度离群点（1024/2048 档 0/8）——保留率 1.7%-3.4% 时该篇中段记录全丢，
-#    符合"方法 collapse"判读，不是 bug（答案相干但事实错）。
-#    速度必须进报告：压缩版 ~175s/篇 ≈ 基准 45s/篇 的 3.9 倍（prefill Python 循环 +
-#    手写 attention 全 eager）。判废线"TPOT 慢 5 倍"未触发，但 prefill 差距已超 2 倍
-#    量化线，如实写进报告。
-#    补 512 档（对标旧 harness 512@32k=0.734）：
-SLOTS_LIST="512" bash tools/run_slots_sweep.sh
-
-# 4) 并发扫描（工具已就绪：tools/bench_concurrency.py + tools/run_concurrency_sweep.sh）：
-#    固定工作量（数据文件全部 8 篇多轮会话）、变并发 N：每个 worker 独立驱动一篇的
-#    完整多轮会话，session 前加唯一 nonce 防 vLLM prefix cache 命中（否则重复 doc
-#    秒回，吞吐虚高）。指标：wall time / session dur mean·median·max /
-#    fact_acc / questions/s。每档 slots 只重启一次服务，N 逐档打：
-bash tools/run_concurrency_sweep.sh
-#    默认 SLOTS_LIST="1024 4096" N_LIST="1 8 16"（N=1 约 25 分钟，N=8/16 约 5-8 分钟；
-#    全矩阵 ×4 档 slots 太久，先两端档探scaling形态，需要中间档再加）。
-#    注意：--max-num-seqs 4 限制同时在飞的 batch 为 4，N>4 测的是排队+KV 压力行为，
-#    如实报告。换档：
-SLOTS_LIST="512 2048" N_LIST="1 8 16 32" bash tools/run_concurrency_sweep.sh
-#    对拍基准：原生 api_server（无插件，同 util 0.88）起在别的端口后单独跑：
-python tools/bench_concurrency.py --base-url http://localhost:18003     --model /home/u/downloads/models/Qwen3.6-35B-A3B     --data data/longctx_multi_turn_65536.jsonl --concurrency 8     --out results/bench_c8_baseline.json
+python -m py_compile vllm_plugin/*.py && echo COMPILE_OK
+grep "PLUGIN_VERSION = " vllm_plugin/config.py    # 当前应为 2026-10-04p
 ```
 
-**今日实测坑位补充**（2026-10-04，全部真金白银踩过）：
-- worker 进程 stdout 是**块缓冲**：服务健康不崩时 print 一直卡在缓冲区，日志里看不到任何运行时标记。
-  所有 `[v8_plugin]` 运行时标记必须 `print(..., flush=True)`（v2026-10-04k 已修）。之前"标记没出现"
-  不等于代码没跑到——先用 flush 排除观测问题，再怀疑逻辑。
-- API server 的 prompt 长度校验读 `model_config.max_model_len`；报 "maximum context length is 163"
-  这类怪数先 `grep "Using max model len" logs/xxx.log`，十有八九是启动命令 max-model-len 写错或
-  端口被旧进程占用，与插件无关。
-- **pkill 杀不干净 vLLM**：`pkill -f "vllm_plugin.serve"` 只杀 APIServer 主进程；spawn 的
-  EngineCore/Worker 子进程 cmdline 是 `spawn_main`，不匹配模式，变孤儿继续占显存（实测 GPU 0/1
-  堆到 73GB，新服务报 `ValueError: Free memory (5.77/79.32 GiB) < desired (0.9)`）。
-  **解法（已封装进 tools/run_slots_sweep.sh 的 cleanup()）**：pkill 主进程后，按目标 GPU 的
-  compute-apps 表查 pid，只杀自己 uid 的；起服务前显存 >10GiB 就等。**教训：重启类脚本不能只
-  pkill 主进程，必须验证显存真的释放了。**
-- 推理模型（Qwen3 thinking）会烧光 max_tokens：所有评测/召回请求必须带
-  `"chat_template_kwargs": {"enable_thinking": False}`，否则答案全是 thinking 过程。
+### 8.2 生成数据（缺哪个跑哪个）
+```bash
+python tools/gen_longctx_multiturn.py --target-tokens 65536 --num-docs 8 --tokenizer-path /home/u/downloads/models/Qwen3.6-35B-A3B --out data/longctx_multi_turn_65536.jsonl
+python tools/gen_longctx_multiturn.py --target-tokens 32768 --num-docs 8 --tokenizer-path /home/u/downloads/models/Qwen3.6-35B-A3B --out data/longctx_multi_turn_32768.jsonl
+```
 
-**判废标准**（任一命中即回 docs/27 复盘，不硬撑）：单请求 64k 出现语义崩坏（fact acc 显著低于 0.73——
-budget_512_32k 旧 harness 实测 0.734，结果文件已删、数字记录在案）；allocator 层面仍随 seq_len 涨显存（说明 spec 没被采纳）；
-`--enforce-eager` 下 TPOT 比 full 慢 5 倍以上（逐请求循环的 Python 开销失控，需先优化形态再继续）。
+### 8.3 并发修复验证（换代码后先跑这个，约 15 分钟）
+```bash
+bash tools/repro_concurrency.sh
+```
+通过标准（脚本自行打印）：版本 = 2026-10-04p；`state reset` 计数 = 0；fact_acc ≥ 0.7。
+
+### 8.4 slots 扫描（约 2 小时）
+```bash
+bash tools/run_slots_sweep.sh
+```
+通过标准：每档无 ANCHOR FAIL / 500，fact_acc ≥ 0.734。
+换档/换数据：`SLOTS_LIST="512 8192" DATA=data/longctx_multi_turn_32768.jsonl bash tools/run_slots_sweep.sh`
+产出：`results/eval_64k_slots<S>.json`
+
+### 8.5 并发扫描（约 2 小时）
+```bash
+bash tools/run_concurrency_sweep.sh
+```
+通过标准：N=1 的 fact_acc 与 8.4 一致（±1 题）；N≥8 不崩（fact_acc ≥ 0.7、errors = 0）。
+换档：`SLOTS_LIST="512 2048" N_LIST="1 8 16 32" bash tools/run_concurrency_sweep.sh`
+产出：`results/bench_c<N>_slots<S>.json`
+
+### 8.6 基准对拍（无插件，GPU 0,1 / 18003）
+```bash
+bash tools/start_baseline.sh
+python tools/eval_longctx_server.py --base-url http://localhost:18003 --model /home/u/downloads/models/Qwen3.6-35B-A3B --data data/longctx_multi_turn_65536.jsonl --out results/eval_64k_baseline.json
+python tools/bench_concurrency.py --base-url http://localhost:18003 --model /home/u/downloads/models/Qwen3.6-35B-A3B --data data/longctx_multi_turn_65536.jsonl --concurrency 8 --out results/bench_c8_baseline.json
+pkill -f "vllm serve" ; sleep 3
+```
+
+### 8.7 判废标准（任一命中即停下回报，不硬撑）
+- 单请求 64k fact_acc 显著低于 0.73；
+- allocator 仍随 seq_len 线性涨显存（spec 没被采纳）；
+- TPOT 比 full-KV 慢 5 倍以上。
+
+### 8.8 故障速查
+- 启动失败：`grep -n -A30 "Traceback" <log>`，根因在 "Engine core initialization failed" 包装错误之上。
+- 启动报 `Free memory ... less than desired`：孤儿 worker 占卡，`nvidia-smi` 找自己 uid 的进程杀掉（各 sweep 脚本的 cleanup() 已内置此逻辑）。
+- 评测全 ANCHOR FAIL：服务没起或端口错，先 `curl localhost:<port>/health`。
+- 日志看不到 `[v8_plugin]` 运行时标记：worker stdout 块缓冲，代码已全 flush=True；看不到不等于没跑到。
+
+（历史诊断与各版本根因见代码注释和 §7 坑表，本手册不重复。）
