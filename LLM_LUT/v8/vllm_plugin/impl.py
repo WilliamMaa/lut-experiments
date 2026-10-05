@@ -57,6 +57,9 @@ class CompressedKVImpl(FlashAttentionImpl):
             "obs": config.V8_OBS_WINDOW,
             "span": config.V8_SPAN_WINDOW,
         }
+        # None = not probed yet. SDPA enable_gqa avoids materializing
+        # [H, L, D] repeated K/V; probed once per layer with tiny tensors.
+        self._gqa_ok = None
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output=None, output_scale=None, output_block_scale=None):
@@ -237,27 +240,48 @@ class CompressedKVImpl(FlashAttentionImpl):
 
         # --- attention ---
         n_rep = q.shape[1] // H_kv
-        k_attn = k_all.repeat_interleave(n_rep, dim=0)   # [H, L2(+C), D]
-        v_attn = v_all.repeat_interleave(n_rep, dim=0)
-        q_h = q.permute(1, 0, 2)                          # [H, C, D]
+        k_attn = k_all                            # [H_kv, L2, D]
+        v_attn = v_all
+        q_h = q.permute(1, 0, 2)                  # [H, C, D]
         if C > 1:
             # K = [compact; chunk]: compact cols unmasked (invariant 4),
             # chunk cols causal.
-            k_attn = torch.cat(
-                [k_attn, k_new.permute(1, 0, 2).repeat_interleave(n_rep, 0)],
-                dim=1)
-            v_attn = torch.cat(
-                [v_attn, v_new.permute(1, 0, 2).repeat_interleave(n_rep, 0)],
-                dim=1)
-            causal = eviction.make_causal_add(C, C, device)
-            mask = torch.zeros(1, 1, C, L2 + C, device=device,
-                               dtype=torch.float32)
-            mask[..., L2:] = causal
-            # SDPA requires attn_mask dtype == query dtype (bf16 here).
-            attn_mask = mask.to(q_h.dtype)
+            k_attn = torch.cat([k_attn, k_new.permute(1, 0, 2)], dim=1)
+            v_attn = torch.cat([v_attn, v_new.permute(1, 0, 2)], dim=1)
+            # v2026-10-04o: build the additive mask directly in query dtype.
+            # The old fp32 [C, L2+C] zeros + .to(bf16) was ~5 GiB of
+            # transients at 64k prefill and OOMed with 1.3 GiB free.
+            attn_mask = torch.zeros(1, 1, C, L2 + C,
+                                    device=device, dtype=q_h.dtype)
+            attn_mask[..., L2:] = eviction.make_causal_add(
+                C, C, device).to(q_h.dtype)
         else:
             attn_mask = None
-        o = F.scaled_dot_product_attention(
-            q_h.unsqueeze(0), k_attn.unsqueeze(0), v_attn.unsqueeze(0),
-            attn_mask=attn_mask)
+        # v2026-10-04o: enable_gqa broadcasts H_kv -> H inside the kernel
+        # instead of materializing repeated [H, L, D] K/V (was 2 x 1.7 GiB
+        # at 64k). Probe once per layer; fall back to repeat_interleave if
+        # the installed torch rejects the flag.
+        if self._gqa_ok is None:
+            try:
+                F.scaled_dot_product_attention(
+                    torch.zeros(1, q.shape[1], 2, device=device,
+                                dtype=q_h.dtype),
+                    torch.zeros(1, H_kv, 4, device=device, dtype=q_h.dtype),
+                    torch.zeros(1, H_kv, 4, device=device, dtype=q_h.dtype),
+                    enable_gqa=True)
+                self._gqa_ok = True
+            except RuntimeError:
+                self._gqa_ok = False
+                print("[v8_plugin] enable_gqa unsupported, falling back to "
+                      "repeat_interleave", flush=True)
+        if self._gqa_ok:
+            o = F.scaled_dot_product_attention(
+                q_h.unsqueeze(0), k_attn.unsqueeze(0), v_attn.unsqueeze(0),
+                attn_mask=attn_mask, enable_gqa=True)
+        else:
+            kr = k_attn.repeat_interleave(n_rep, dim=0)
+            vr = v_attn.repeat_interleave(n_rep, dim=0)
+            o = F.scaled_dot_product_attention(
+                q_h.unsqueeze(0), kr.unsqueeze(0), vr.unsqueeze(0),
+                attn_mask=attn_mask)
         output[qs:qe] = o[0].permute(1, 0, 2).to(output.dtype)

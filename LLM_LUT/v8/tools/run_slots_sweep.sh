@@ -71,10 +71,17 @@ for S in $SLOTS_LIST; do
         continue
     fi
 
+    # v2026-10-04o: 0.88 (not the 0.9 default) — the plugin's prefill
+    # transients (bf16 [C, L2+C] additive mask at 64k ≈ 1.6 GiB) sit on top
+    # of vLLM's profiled activation budget; 0.9 left only 1.3 GiB free and
+    # OOMed at prompt ~98k. Cost: ~2.4 GiB less KV pool (documented in the
+    # report; real memory savings is a separate phase anyway).
     CUDA_VISIBLE_DEVICES="$GPUS" V8_COMPRESS_SLOTS="$S" \
+        PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
         python -m vllm_plugin.serve "$MODEL" \
         --enforce-eager --max-model-len "$MAX_LEN" \
         --tensor-parallel-size 2 --max-num-seqs 4 \
+        --gpu-memory-utilization 0.88 \
         --port "$PORT" > "logs/vllm_64k_s${S}.log" 2>&1 &
 
     # wait for health instead of a blind fixed sleep
