@@ -582,25 +582,19 @@ CUDA graph、prefix caching、SLA/排队模型。
 - 模型 `/home/u/downloads/models/Qwen3.6-35B-A3B`。
 - 所有起服务的动作都在脚本内部完成（环境变量写死在脚本里），不要在终端手搓 serve 命令。
 
-### 8.1 同步代码后必做（10 秒，防部分同步）
-```bash
-python -m py_compile vllm_plugin/*.py && echo COMPILE_OK
-grep "PLUGIN_VERSION = " vllm_plugin/config.py    # 当前应为 2026-10-04r
-```
-
-### 8.2 生成数据（缺哪个跑哪个）
+### 8.1 生成数据（缺哪个跑哪个）
 ```bash
 python tools/gen_longctx_multiturn.py --target-tokens 65536 --num-docs 8 --tokenizer-path /home/u/downloads/models/Qwen3.6-35B-A3B --out data/longctx_multi_turn_65536.jsonl
 python tools/gen_longctx_multiturn.py --target-tokens 32768 --num-docs 8 --tokenizer-path /home/u/downloads/models/Qwen3.6-35B-A3B --out data/longctx_multi_turn_32768.jsonl
 ```
 
-### 8.3 并发修复验证（换代码后先跑这个，约 15 分钟）
+### 8.2 并发修复验证（换代码后先跑这个，约 15 分钟）
 ```bash
 bash tools/repro_concurrency.sh
 ```
-通过标准（脚本自行打印）：版本 = 2026-10-04r；`state reset` 计数 = 0；fact_acc ≥ 0.7。
+通过标准（脚本自行打印）：版本 = 2026-10-04s；`state reset` 计数 = 0；fact_acc ≥ 0.7。
 
-### 8.4 slots 扫描（约 2 小时）
+### 8.3 slots 扫描（约 2 小时）
 ```bash
 bash tools/run_slots_sweep.sh
 ```
@@ -608,15 +602,15 @@ bash tools/run_slots_sweep.sh
 换档/换数据：`SLOTS_LIST="512 8192" DATA=data/longctx_multi_turn_32768.jsonl bash tools/run_slots_sweep.sh`
 产出：`results/eval_64k_slots<S>.json`
 
-### 8.5 并发扫描（约 2 小时）
+### 8.4 并发扫描（约 2 小时）
 ```bash
 bash tools/run_concurrency_sweep.sh
 ```
-通过标准：N=1 的 fact_acc 与 8.4 一致（±1 题）；N≥8 不崩（fact_acc ≥ 0.7、errors = 0）。
+通过标准：N=1 的 fact_acc 与 8.3 一致（±1 题）；N≥8 不崩（fact_acc ≥ 0.7、errors = 0）。
 换档：`SLOTS_LIST="512 2048" N_LIST="1 8 16 32" bash tools/run_concurrency_sweep.sh`
 产出：`results/bench_c<N>_slots<S>.json`
 
-### 8.6 基准对拍（无插件，GPU 0,1 / 18003）
+### 8.5 基准对拍（无插件，GPU 0,1 / 18003）
 ```bash
 bash tools/start_baseline.sh
 python tools/eval_longctx_server.py --base-url http://localhost:18003 --model /home/u/downloads/models/Qwen3.6-35B-A3B --data data/longctx_multi_turn_65536.jsonl --out results/eval_64k_baseline.json
@@ -624,12 +618,12 @@ python tools/bench_concurrency.py --base-url http://localhost:18003 --model /hom
 pkill -f "vllm serve" ; sleep 3
 ```
 
-### 8.7 判废标准（任一命中即停下回报，不硬撑）
+### 8.6 判废标准（任一命中即停下回报，不硬撑）
 - 单请求 64k fact_acc 显著低于 0.73；
 - allocator 仍随 seq_len 线性涨显存（spec 没被采纳）；
 - TPOT 比 full-KV 慢 5 倍以上。
 
-### 8.8 故障速查
+### 8.7 故障速查
 - 启动失败：`grep -n -A30 "Traceback" <log>`，根因在 "Engine core initialization failed" 包装错误之上。
 - 启动报 `Free memory ... less than desired`：孤儿 worker 占卡，`nvidia-smi` 找自己 uid 的进程杀掉（各 sweep 脚本的 cleanup() 已内置此逻辑）。
 - 评测全 ANCHOR FAIL：服务没起或端口错，先 `curl localhost:<port>/health`。

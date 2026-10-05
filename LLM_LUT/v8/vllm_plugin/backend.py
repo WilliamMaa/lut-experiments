@@ -150,17 +150,30 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
             n_need = min((seen + C + bs - 1) // bs,
                          bt.shape[1], nblk)
             blocks = tuple(int(x) for x in bt[i, :max(n_need, 1)].tolist())
-            # Compare over the OVERLAPPING prefix only: under async
-            # scheduling the meaningful region grows by C per step, and
-            # truncating either side to the other's length mismatches
-            # (v2026-10-04q lesson). A live request's physical blocks only
-            # ever APPEND; any overlap mismatch on a known key = the first
-            # block was reissued to a NEW request -> fresh state.
-            n_ov = min(len(blocks), len(st.blocks)) if st is not None else 0
-            if st is None or blocks[:n_ov] != st.blocks[:n_ov]:
+            # Request identity (v2026-10-04s). Continuing requests STRICTLY
+            # EXTEND their block row every prefill chunk (the scheduler
+            # allocates each chunk's blocks when scheduling it), and decode
+            # steps (C==1) hold the row length between allocations (one
+            # block per bs tokens). So:
+            #   same request  = prefix match AND (strictly longer OR C==1)
+            #   new request   = prefix mismatch, OR (match AND equal length
+            #                   AND C>1)
+            # The equal-length+C>1 case is a finished request whose WHOLE
+            # block sequence was reissued to a new request — the allocator
+            # does this deterministically on a quiet pool (实机: sess B got
+            # the identical [4..11] as finished sess A). v2026-10-04r's
+            # prefix-match-only rule false-accepted it, the new request
+            # inherited compact_len=32768, and the write-back indexed
+            # blk_tensor out of bounds (CUDA device-side assert).
+            n_st = len(st.blocks) if st is not None else 0
+            same = (st is not None
+                    and len(blocks) >= n_st
+                    and blocks[:n_st] == st.blocks
+                    and (len(blocks) > n_st or C == 1))
+            if not same:
                 st = RequestKVState(blocks)
                 self.states[key] = st
-            elif len(blocks) > len(st.blocks):
+            elif len(blocks) > n_st:
                 # Same request, allocation grew mid-prefill (deferred
                 # eviction makes allocation track prompt length). Refresh
                 # the block tensor; compact state carries over.

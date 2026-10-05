@@ -18,7 +18,7 @@ TARGET_ARCH = os.environ.get(
 
 # Bumped on every behavioral change; printed at patch() and injection time
 # so a remote log alone proves which code version is live.
-PLUGIN_VERSION = "2026-10-04r"
+PLUGIN_VERSION = "2026-10-04s"
 
 # Margin (in blocks) added on top of the retention budget. Eviction keeps
 # L <= retention strictly, the margin only covers decode append-then-evict

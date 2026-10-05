@@ -76,7 +76,7 @@ if [ "$up" != "1" ]; then
     exit 1
 fi
 
-echo "=== version check (must say 2026-10-04r) ==="
+echo "=== version check (must say 2026-10-04s) ==="
 grep "2026-10-04" logs/vllm_repro.log | head -2
 
 echo "=== bench: N=$N docs=$DOCS data=$DATA ==="
@@ -91,8 +91,8 @@ echo -n "state reset count (must be 0): "
 grep -c "state reset" logs/vllm_repro.log
 echo -n "stale metadata healed count (large is OK): "
 grep -c "stale metadata healed" logs/vllm_repro.log
-echo "=== server errors (must be empty; if not, these lines identify the crash) ==="
-grep -n "RuntimeError\|IndexError\|out of memory\|WorkerProc hit" logs/vllm_repro.log | head -5
+echo "=== server errors (must be empty; full traceback of the first crash) ==="
+grep -n -A35 "WorkerProc hit an exception" logs/vllm_repro.log | head -80
 echo "=== sample answers ==="
 python - "results/bench_repro_c${N}.json" <<'PYEOF'
 import json, sys
