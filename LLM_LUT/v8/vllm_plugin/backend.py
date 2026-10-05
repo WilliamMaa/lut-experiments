@@ -116,11 +116,11 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
                            fast_build)
         nblk = self.spec.blocks_per_request
         bs = self.spec.block_size
-        # block_table_tensor: [num_reqs, max_blocks] (GPU). Our group's row
-        # holds the request's private blocks; entries beyond the allocated
-        # length are padding (stale ids / zeros from reused rows) and must
-        # NOT take part in identity comparisons. v2026-10-04p: slice each
-        # row to ceil(seq_len/bs) — the only entries that are meaningful.
+        # block_table_tensor: [num_reqs, max_blocks] (GPU). Row content is
+        # valid up to the scheduler's allocation frontier, which RUNS AHEAD
+        # of execution under async scheduling (the seq_lens metadata lags
+        # instead). Slicing rules and request identity are documented at
+        # the slice site below (v2026-10-04r).
         #
         # Request identity rule (replaces the old n_computed==0 reset
         # heuristic in impl.py, which false-fired ~3000x under concurrency:
@@ -132,23 +132,34 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
         # - any prefix mismatch on a known blocks[0] = the block was
         #   reissued to a NEW request -> fresh state (recreate in place).
         bt = common_attn_metadata.block_table_tensor.cpu()
-        seq_lens = common_attn_metadata.seq_lens.cpu().tolist()
+        qsl = common_attn_metadata.query_start_loc_cpu.tolist()
         req_states = []
         for i in range(common_attn_metadata.num_reqs):
-            n_alloc = min((int(seq_lens[i]) + bs - 1) // bs,
-                          bt.shape[1], nblk)
-            blocks = tuple(int(x) for x in bt[i, :max(n_alloc, 1)].tolist())
-            st = self.states.get(blocks[0])
+            C = int(qsl[i + 1] - qsl[i])
+            key = int(bt[i, 0])
+            st = self.states.get(key)
+            # Slice width (v2026-10-04r): the plugin may touch any block in
+            # [0, ceil((snap_len + C)/bs)) this step — compact write-back
+            # reaches the healed chunk end, which is AHEAD of the lagged
+            # seq_lens metadata (async scheduling, see v2026-10-04n). The
+            # scheduler allocates blocks ahead of execution, so the row is
+            # valid at least through the currently executing chunk; slicing
+            # by seq_lens instead (v2026-10-04q) gave blk_tensor one chunk
+            # too few blocks and crashed with an index out of bounds.
+            seen = st.snap_len if st is not None else 0
+            n_need = min((seen + C + bs - 1) // bs,
+                         bt.shape[1], nblk)
+            blocks = tuple(int(x) for x in bt[i, :max(n_need, 1)].tolist())
             # Compare over the OVERLAPPING prefix only: under async
-            # scheduling the row can be one chunk stale (shorter), and a
-            # growing request is longer — truncating either side to the
-            # other's length is what v2026-10-04q fixed (v2026-10-04p's
-            # st.blocks[:len(blocks)] != blocks mismatched on EVERY growth
-            # step and recreated the state each chunk).
-            n = min(len(blocks), len(st.blocks)) if st is not None else 0
-            if st is None or blocks[:n] != st.blocks[:n]:
+            # scheduling the meaningful region grows by C per step, and
+            # truncating either side to the other's length mismatches
+            # (v2026-10-04q lesson). A live request's physical blocks only
+            # ever APPEND; any overlap mismatch on a known key = the first
+            # block was reissued to a NEW request -> fresh state.
+            n_ov = min(len(blocks), len(st.blocks)) if st is not None else 0
+            if st is None or blocks[:n_ov] != st.blocks[:n_ov]:
                 st = RequestKVState(blocks)
-                self.states[blocks[0]] = st
+                self.states[key] = st
             elif len(blocks) > len(st.blocks):
                 # Same request, allocation grew mid-prefill (deferred
                 # eviction makes allocation track prompt length). Refresh

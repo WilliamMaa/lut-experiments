@@ -76,7 +76,7 @@ if [ "$up" != "1" ]; then
     exit 1
 fi
 
-echo "=== version check (must say 2026-10-04q) ==="
+echo "=== version check (must say 2026-10-04r) ==="
 grep "2026-10-04" logs/vllm_repro.log | head -2
 
 echo "=== bench: N=$N docs=$DOCS data=$DATA ==="
