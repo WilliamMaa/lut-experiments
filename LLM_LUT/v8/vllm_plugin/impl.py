@@ -106,17 +106,15 @@ class CompressedKVImpl(FlashAttentionImpl):
         hh_budget = allowance - sink_n - recent_n
 
         st.ensure_gpu(device)
-        # New-request detection: blocks[0] is the state key, and a finished
-        # request's blocks go back to the pool and can be reissued to a new
-        # request. The builder keeps the state object across tuple changes
-        # now (allocation grows mid-prefill), so the reset signal is
-        # n_computed == 0 while compact state is non-empty.
-        if n_computed == 0 and st.compact_len != 0:
-            print(f"[v8_plugin] state reset: new request on "
-                  f"blocks[0]={st.blocks[0]} "
-                  f"old_compact={st.compact_len}", flush=True)
-            st.compact_len = 0
-            st.snap_len = 0
+        # New-request detection was REMOVED here (v2026-10-04p): the
+        # n_computed == 0 heuristic false-fired ~3000x under concurrency —
+        # async scheduling holds num_computed at 0 until a request's prior
+        # step executes, so every prefill chunk looked like a new request
+        # and the snapshot table was wiped every step. The builder now
+        # decides identity from the block table (append-only prefix; any
+        # mismatch on a known blocks[0] = reissued to a new request) and
+        # hands impl.py a fresh state when needed. Do NOT reintroduce
+        # metadata-based reset here.
         # v2026-10-04n: async scheduling can lag chunk metadata by one chunk
         # (n_computed < positions already scored). For prefill chunks the
         # snapshot length IS the true chunk start; heal and flag it. Decode

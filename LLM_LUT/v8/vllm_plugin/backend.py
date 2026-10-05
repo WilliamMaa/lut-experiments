@@ -115,36 +115,39 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
         md = super().build(common_prefix_len, common_attn_metadata,
                            fast_build)
         nblk = self.spec.blocks_per_request
+        bs = self.spec.block_size
         # block_table_tensor: [num_reqs, max_blocks] (GPU). Our group's row
-        # holds the request's private blocks at [0, blocks_per_request);
-        # entries beyond are padding and never touched by us.
-        bt = common_attn_metadata.block_table_tensor[:, :nblk].cpu()
+        # holds the request's private blocks; entries beyond the allocated
+        # length are padding (stale ids / zeros from reused rows) and must
+        # NOT take part in identity comparisons. v2026-10-04p: slice each
+        # row to ceil(seq_len/bs) — the only entries that are meaningful.
+        #
+        # Request identity rule (replaces the old n_computed==0 reset
+        # heuristic in impl.py, which false-fired ~3000x under concurrency:
+        # async scheduling leaves num_computed at 0 until a request's
+        # previous step fully executes, so every prefill chunk looked like
+        # a new request and the snapshot table was wiped every step):
+        # - physical blocks of a live request only ever APPEND (prefix
+        #   stable), so a meaningful-prefix match = same request;
+        # - any prefix mismatch on a known blocks[0] = the block was
+        #   reissued to a NEW request -> fresh state (recreate in place).
+        bt = common_attn_metadata.block_table_tensor.cpu()
+        seq_lens = common_attn_metadata.seq_lens.cpu().tolist()
         req_states = []
         for i in range(common_attn_metadata.num_reqs):
-            blocks = tuple(int(x) for x in bt[i].tolist())
+            n_alloc = min((int(seq_lens[i]) + bs - 1) // bs,
+                          bt.shape[1], nblk)
+            blocks = tuple(int(x) for x in bt[i, :max(n_alloc, 1)].tolist())
             st = self.states.get(blocks[0])
-            if st is None:
+            if st is None or st.blocks[:len(blocks)] != blocks:
                 st = RequestKVState(blocks)
                 self.states[blocks[0]] = st
-            elif st.blocks != blocks:
-                # Two sub-cases (v2026-10-04m instrumentation):
-                # (a) scheduler GREW the allocation mid-prefill — deferred
-                #     eviction makes allocation track prompt length, so the
-                #     tuple changes at every chunk now. The physical blocks
-                #     of already-written tokens never change; only the
-                #     tuple (incl. trailing padding values) does. Keep the
-                #     compact state, refresh the block tensor.
-                # (b) a NEW request reused blocks[0] after free — detected
-                #     and reset in _update_and_attend via n_computed == 0.
-                if len(blocks) >= len(st.blocks) and \
-                        blocks[:len(st.blocks)] == st.blocks:
-                    st.blocks = blocks
-                    st._gpu = None  # ensure_gpu rebuilds blk tensor
-                else:
-                    # padding-value drift can also land here; safe fallback
-                    # is the same keep-and-refresh (n_computed==0 resets).
-                    st.blocks = blocks
-                    st._gpu = None
+            elif len(blocks) > len(st.blocks):
+                # Same request, allocation grew mid-prefill (deferred
+                # eviction makes allocation track prompt length). Refresh
+                # the block tensor; compact state carries over.
+                st.blocks = blocks
+                st._gpu = None  # ensure_gpu rebuilds blk tensor
             req_states.append(st)
         md.req_states = req_states
         md.qsl_cpu = common_attn_metadata.query_start_loc_cpu
