@@ -108,6 +108,11 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
         # 0.19.1 signature: (kv_cache_spec, layer_names, vllm_config, device)
         super().__init__(*args, **kwargs)
         self.spec = args[0] if args else kwargs["kv_cache_spec"]
+        layer_names = args[1] if len(args) > 1 else \
+            kwargs.get("layer_names", [])
+        # Identity-decision logging from ONE layer only, else 48 layers
+        # flood the log.
+        self._verbose = any("layers.0." in n for n in layer_names)
         self.states: dict[int, RequestKVState] = {}
 
     def build(self, common_prefix_len, common_attn_metadata,
@@ -170,6 +175,11 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
                     and len(blocks) >= n_st
                     and blocks[:n_st] == st.blocks
                     and (len(blocks) > n_st or C == 1))
+            if self._verbose:
+                print(f"[v8_plugin] identity: key={key} C={C} "
+                      f"row_len={len(blocks)} st_len={n_st} "
+                      f"snap_len={st.snap_len if st else 0} -> "
+                      f"{'SAME' if same else 'NEW'}", flush=True)
             if not same:
                 st = RequestKVState(blocks)
                 self.states[key] = st

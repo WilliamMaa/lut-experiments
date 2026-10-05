@@ -71,6 +71,10 @@ class CompressedKVImpl(FlashAttentionImpl):
 
         H_kv = self.num_kv_heads
         bs = kv_cache.shape[2]  # block_size
+        if not getattr(self, "_v8_cfg_logged", False):
+            self._v8_cfg_logged = True
+            print(f"[v8_plugin] layer cfg: bs={bs} H_kv={H_kv} "
+                  f"pool={list(kv_cache.shape)}", flush=True)
         qsl = attn_metadata.qsl_cpu.tolist()
         seq_lens = attn_metadata.seq_lens_cpu.tolist()
 
@@ -148,6 +152,13 @@ class CompressedKVImpl(FlashAttentionImpl):
         if L > 0:
             jb = arange_cap[:L] // bs
             off = arange_cap[:L] % bs
+            if int(jb.max()) >= st.blk_tensor.numel():
+                raise IndexError(
+                    f"[v8_plugin] compact-gather OOB: L={L} jb_max="
+                    f"{int(jb.max())} n_blk={st.blk_tensor.numel()} "
+                    f"C={C} compact_len={st.compact_len} "
+                    f"snap_len={st.snap_len} n_computed={n_computed} "
+                    f"blocks_len={len(st.blocks)}")
             bid = st.blk_tensor[jb]
             k_comp = k_cache[bid, off].permute(1, 0, 2)  # [H_kv, L, D]
             v_comp = v_cache[bid, off].permute(1, 0, 2)
@@ -232,6 +243,13 @@ class CompressedKVImpl(FlashAttentionImpl):
             st.compact_len = L2
         jb2 = arange_cap[:L2] // bs
         off2 = arange_cap[:L2] % bs
+        if int(jb2.max()) >= st.blk_tensor.numel():
+            raise IndexError(
+                f"[v8_plugin] write-back OOB: L2={L2} jb2_max="
+                f"{int(jb2.max())} n_blk={st.blk_tensor.numel()} "
+                f"C={C} compact_len={st.compact_len} "
+                f"snap_len={st.snap_len} n_computed={n_computed} "
+                f"blocks_len={len(st.blocks)}")
         bid2 = st.blk_tensor[jb2]
         k_cache[bid2, off2] = k_all.permute(1, 0, 2)
         v_cache[bid2, off2] = v_all.permute(1, 0, 2)
