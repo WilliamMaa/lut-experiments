@@ -123,10 +123,28 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
         for i in range(common_attn_metadata.num_reqs):
             blocks = tuple(int(x) for x in bt[i].tolist())
             st = self.states.get(blocks[0])
-            if st is None or st.blocks != blocks:
-                # New request, or finished-and-blocks-reused: (re)create.
+            if st is None:
                 st = RequestKVState(blocks)
                 self.states[blocks[0]] = st
+            elif st.blocks != blocks:
+                # Two sub-cases (v2026-10-04m instrumentation):
+                # (a) scheduler GREW the allocation mid-prefill — deferred
+                #     eviction makes allocation track prompt length, so the
+                #     tuple changes at every chunk now. The physical blocks
+                #     of already-written tokens never change; only the
+                #     tuple (incl. trailing padding values) does. Keep the
+                #     compact state, refresh the block tensor.
+                # (b) a NEW request reused blocks[0] after free — detected
+                #     and reset in _update_and_attend via n_computed == 0.
+                if len(blocks) >= len(st.blocks) and \
+                        blocks[:len(st.blocks)] == st.blocks:
+                    st.blocks = blocks
+                    st._gpu = None  # ensure_gpu rebuilds blk tensor
+                else:
+                    # padding-value drift can also land here; safe fallback
+                    # is the same keep-and-refresh (n_computed==0 resets).
+                    st.blocks = blocks
+                    st._gpu = None
             req_states.append(st)
         md.req_states = req_states
         md.qsl_cpu = common_attn_metadata.query_start_loc_cpu

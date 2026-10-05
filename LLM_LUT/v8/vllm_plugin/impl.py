@@ -103,6 +103,17 @@ class CompressedKVImpl(FlashAttentionImpl):
         hh_budget = allowance - sink_n - recent_n
 
         st.ensure_gpu(device)
+        # New-request detection: blocks[0] is the state key, and a finished
+        # request's blocks go back to the pool and can be reissued to a new
+        # request. The builder keeps the state object across tuple changes
+        # now (allocation grows mid-prefill), so the reset signal is
+        # n_computed == 0 while compact state is non-empty.
+        if n_computed == 0 and st.compact_len != 0:
+            print(f"[v8_plugin] state reset: new request on "
+                  f"blocks[0]={st.blocks[0]} "
+                  f"old_compact={st.compact_len}", flush=True)
+            st.compact_len = 0
+            st.snap_len = 0
         st.grow(max(n_computed + C + 1, allowance + bs), device, H_kv)
 
         L = st.compact_len
@@ -199,6 +210,15 @@ class CompressedKVImpl(FlashAttentionImpl):
 
         # --- write compact layout back into the private blocks ---
         L2 = st.compact_len
+        if k_all.shape[1] != L2:
+            # Should be unreachable (both derive from L+C or the eviction
+            # cat). v2026-10-04m: print the full现场 and reconcile to the
+            # tensor we actually hold.
+            print(f"[v8_plugin] LAYOUT MISMATCH st={id(st)} L2={L2} "
+                  f"k_all={k_all.shape[1]} L={L} C={C} "
+                  f"n_computed={n_computed} allowance={allowance}", flush=True)
+            L2 = k_all.shape[1]
+            st.compact_len = L2
         jb2 = arange_cap[:L2] // bs
         off2 = arange_cap[:L2] % bs
         bid2 = st.blk_tensor[jb2]
