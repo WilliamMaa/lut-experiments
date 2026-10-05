@@ -67,19 +67,24 @@ def run_session(base_url, model, doc, sid, max_tokens):
                  "content": nonce + "\n" + doc["document"]}]
     t0 = time.time()
     turn_seconds = []
+    answers = []
     correct = 0
     error = None
     try:
         _, dt = chat(base_url, model, messages, 8)
         turn_seconds.append(dt)
         messages.append({"role": "assistant", "content": "好的，我已读完。"})
-        for q, gts in zip(doc["questions"], doc["answers"]):
+        for q, gts, qt in zip(doc["questions"], doc["answers"],
+                              doc.get("qtype", [""] * len(doc["questions"]))):
             messages.append({"role": "user", "content": q})
             try:
                 ans, dt = chat(base_url, model, messages, max_tokens)
             except Exception as e:
                 ans, dt = f"<ERROR {e!r}>", 0.0
             turn_seconds.append(dt)
+            answers.append({"qtype": qt, "question": q, "gt": gts,
+                            "answer": ans[:400],
+                            "correct": all(gt in ans for gt in gts)})
             correct += all(gt in ans for gt in gts)
             messages.append({"role": "assistant", "content": ans})
     except Exception as e:
@@ -94,6 +99,7 @@ def run_session(base_url, model, doc, sid, max_tokens):
             "correct": correct, "n_questions": len(doc["questions"]),
             "seconds": round(dur, 2),
             "turn_seconds": [round(t, 2) for t in turn_seconds],
+            "answers": answers,
             "error": error}
 
 
@@ -104,6 +110,8 @@ def main():
     ap.add_argument("--data", required=True, help="longctx_multi_turn jsonl")
     ap.add_argument("--concurrency", type=int, required=True,
                     help="parallel sessions (workers)")
+    ap.add_argument("--max-docs", type=int, default=0,
+                    help="0 = all docs; >0 cap sessions for quick repro")
     ap.add_argument("--out", default=None, help="write JSON summary here")
     ap.add_argument("--max-tokens", type=int, default=96)
     ap.add_argument("--timeout", type=int, default=3600,
@@ -123,6 +131,8 @@ def main():
                 d["doc_index"] = i
                 docs.append(d)
     # sessions = one per doc, recycled round-robin if N > len(docs)
+    if args.max_docs > 0:
+        docs = docs[:args.max_docs]
     sessions = [(i, docs[i % len(docs)]) for i in range(len(docs))]
 
     wall_t0 = time.time()
