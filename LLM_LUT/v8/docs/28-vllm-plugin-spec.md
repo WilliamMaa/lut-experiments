@@ -559,6 +559,7 @@ CUDA graph、prefix caching、SLA/排队模型。
 | **get_kv_cache_spec 时序** | worker 在 `_initialize_kv_caches` 里对每个 Attention 实例调 `get_kv_cache_spec()`（gpu_model_runner.py:6926），此时**可能不在 `set_current_vllm_config` 上下文内** → `get_current_vllm_config()` 抛异常；若转换函数里做 arch 门控并吞异常会静默跳过（症状：patch/注入日志都在、并发上限数字不变）。**解法：转换处不做 config 依赖的门控**（backend 名字已足以证明身份） | 实机踩过（g 版修复，采纳后并发上限 192x→729x） |
 
 | **prefill chunk 长度** | vLLM 按 8192 chunk 一次喂入（C 可达数千），arange 辅助张量只按 `budget+bs`（544）开 → `arange_cap[:C]` 静默截断 → `index_copy_` 报 `Number of indices (544) != source.size(2065)`（v2026-10-04j 实机踩过）。**解法：`need_ar = max(n_computed + C + 1, budget + bs)`，不够大就重建** | 同类坑：凡按 token 开表的辅助张量都要按 C 校验 |
+| **async scheduling 元数据滞后** | vLLM async scheduling 下 chunk 的调度元数据可滞后一个 chunk：chunk3 到来时 `n_computed`=8192（本应是 16384），`seq_lens = num_computed + scheduled`。on-demand 重建条件 `need_ar=max(n_computed+C+1, budget+bs)` 算出 16385 恰不大于现有 16385 → 不重建 → `arange_cap[:L2]` 静默截断 → 64k 多 chunk 第 3 chunk 必崩 `RuntimeError: value [24576,1,256] vs target [16385,1,256]`（16385=上一 chunk 的 need_ar，2026-10-05 实机踩过；单 chunk smoke 永不暴露）。**解法（v2026-10-04n）：① arange 一次性开满 `V8_MAX_SEQ_TOKENS+bs+16`，不再按需重建；② prefill 元数据自愈 `if C>1 and n_computed < st.snap_len: n_computed = st.snap_len`（decode C==1 不走此路），触发时日志打 `stale metadata healed`** |
 
 **远程验证状态（2026-10-04 smoke ALL PASS 后更新）**：R1–R6 全部实机通过——0.19.1+cu128 import 正常、builder/metadata 无 TypeError、无 MTP 第二路径、GDN 组与 full-attn 组 spec 共存未炸、pool 布局确为 [2,nb,bs,H_kv,D]、TP=2 正常。原表留档：
 

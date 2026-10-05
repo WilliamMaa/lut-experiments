@@ -114,17 +114,27 @@ class CompressedKVImpl(FlashAttentionImpl):
                   f"old_compact={st.compact_len}", flush=True)
             st.compact_len = 0
             st.snap_len = 0
+        # v2026-10-04n: async scheduling can lag chunk metadata by one chunk
+        # (n_computed < positions already scored). For prefill chunks the
+        # snapshot length IS the true chunk start; heal and flag it. Decode
+        # (C==1) must not take this path (snap_len == prompt length there).
+        if C > 1 and n_computed < st.snap_len:
+            print(f"[v8_plugin] stale metadata healed: n_computed "
+                  f"{n_computed} -> {st.snap_len} C={C}", flush=True)
+            n_computed = st.snap_len
         st.grow(max(n_computed + C + 1, allowance + bs), device, H_kv)
 
         L = st.compact_len
         arange_cap = st._gpu[2]
-        # arange_cap must cover C (chunk length), not just budget+bs —
-        # a 2065-token prefill with bs=32 needs 2065 entries, and a
-        # truncated slice would silently shrink orig_all (debugged from
-        # "Number of indices (544) != source.size(2065)").
-        need_ar = max(n_computed + C + 1, budget + bs)
-        if arange_cap is None or arange_cap.numel() < need_ar:
-            arange_cap = torch.arange(need_ar, device=device)
+        # v2026-10-04n: allocate the FULL allowance up front (~1 MiB) instead
+        # of rebuilding on demand. Async scheduling can deliver chunk
+        # metadata one chunk stale (n_computed lags), which made the
+        # on-demand rebuild condition under-allocate and silently truncate
+        # arange_cap[:L2] (crash: value [24576] vs target [16385], where
+        # 16385 was the previous chunk's need_ar).
+        full_ar = config.V8_MAX_SEQ_TOKENS + bs + 16
+        if arange_cap is None or arange_cap.numel() < full_ar:
+            arange_cap = torch.arange(full_ar, device=device)
             st._gpu = (device, st.blk_tensor, arange_cap)
 
         # 0.19.1 pool layout: kv_cache = [2, num_blocks, bs, H_kv, D].
