@@ -585,7 +585,7 @@ CUDA graph、prefix caching、SLA/排队模型。
 ### 8.1 同步代码后必做（10 秒，防部分同步）
 ```bash
 python -m py_compile vllm_plugin/*.py && echo COMPILE_OK
-grep "PLUGIN_VERSION = " vllm_plugin/config.py    # 当前应为 2026-10-04p
+grep "PLUGIN_VERSION = " vllm_plugin/config.py    # 当前应为 2026-10-04q
 ```
 
 ### 8.2 生成数据（缺哪个跑哪个）
@@ -598,7 +598,7 @@ python tools/gen_longctx_multiturn.py --target-tokens 32768 --num-docs 8 --token
 ```bash
 bash tools/repro_concurrency.sh
 ```
-通过标准（脚本自行打印）：版本 = 2026-10-04p；`state reset` 计数 = 0；fact_acc ≥ 0.7。
+通过标准（脚本自行打印）：版本 = 2026-10-04q；`state reset` 计数 = 0；fact_acc ≥ 0.7。
 
 ### 8.4 slots 扫描（约 2 小时）
 ```bash

@@ -76,8 +76,8 @@ if [ "$up" != "1" ]; then
     exit 1
 fi
 
-echo "=== version check (must say 2026-10-04p) ==="
-grep "PLUGIN_VERSION" logs/vllm_repro.log | head -2
+echo "=== version check (must say 2026-10-04q) ==="
+grep "2026-10-04" logs/vllm_repro.log | head -2
 
 echo "=== bench: N=$N docs=$DOCS data=$DATA ==="
 python tools/bench_concurrency.py \
@@ -91,6 +91,8 @@ echo -n "state reset count (must be 0): "
 grep -c "state reset" logs/vllm_repro.log
 echo -n "stale metadata healed count (large is OK): "
 grep -c "stale metadata healed" logs/vllm_repro.log
+echo "=== server errors (must be empty; if not, these lines identify the crash) ==="
+grep -n "RuntimeError\|IndexError\|out of memory\|WorkerProc hit" logs/vllm_repro.log | head -5
 echo "=== sample answers ==="
 python - "results/bench_repro_c${N}.json" <<'PYEOF'
 import json, sys

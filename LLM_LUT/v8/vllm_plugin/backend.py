@@ -139,7 +139,14 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
                           bt.shape[1], nblk)
             blocks = tuple(int(x) for x in bt[i, :max(n_alloc, 1)].tolist())
             st = self.states.get(blocks[0])
-            if st is None or st.blocks[:len(blocks)] != blocks:
+            # Compare over the OVERLAPPING prefix only: under async
+            # scheduling the row can be one chunk stale (shorter), and a
+            # growing request is longer — truncating either side to the
+            # other's length is what v2026-10-04q fixed (v2026-10-04p's
+            # st.blocks[:len(blocks)] != blocks mismatched on EVERY growth
+            # step and recreated the state each chunk).
+            n = min(len(blocks), len(st.blocks)) if st is not None else 0
+            if st is None or blocks[:n] != st.blocks[:n]:
                 st = RequestKVState(blocks)
                 self.states[blocks[0]] = st
             elif len(blocks) > len(st.blocks):
