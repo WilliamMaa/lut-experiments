@@ -197,7 +197,7 @@ def patch_step_context() -> None:
         req_ids = list(self.input_batch.req_ids[:self.input_batch.num_reqs])
         computed, scheduled = {}, {}
         for new in scheduler_output.scheduled_new_reqs:
-            computed[new.request_id] = new.num_computed_tokens
+            computed[new.req_id] = new.num_computed_tokens
         cached = scheduler_output.scheduled_cached_reqs
         for rid, comp in zip(cached.req_ids, cached.num_computed_tokens):
             computed[rid] = comp

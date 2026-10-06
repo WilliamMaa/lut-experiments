@@ -21,7 +21,8 @@ TARGET_ARCH = os.environ.get(
 # 2026-10-06a: docs/31 contract rewrite — identity by request_id (I4),
 # kernel-unit addressing with P from the pool (I2), fail-closed frontier
 # plan (I3). The n→t heuristic patch chain is gone.
-PLUGIN_VERSION = "2026-10-06a"
+# 2026-10-06b: NewRequestData field is req_id, not request_id (0.19.1).
+PLUGIN_VERSION = "2026-10-06b"
 
 # Margin (in blocks) added on top of the retention budget. Eviction keeps
 # L <= retention strictly, the margin only covers decode append-then-evict
