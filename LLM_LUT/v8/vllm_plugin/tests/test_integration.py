@@ -15,7 +15,9 @@ os.environ.setdefault("V8_OBS_WINDOW", "8")
 os.environ.setdefault("V8_SPAN_WINDOW", "2")
 os.environ.setdefault("V8_MAX_SEQ_TOKENS", "96")
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.dirname(os.path.dirname(_HERE)))  # project root
+sys.path.insert(0, _HERE)
 import fake_vllm
 fake_vllm.install()
 
