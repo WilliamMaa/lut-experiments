@@ -24,17 +24,19 @@ def main():
     ap.add_argument("--model-path", required=True)
     args = ap.parse_args()
 
-    vllm_config = VllmConfig(
-        model=args.model_path,
-        tokenizer=args.model_path,
-        enforce_eager=True,
-        max_model_len=131072,
-    )
+    from vllm.config import ModelConfig, VllmConfig
+
+    # 0.19.1: VllmConfig is a container of sub-configs (pydantic dataclass);
+    # flattened kwargs are not accepted. The hybrid block-size override runs
+    # from VllmConfig.try_verify_and_update_config (config/vllm.py:1606).
+    model_config = ModelConfig(model=args.model_path,
+                               tokenizer=args.model_path,
+                               max_model_len=131072)
+    vllm_config = VllmConfig(model_config=model_config)
+    vllm_config.try_verify_and_update_config()
+
     cc = vllm_config.cache_config
     mc = vllm_config.model_config
-
-    # Trigger the same hybrid override the server hits at startup.
-    mc._try_verify_and_update_model_config()
 
     print("=== v8 Gate-1 probe: vLLM's own unit view ===")
     print(f"architecture        : {mc.architecture}")
