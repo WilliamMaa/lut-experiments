@@ -52,6 +52,64 @@ scheduler: block_ids=([1],[2],[3],[4..11]), num_scheduled_tokens=8192
 - **F5** 调度器侧 per-request 块所有权本来就是显式状态：
   `kv_cache_manager.get_block_ids(request_id)`（`kv_cache_manager.py:522`）。
 
+## 1.1 实测钉值（Gate 1 probe，2026-10-06，Qwen3.6-35B-A3B @ vLLM 0.19.1）
+
+`tools/probe_kv_units.py`（CPU、只读配置）输出：
+
+```
+architecture     : Qwen3_5MoeForConditionalGeneration
+max_model_len (T): 131072
+B_g (attention)  : 1056    ← HybridAttentionMambaModelConfig 强制上调
+mamba_block_size : 1056    (mamba_cache_mode=align; mamba page 2162688 B)
+```
+
+两个推论，均已用源码分支数学核实：
+
+1. **B_g=1056 与 prefix caching 开关无关**：开（align 模式）走
+   `chunk_size*cdiv(...)` 分支、关（我们的 serve 配置）走
+   `16*cdiv(mamba_page, 16*attn_1tok)` 分支，mamba page 恰好是
+   2162688 B = 66×16×2048 B，两分支都得出 1056。
+2. **事故数字完全闭合**：调度器给 8192-token chunk 分配
+   `cdiv(8192,1056)=8` 块（崩溃 dump 的 `[4..11]`）；插件 builder 按
+   spec 的 32 去切块表（抓满 padding 宽度 256）；impl write-back 按
+   32 换算需要 `16384/32=512` 块 > 256 → OOB。三套单位同处一行代码。
+
+**对 integration 的硬约束**：v8 的 spec/换算一律以运行时
+`kv_cache_groups[g].kv_cache_spec.block_size` 为准，禁止任何 32/16
+字面量；启动时 assert `spec.block_size == cache_config.block_size`（同
+进程 config 真值），pool 页 P 在第一次 forward 用 `kv_cache.shape[2]`
+对账（I2 的 P vs B_g 关系就此钉死）。
+
+### 1.2 block_table.py 精读补充（2026-10-06，vLLM 0.19.1 worker 侧）
+
+- **块表张量已经是 kernel 单位**：`BlockTable(block_size=B_g,
+  kernel_block_size=P)`，当 B_g != P 时 `use_hybrid_blocks=True`，
+  `append_row` 把每个 manager 块展开为 `blocks_per_kv_block = B_g//P`
+  个 kernel 块（`kernel_id = mgr_id*q + r`，block_table.py:47-68,
+  110-118）。所以 builder 看到的就是 P=32 单位的表，pool 索引用 P 作
+  除数是**对的**；崩溃的真因是 builder 切片宽度与 frontier 脱节 +
+  spec 侧常数错误，不是这里要再换算。
+- **行内没有有效长度哨兵**：`clear()`/`clear_row()` 用 0 填充
+  （block_table.py:124-171），越界读到的是陈旧块号或 0（0 是合法物理
+  块）。因此"读表数有效长度"不可能——有效长度只能由本步 T 前沿
+  `computed + scheduled` 推导，这就是 I3 的 fail-closed 检查存在的
+  原因（vllm_plugin/blockplan.py）。
+- **spec.py 实锤 bug**：`blocks_per_request = ceil(131072/32)+1 = 4097`
+  按 B_g=32 算；真值必须按 B_g=1056 → **125**。allocator cap 与
+  `max_memory_usage_bytes` 全部要改按 group 真值。
+
+### 1.3 Gate 结果（2026-10-06，本机纯 CPU）
+
+| Gate | 模块 | 结果 |
+|---|---|---|
+| Gate 1 | `vllm_plugin/units.py` + `tests/test_units.py`（5 组 × 20k 随机） | **PASS** |
+| Gate 1 probe | `tools/probe_kv_units.py`（服务器，只读配置） | **B_g=1056 钉死** |
+| Gate 2 | `vllm_plugin/identity.py` + `tests/test_identity.py`（7 种调度序列） | **PASS** |
+| Gate 3 | `vllm_plugin/blockplan.py` + `tests/test_blockplan.py`（4 组 × 20k 随机） | **PASS** |
+
+剩余唯一未钉值：serve 时 P 的实机确认（integration 启动 assert 自动完成）。
+Gate 4（加载 35B，1→2→4 并发）在 integration 重写后执行。
+
 ## 2. 必须成立的不变量（每个都写成可执行检查）
 
 ### I1 单位声明

@@ -19,13 +19,15 @@ import os
 import random
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__)))))
 
-from units import (AddrCtx, Qty, Unit, UnitError, as_, cdiv,
-                   mgr_block_to_pool_pages, required_mgr_blocks,
-                   slot_address)
+from vllm_plugin.units import (AddrCtx, Qty, Unit, UnitError, as_, cdiv,
+                               mgr_block_to_pool_pages,
+                               required_mgr_blocks, slot_address)
 
-BG_SIZES = [16, 32, 64, 128, 512, 1024]
+P_SIZES = [16, 32]  # pool pages (kernel units)
+BG_SIZES = [16, 32, 64, 128, 512, 1024, 1056]  # manager block sizes
 CTX = AddrCtx(request_id="gate1-probe", group_id=0, token_start_t=0,
               token_end_t=0, token_computed_t=0, token_scheduled_t=0,
               mgr_block_size=0, pool_page_size=0)
@@ -60,43 +62,43 @@ def p1_mixed_units(rng, n):
 
 def p2_chain_matches_reference(rng, n):
     for _ in range(n):
-        bg = rng.choice(BG_SIZES)
-        length = rng.choice([0, 1, bg - 1, bg, bg + 1,
+        pp = rng.choice(P_SIZES)  # divisor is the POOL PAGE, not B_g
+        length = rng.choice([0, 1, pp - 1, pp, pp + 1,
                              rng.randint(0, 131072)])
-        block_ids = list(range(cdiv(max(length, 1), bg) + rng.randint(0, 4)))
-        ctx = ctx_with(bg)
+        block_ids = list(range(cdiv(max(length, 1), pp) + rng.randint(0, 4)))
+        ctx = ctx_with(pp)
         for _ in range(4):
             s = rng.randint(0, max(length - 1, 0))
-            b, r = slot_address(Qty(s, Unit.S), block_ids, Qty(bg, Unit.BG),
+            b, r = slot_address(Qty(s, Unit.S), block_ids, Qty(pp, Unit.P),
                                 ctx)
-            j_ref, r_ref = naive_ref(s, bg)
+            j_ref, r_ref = naive_ref(s, pp)
             assert (b, r) == (block_ids[j_ref], r_ref), \
-                f"s={s} bg={bg}: got {(b, r)} want {(block_ids[j_ref], r_ref)}"
-            assert 0 <= r < bg
+                f"s={s} P={pp}: got {(b, r)} want {(block_ids[j_ref], r_ref)}"
+            assert 0 <= r < pp
 
 
 def p3_short_table_raises(rng, n):
     for _ in range(n):
-        bg = rng.choice(BG_SIZES)
+        pp = rng.choice(P_SIZES)
         length = rng.randint(1, 131072)
-        have = cdiv(length, bg)  # exactly enough: must NOT raise at s < length
+        have = cdiv(length, pp)  # exactly enough: must NOT raise at s < length
         block_ids = list(range(have))
-        ctx = ctx_with(bg)
+        ctx = ctx_with(pp)
         # use the LAST slot: it needs exactly `have` blocks, so removing
         # one block must starve it (any earlier slot might still fit)
         s = length - 1
-        slot_address(Qty(s, Unit.S), block_ids, Qty(bg, Unit.BG), ctx)
+        slot_address(Qty(s, Unit.S), block_ids, Qty(pp, Unit.P), ctx)
         # now starve the table by one block: must raise with all I6 fields
         starved = block_ids[:-1]
         try:
-            slot_address(Qty(s, Unit.S), starved, Qty(bg, Unit.BG), ctx)
+            slot_address(Qty(s, Unit.S), starved, Qty(pp, Unit.P), ctx)
         except UnitError as e:
             msg = str(e)
             for field in ("req=", "grp=", "T=[", "computed=", "scheduled=",
                           "B_g=", "P=", "need ", "have "):
                 assert field in msg, f"I6 field {field!r} missing: {msg}"
             continue
-        raise AssertionError(f"starved table did not raise (bg={bg} s={s})")
+        raise AssertionError(f"starved table did not raise (P={pp} s={s})")
 
 
 def p4_required_blocks(rng, n):

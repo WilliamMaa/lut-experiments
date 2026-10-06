@@ -2,26 +2,38 @@
 
 Every length/offset in the v8<->vLLM adapter must carry its unit; the only
 way to cross units is through the conversion functions in this module.
-Units (docs/31 §1):
+Units (docs/31 §1 + §1.1 probe + block_table.py read):
 
   T   scheduler token (EngineCore accounting: num_scheduled/computed_tokens)
   BG  group manager block size (kv_cache_groups[g].kv_cache_spec.block_size;
-      the scheduler allocates cdiv(tokens, BG) blocks per group)
+      the SCHEDULER allocates cdiv(tokens, BG) blocks per group).
+      Measured for Qwen3.6-35B-A3B: BG = 1056 (hybrid GDN override, NOT
+      user-settable, NOT 16/32).
   H   hash block (BlockPool.hash_block_size; group block is a multiple of H)
-  P   kernel/pool page (runtime kv_cache.shape[2], the tensor index granule)
+  P   kernel/pool page (runtime kv_cache.shape[2]; the attention kernel's
+      page and the granule of block_table_tensor rows). Measured: P = 32.
+      block_table.py:64-68 expands manager blocks to kernel blocks when
+      BG != P (blocks_per_kv_block = BG // P, kernel_id = mgr_id * q + r),
+      so the block table the metadata builder sees is ALREADY in P units.
   S   v8 compact slot (logical token slot in [sink|HH|recent]; 1 S = 1 T
       position, the mapping st.orig[s] -> T)
 
 Conversion chain (docs/31 I2), the ONLY legal addressing path:
 
-  slot s (S)
-    -> j = s // BG, r = s % BG          (S -> manager block index + inner offset)
-    -> b_j = block_ids[j]               (block-table lookup, bounds-checked)
-    -> pool token offset = j * BG + r   (== s; identity, kept for clarity)
+  slot s (S, == T position)
+    -> j = s // P, r = s % P          (S -> KERNEL block index + inner offset;
+                                       the divisor is P, NOT BG, because the
+                                       block table rows are kernel units)
+    -> b_j = block_row[j]             (bounds-checked against the step's own
+                                       T frontier, see blockplan.py — rows
+                                       have NO in-band sentinel, padding is
+                                       stale/0, block_table.py:124-171)
+    -> pool index (b_j, r)
 
-If the Gate-1 probe finds P != BG for any group (hybrid unified-page reshape),
-mgr_block_to_pool_pages() is the single place where that ratio is applied;
-nothing outside this module may do unit arithmetic.
+Manager units (BG) appear ONLY in scheduler-facing accounting
+(spec.blocks_per_request, the allocator cap): blocks = cdiv(tokens, BG).
+Mixing these up is exactly the v2026-10-04t crash: scheduler counted in
+1056-token blocks, the plugin sliced and indexed in 32-token units.
 """
 from dataclasses import dataclass
 from enum import Enum
@@ -119,26 +131,29 @@ class AddrCtx:
                 f"B_g={self.mgr_block_size} P={self.pool_page_size}")
 
 
-def slot_address(slot: Qty, block_ids, block_size: Qty, ctx: AddrCtx):
+def slot_address(slot: Qty, block_row, pool_page: Qty, ctx: AddrCtx):
     """The I2 chain: compact slot -> (physical block id, inner offset).
 
-    Raises UnitError with the full I6 context if the block table is shorter
-    than the span needs (docs/31 I3: fail-closed, NEVER clamp).
-    Returns (b_j: int, r: int) with 0 <= r < B_g.
+    The divisor is the POOL PAGE P (kernel units): block_table_tensor rows
+    are already kernel-unit ids (block_table.py expands manager blocks), so
+    BG must NOT appear here. Bounds are checked against the caller-visible
+    row (docs/31 I3: fail-closed, NEVER clamp); the authoritative frontier
+    check lives in blockplan.build_block_plan and runs BEFORE any tensor
+    indexing. Returns (b_j: int, r: int) with 0 <= r < P.
     """
     s = as_(slot, Unit.S)
-    bs = as_(block_size, Unit.BG)
+    pp = as_(pool_page, Unit.P)
     if s < 0:
         raise UnitError(f"negative slot {s}; {ctx.describe()}")
-    j, r = s // bs, s % bs
+    j, r = s // pp, s % pp
     need = j + 1
-    have = len(block_ids)
+    have = len(block_row)
     if need > have:
         raise UnitError(
-            f"block table shorter than write span: need {need} blocks "
-            f"(slot {s}, B_g {bs}), have {have}; "
-            f"block_ids[:16]={list(block_ids[:16])}; {ctx.describe()}")
-    return int(block_ids[j]), r
+            f"block row shorter than write span: need {need} pool blocks "
+            f"(slot {s}, P {pp}), have {have}; "
+            f"row[:16]={list(block_row[:16])}; {ctx.describe()}")
+    return int(block_row[j]), r
 
 
 def mgr_block_to_pool_pages(j: int, mgr_block_size: Qty,
