@@ -28,15 +28,20 @@ class FakeCommon:
 
 class RequestRec:
     """Scheduler-side per-request truth (the harness plays the scheduler,
-    so this IS the truth the invariants are checked against)."""
+    so this IS the truth the invariants are checked against).
+
+    k_store/v_store hold every token's K/V in orig order: the prompt at
+    creation, then decode-generated tokens appended as steps consume
+    beyond the prompt (mirroring vLLM: decode K/V come from the model,
+    not from a fixed prompt)."""
 
     def __init__(self, rid, prompt_len, prompt_k, prompt_v):
         self.rid = rid
         self.prompt_len = prompt_len
-        self.prompt_k = prompt_k                  # [prompt_len, H_kv, D]
-        self.prompt_v = prompt_v
-        self.computed = 0                         # scheduler num_computed
-        self.kernel_ids = []                      # allocated row (kernel ids)
+        self.k_store = prompt_k            # grows: [total_tokens, H_kv, D]
+        self.v_store = prompt_v
+        self.computed = 0                  # scheduler num_computed
+        self.kernel_ids = []               # allocated row (kernel ids)
         self.active = True
 
 
@@ -140,8 +145,21 @@ class FakeWorld:
         off = 0
         for rid, n in schedule:
             rec = self.reqs[rid]
-            k[off:off + n] = rec.prompt_k[rec.computed:rec.computed + n]
-            v[off:off + n] = rec.prompt_v[rec.computed:rec.computed + n]
+            s = rec.computed
+            if s + n > len(rec.k_store):
+                # decode-generated tokens: extend the store the way the
+                # model would produce new K/V beyond the prompt
+                extra = s + n - len(rec.k_store)
+                rec.k_store = torch.cat([
+                    rec.k_store,
+                    torch.randn(extra, self.H_kv, self.D,
+                                generator=self.g)])
+                rec.v_store = torch.cat([
+                    rec.v_store,
+                    torch.randn(extra, self.H_kv, self.D,
+                                generator=self.g)])
+            k[off:off + n] = rec.k_store[s:s + n]
+            v[off:off + n] = rec.v_store[s:s + n]
             off += n
         out = torch.zeros(T, H, self.D)
         self.impl.forward(None, q, k, v, self.pool, md, out)
@@ -219,7 +237,7 @@ class FakeWorld:
             return
         bid = torch.tensor(rec.kernel_ids, dtype=torch.int64)[j]
         got = self.pool[0, bid, r]                        # [L, H_kv, D]
-        want = rec.prompt_k[o]
+        want = rec.k_store[o]
         if not torch.allclose(got, want, atol=1e-5):
             bad = int((got - want).abs().amax(dim=(1, 2)).argmax())
             errs.append(f"{rid}: K read-back mismatch at slot {bad} "
