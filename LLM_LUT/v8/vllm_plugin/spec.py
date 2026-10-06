@@ -45,6 +45,10 @@ class CompressedKVSpec(FullAttentionSpec):
         # prompt (up to V8_MAX_SEQ_TOKENS), not just the retention budget.
         # Blocks are allocated lazily by the scheduler as prefill advances;
         # this is only the per-request cap.
+        # 2026-10-06a: bs here IS the group manager block size B_g (1056
+        # for the hybrid target, set by HybridAttentionMambaModelConfig
+        # before any spec is built) — manager units, docs/31 §1.1. The
+        # kernel page P never appears in this formula.
         n = (config.V8_MAX_SEQ_TOKENS + bs - 1) // bs + config.BLOCK_MARGIN
         object.__setattr__(self, "blocks_per_request", n)
 

@@ -42,7 +42,12 @@ def build_block_plan(request_id: str, group_id: int,
                      mgr_block_size: int) -> BlockPlan:
     """Fail-closed (I3): if the write span needs more pool blocks than this
     step's allocation frontier guarantees, raise with the full I6 context.
-    NEVER clamps."""
+    NEVER clamps.
+
+    block_row: sequence of kernel-unit block ids (stored verbatim), or an
+    int meaning "certified valid length only" — the integration passes an
+    int because the real row is a GPU tensor and its ids are consumed
+    directly by the impl's gather (no CPU copy needed)."""
     span_end_t = as_(span_end, Unit.S)
     computed_t = as_(computed, Unit.T)
     scheduled_t = as_(scheduled, Unit.T)
@@ -50,6 +55,8 @@ def build_block_plan(request_id: str, group_id: int,
     frontier_t = computed_t + scheduled_t
     required = cdiv(span_end_t, pp) if span_end_t > 0 else 0
     available = cdiv(frontier_t, pp)
+    row_len = block_row if isinstance(block_row, int) else len(block_row)
+    row_head = () if isinstance(block_row, int) else list(block_row[:16])
     ctx = AddrCtx(request_id=request_id, group_id=group_id,
                   token_start_t=0, token_end_t=span_end_t,
                   token_computed_t=computed_t,
@@ -61,21 +68,21 @@ def build_block_plan(request_id: str, group_id: int,
             f"{required} pool blocks (span_end {span_end_t} T, P {pp}) > "
             f"available {available} (frontier {frontier_t} T = "
             f"computed {computed_t} + scheduled {scheduled_t}); "
-            f"row[:16]={list(block_row[:16])}; {ctx.describe()}")
-    if required > len(block_row):
-        # The row the caller sliced must cover at least the span; slicing
-        # is the builder's job, and an under-sliced row is a builder bug,
-        # caught here before any tensor indexing.
+            f"row[:16]={row_head}; {ctx.describe()}")
+    if required > row_len:
+        # The row the caller certified must cover at least the span;
+        # anything shorter is an integration bug, caught before any
+        # tensor indexing (rows have NO in-band sentinel, docs/31 §1.2).
         raise UnitError(
             f"block row shorter than plan: required {required}, row has "
-            f"{len(block_row)}; row[:16]={list(block_row[:16])}; "
-            f"{ctx.describe()}")
+            f"{row_len}; row[:16]={row_head}; {ctx.describe()}")
+    stored_row = () if isinstance(block_row, int) else tuple(block_row)
     return BlockPlan(request_id=request_id, group_id=group_id,
                      span_end_t=span_end_t, token_computed_t=computed_t,
                      token_scheduled_t=scheduled_t, frontier_t=frontier_t,
                      pool_page_size=pp, required_pool_blocks=required,
                      available_pool_blocks=available,
-                     block_row=tuple(block_row))
+                     block_row=stored_row)
 
 
 def scheduler_mgr_blocks(tokens: int, mgr_block_size: int) -> int:

@@ -18,7 +18,10 @@ TARGET_ARCH = os.environ.get(
 
 # Bumped on every behavioral change; printed at patch() and injection time
 # so a remote log alone proves which code version is live.
-PLUGIN_VERSION = "2026-10-04t"
+# 2026-10-06a: docs/31 contract rewrite — identity by request_id (I4),
+# kernel-unit addressing with P from the pool (I2), fail-closed frontier
+# plan (I3). The n→t heuristic patch chain is gone.
+PLUGIN_VERSION = "2026-10-06a"
 
 # Margin (in blocks) added on top of the retention budget. Eviction keeps
 # L <= retention strictly, the margin only covers decode append-then-evict

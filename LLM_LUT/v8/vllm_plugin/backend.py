@@ -1,21 +1,29 @@
-"""CompressedKVBackend + metadata builder + allocator cap patch.
+"""CompressedKVBackend + metadata builder (docs/31 contract implementation).
 
-Integration facts (vLLM v0.19.1, verified against spike/vllm-src-019):
-- Attention.__init__ accepts attn_backend=... (attention.py:202) — injected
-  by monkeypatch (vllm_plugin/__init__.py).
+Integration facts (vLLM 0.19.1, spike/vllm-src-019):
+- Attention.__init__ accepts attn_backend=... (attention.py) — injected by
+  monkeypatch (vllm_plugin/__init__.py).
 - No customize_spec in 0.19.1: Attention.get_kv_cache_spec returns
-  FullAttentionSpec directly (attention.py:537) — the monkeypatch converts it.
-- Builder signature in 0.19.1: (kv_cache_spec, layer_names, vllm_config,
-  device) — our __init__ takes (*args, **kwargs).
-- Builder.build(common_prefix_len, common_attn_metadata, fast_build=False)
-  consumes CommonAttentionMetadata (query_start_loc_cpu, seq_lens,
-  block_table_tensor, ...). No req_ids: per-request state is keyed by the
-  request's block-id tuple (unique while alive; reuse => recreate).
-- Allocator: single_type_kv_cache_manager.get_num_blocks_to_allocate
-  computes cdiv(num_tokens, block_size) with no spec hook — monkeypatched
-  to clamp at spec.blocks_per_request (see patch_allocator).
+  FullAttentionSpec directly — the monkeypatch converts it.
+- Builder signature: (kv_cache_spec, layer_names, vllm_config, device);
+  build(common_prefix_len, common_attn_metadata, fast_build=False) consumes
+  CommonAttentionMetadata (NO request identity in it, backend.py:323 — the
+  identity truth comes from our patched _update_states instead, I4).
+- Block table rows are KERNEL-unit ids (block_table.py expands manager
+  blocks, B_g//P each); row padding has NO sentinel (zeros/stale), so valid
+  length is never read from the row — only derived from the scheduler's
+  per-step token frontier (blockplan.py, I3).
 - v1 is eager-only: per-request Python state cannot be CUDA-graph captured.
   --enforce-eager is mandatory (enforced in serve.py).
+
+Per-request lifecycle (I4/I5):
+- identity: request_id only, from the step context (input_batch.req_ids +
+  SchedulerOutput num_computed/num_scheduled), set by patch_step_context.
+- rewind: if the scheduler's frontier (computed+scheduled) falls BEHIND
+  v8's processed record (snap_len), the request was preempted/recomputed
+  (or the timeline otherwise rewound): the state is dropped and rebuilt
+  from the scheduler truth. This is T-unit frontier arithmetic on the same
+  step's scheduler output — not a lifecycle heuristic.
 """
 import torch
 from vllm.v1.attention.backends.flash_attn import (
@@ -27,33 +35,39 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 
 from .spec import CompressedKVSpec
 from . import config
+from . import identity as idn
+from . import units
 
 
 class RequestKVState:
-    """Per layer, per request. K/V live in the pool; this is the control
-    plane: compact layout bookkeeping + the attention-mass snapshot table.
+    """Per layer-group, per request. K/V live in the pool; this is the
+    control plane: compact layout bookkeeping + the attention-mass snapshot
+    table. Block rows are NOT stored here — each step's addressable row is
+    certified by the BlockPlan built from that step's scheduler truth.
 
-    Layout invariant: compact slots [0, L) of the request's private blocks
-    always hold [sink | heavy-hitter | recent] in temporal (orig) order.
+    Layout invariant: compact slots [0, L) of the request's certified row
+    prefix always hold [sink | heavy-hitter | recent] in temporal order.
     """
 
-    __slots__ = ("blocks", "compact_len", "orig", "snap", "snap_per_head",
-                 "snap_len", "_gpu")
+    __slots__ = ("request_id", "compact_len", "orig", "snap",
+                 "snap_per_head", "snap_len", "_arange")
 
-    def __init__(self, blocks):
-        self.blocks = blocks            # tuple[int], len == blocks_per_request
+    def __init__(self, request_id):
+        self.request_id = request_id
         self.compact_len = 0
         self.orig = None                # LongTensor [cap], lazily on GPU
         self.snap = None                # fp32 [cap], attention-mass snapshot
         self.snap_per_head = None       # fp32 [H_kv, cap]
-        self.snap_len = 0
-        self._gpu = None                # (device, blk_tensor, arange_cache)
+        self.snap_len = 0               # tokens processed (T), v8's record
+        self._arange = None             # (device, arange cache)
 
-    def ensure_gpu(self, device):
-        if self._gpu is not None and self._gpu[0] == device:
-            return
-        blk = torch.tensor(self.blocks, dtype=torch.long, device=device)
-        self._gpu = (device, blk, None)
+    def arange(self, n, device):
+        if self._arange is not None and self._arange[0] == device \
+                and self._arange[1].numel() >= n:
+            return self._arange[1]
+        t = torch.arange(n, device=device)
+        self._arange = (device, t)
+        return t
 
     def grow(self, needed, device, h_kv):
         """Lazily allocate the orig/snap tables, doubling as needed."""
@@ -71,21 +85,19 @@ class RequestKVState:
             snap_ph[:, :cap] = self.snap_per_head
         self.orig, self.snap, self.snap_per_head = orig, snap, snap_ph
 
-    @property
-    def blk_tensor(self):
-        return self._gpu[1]
-
 
 class CompressedKVMetadata(FlashAttentionMetadata):
-    """Adds per-request state to the standard metadata.
-
-    req_states[i] corresponds to request i of the batch (same order as
-    query_start_loc / seq_lens). Attached post-construction by the builder.
-    """
+    """Standard metadata plus the contract attachments:
+    req_states[i] / req_ids[i] / computed_t[i] / scheduled_t[i] correspond
+    to batch row i (same order as query_start_loc). Built by the builder
+    from the step context — never reconstructed from lag-prone fields."""
 
     req_states: list = None
+    req_ids: list = None
+    computed_t: list = None
+    scheduled_t: list = None
     qsl_cpu: object = None
-    seq_lens_cpu: object = None
+    mgr_block_size: int = 0
 
 
 class CompressedKVBackend(FlashAttentionBackend):
@@ -110,90 +122,94 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
         self.spec = args[0] if args else kwargs["kv_cache_spec"]
         layer_names = args[1] if len(args) > 1 else \
             kwargs.get("layer_names", [])
-        # Identity-decision logging from ONE layer only, else 48 layers
-        # flood the log.
-        self._verbose = any("layers.0." in n for n in layer_names)
-        self.states: dict[int, RequestKVState] = {}
+        # Per KV-cache-group identity registry (I4). One builder instance
+        # per group; layers in a group share it.
+        self.registry = idn.IdentityRegistry(RequestKVState)
+        self.group_label = layer_names[0] if layer_names else "?"
 
     def build(self, common_prefix_len, common_attn_metadata,
               fast_build: bool = False):
         md = super().build(common_prefix_len, common_attn_metadata,
                            fast_build)
-        nblk = self.spec.blocks_per_request
-        bs = self.spec.block_size
-        # block_table_tensor: [num_reqs, max_blocks] (GPU). Row content is
-        # valid up to the scheduler's allocation frontier, which RUNS AHEAD
-        # of execution under async scheduling (the seq_lens metadata lags
-        # instead). Slicing rules and request identity are documented at
-        # the slice site below (v2026-10-04r).
-        #
-        # Request identity rule (replaces the old n_computed==0 reset
-        # heuristic in impl.py, which false-fired ~3000x under concurrency:
-        # async scheduling leaves num_computed at 0 until a request's
-        # previous step fully executes, so every prefill chunk looked like
-        # a new request and the snapshot table was wiped every step):
-        # - physical blocks of a live request only ever APPEND (prefix
-        #   stable), so a meaningful-prefix match = same request;
-        # - any prefix mismatch on a known blocks[0] = the block was
-        #   reissued to a NEW request -> fresh state (recreate in place).
-        bt = common_attn_metadata.block_table_tensor.cpu()
+        ctx = idn.get_step_context()
+        if ctx is None:
+            raise idn.IdentityError(
+                "[v8_plugin] step context missing: the _update_states patch "
+                "did not run before metadata build (patch_step_context "
+                "installed? worker inherited the patch?)")
         qsl = common_attn_metadata.query_start_loc_cpu.tolist()
-        req_states = []
-        for i in range(common_attn_metadata.num_reqs):
+        n_reqs = common_attn_metadata.num_reqs
+        if len(ctx.req_ids) < n_reqs:
+            raise idn.IdentityError(
+                f"[v8_plugin] step context has {len(ctx.req_ids)} req_ids "
+                f"for a batch of {n_reqs}")
+
+        # I4: batch order is the worker's own req order for this step.
+        req_ids = list(ctx.req_ids[:n_reqs])
+        states = self.registry.sync(req_ids)
+        self.registry.drop_finished(ctx.finished)
+
+        computed_t, scheduled_t = [], []
+        for i, rid in enumerate(req_ids):
             C = int(qsl[i + 1] - qsl[i])
-            key = int(bt[i, 0])
-            st = self.states.get(key)
-            # Slice width (v2026-10-04r): the plugin may touch any block in
-            # [0, ceil((snap_len + C)/bs)) this step — compact write-back
-            # reaches the healed chunk end, which is AHEAD of the lagged
-            # seq_lens metadata (async scheduling, see v2026-10-04n). The
-            # scheduler allocates blocks ahead of execution, so the row is
-            # valid at least through the currently executing chunk; slicing
-            # by seq_lens instead (v2026-10-04q) gave blk_tensor one chunk
-            # too few blocks and crashed with an index out of bounds.
-            seen = st.snap_len if st is not None else 0
-            n_need = min((seen + C + bs - 1) // bs,
-                         bt.shape[1], nblk)
-            blocks = tuple(int(x) for x in bt[i, :max(n_need, 1)].tolist())
-            # Request identity (v2026-10-04s). Continuing requests STRICTLY
-            # EXTEND their block row every prefill chunk (the scheduler
-            # allocates each chunk's blocks when scheduling it), and decode
-            # steps (C==1) hold the row length between allocations (one
-            # block per bs tokens). So:
-            #   same request  = prefix match AND (strictly longer OR C==1)
-            #   new request   = prefix mismatch, OR (match AND equal length
-            #                   AND C>1)
-            # The equal-length+C>1 case is a finished request whose WHOLE
-            # block sequence was reissued to a new request — the allocator
-            # does this deterministically on a quiet pool (实机: sess B got
-            # the identical [4..11] as finished sess A). v2026-10-04r's
-            # prefix-match-only rule false-accepted it, the new request
-            # inherited compact_len=32768, and the write-back indexed
-            # blk_tensor out of bounds (CUDA device-side assert).
-            n_st = len(st.blocks) if st is not None else 0
-            same = (st is not None
-                    and len(blocks) >= n_st
-                    and blocks[:n_st] == st.blocks
-                    and (len(blocks) > n_st or C == 1))
-            if self._verbose:
-                print(f"[v8_plugin] identity: key={key} C={C} "
-                      f"row_len={len(blocks)} st_len={n_st} "
-                      f"snap_len={st.snap_len if st else 0} -> "
-                      f"{'SAME' if same else 'NEW'}", flush=True)
-            if not same:
-                st = RequestKVState(blocks)
-                self.states[key] = st
-            elif len(blocks) > n_st:
-                # Same request, allocation grew mid-prefill (deferred
-                # eviction makes allocation track prompt length). Refresh
-                # the block tensor; compact state carries over.
-                st.blocks = blocks
-                st._gpu = None  # ensure_gpu rebuilds blk tensor
-            req_states.append(st)
-        md.req_states = req_states
+            # Scheduler-truth frontier for THIS step (T units). A request
+            # missing from the maps defaults to (0, C): first appearance.
+            comp = int(ctx.computed.get(rid, 0))
+            sched = int(ctx.scheduled.get(rid, C))
+            st = states[i]
+            # Rewind detection (preemption/recompute): the scheduler's
+            # frontier must never be behind v8's processed record.
+            if st.snap_len > comp + C:
+                print(f"[v8_plugin] rewind detected: {rid} snap_len="
+                      f"{st.snap_len} > computed {comp} + C {C}; state "
+                      "reset", flush=True)
+                st = RequestKVState(rid)
+                self.registry.states[rid] = st
+                states[i] = st
+            computed_t.append(comp)
+            scheduled_t.append(sched)
+
+        md.req_states = states
+        md.req_ids = req_ids
+        md.computed_t = computed_t
+        md.scheduled_t = scheduled_t
         md.qsl_cpu = common_attn_metadata.query_start_loc_cpu
-        md.seq_lens_cpu = common_attn_metadata.seq_lens.cpu()
+        md.mgr_block_size = self.spec.block_size
         return md
+
+
+def patch_step_context() -> None:
+    """Install the per-step truth: wrap GPUModelRunner._update_states so
+    that after the persistent batch reflects the scheduler output, the
+    step context (req_ids + per-request computed/scheduled + finished)
+    is published for the metadata builders of this step (I4/I5).
+
+    Runs in every worker process (patch propagates via fork from the
+    parent, same as the other patches in vllm_plugin/__init__.py)."""
+    from vllm.v1.worker.gpu_model_runner import GPUModelRunner
+
+    if getattr(GPUModelRunner, "_v8_stepctx_patched", False):
+        return
+    orig = GPUModelRunner._update_states
+
+    def patched(self, scheduler_output):
+        ret = orig(self, scheduler_output)
+        req_ids = list(self.input_batch.req_ids[:self.input_batch.num_reqs])
+        computed, scheduled = {}, {}
+        for new in scheduler_output.scheduled_new_reqs:
+            computed[new.request_id] = new.num_computed_tokens
+        cached = scheduler_output.scheduled_cached_reqs
+        for rid, comp in zip(cached.req_ids, cached.num_computed_tokens):
+            computed[rid] = comp
+        for rid, n in scheduler_output.num_scheduled_tokens.items():
+            scheduled[rid] = n
+        idn.set_step_context(idn.StepContext(
+            req_ids, computed, scheduled,
+            scheduler_output.finished_req_ids))
+        return ret
+
+    GPUModelRunner._update_states = patched
+    GPUModelRunner._v8_stepctx_patched = True
 
 
 def register_spec_manager() -> None:
@@ -209,12 +225,8 @@ def register_spec_manager() -> None:
 
 
 def register_backend_enum() -> None:
-    """Attention.__init__ (attention.py:350) resolves
-    ``AttentionBackendEnum[self.attn_backend.get_name()]``; the enum is
-    closed, so inject a V8_COMPRESSED member at runtime. The value follows
-    the enum's convention (default class path), so get_path()/get_class()
-    resolve without register_backend overrides.
-    """
+    """Attention.__init__ resolves AttentionBackendEnum[get_name()]; the
+    enum is closed, so inject a V8_COMPRESSED member at runtime."""
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
     if "V8_COMPRESSED" in AttentionBackendEnum._member_map_:
@@ -225,9 +237,6 @@ def register_backend_enum() -> None:
     AttentionBackendEnum._member_map_["V8_COMPRESSED"] = member
     AttentionBackendEnum._value2member_map_[member._value_] = member
     try:
-        # Enum.__setattr__ refuses member names; the C-level slot bypasses
-        # the check. Class attribute is only for debug access —
-        # AttentionBackendEnum[name] resolves via _member_map_.
         type.__setattr__(AttentionBackendEnum, "V8_COMPRESSED", member)
     except AttributeError:
         pass
@@ -237,11 +246,12 @@ def patch_allocator() -> None:
     """Clamp per-request block allocation at blocks_per_request.
 
     0.19.1 has no spec hook here: get_num_blocks_to_allocate derives the
-    requirement from the token count. v2026-10-04l: with deferred eviction
-    the cap is V8_MAX_SEQ_TOKENS worth of blocks (the whole prompt must be
-    holdable until the first decode step compresses it); previously it was
-    the retention budget, which per-chunk eviction made sufficient. The
-    clamp still protects the pool from runaway growth beyond the cap.
+    requirement from the token count in manager units
+    (cdiv(tokens, B_g)) — units.scheduler_mgr_blocks is the same math and
+    the only place outside the scheduler where BG-unit division is legal
+    (docs/31 I2). The cap follows the deferred-eviction design: a
+    request's blocks must cover its whole prompt up to
+    V8_MAX_SEQ_TOKENS; blocks are allocated lazily as prefill advances.
     """
     from vllm.v1.core.single_type_kv_cache_manager import (
         SingleTypeKVCacheManager)
@@ -254,9 +264,8 @@ def patch_allocator() -> None:
                 total_computed_tokens, num_tokens_main_model):
         spec = self.kv_cache_spec
         if isinstance(spec, CompressedKVSpec):
-            cap_tokens = spec.blocks_per_request * spec.block_size
-            if num_tokens > cap_tokens:
-                num_tokens = cap_tokens
+            if num_tokens > config.V8_MAX_SEQ_TOKENS:
+                num_tokens = config.V8_MAX_SEQ_TOKENS
         return orig(self, request_id, num_tokens, new_computed_blocks,
                     total_computed_tokens, num_tokens_main_model)
 

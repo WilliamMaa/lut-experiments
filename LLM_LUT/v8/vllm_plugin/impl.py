@@ -1,40 +1,33 @@
-"""CompressedKVImpl: full rewrite of the attention forward (vLLM 0.19.1).
+"""CompressedKVImpl: attention forward under the docs/31 contract.
 
-Interface (verified against v0.19.1):
+Interface (vLLM 0.19.1):
 - forward(layer, query, key, value, kv_cache, attn_metadata, output,
           output_scale=None, output_block_scale=None)
   query [T, H, D]; key/value [T, H_kv, D]; output preallocated [T, H, D]
-  (None only in exotic paths; Attention.forward always passes it).
-- kv_cache (per-layer pool view, 0.19.1 layout): [2, num_blocks, block_size,
-  H_kv, D]; K = kv_cache[0], V = kv_cache[1] (see do_kv_cache_update unbind).
-- attn_metadata: CompressedKVMetadata with req_states / qsl_cpu /
-  seq_lens_cpu attached by the builder.
+- kv_cache (per-layer pool view): [2, num_blocks, P, H_kv, D] with
+  P = kv_cache.shape[2] the KERNEL page (measured 32 for the target
+  model; B_g = 1056 manager units never appears here — the block table
+  rows are already kernel units, block_table.py:110-118).
+- attn_metadata: CompressedKVMetadata with req_states / req_ids /
+  computed_t / scheduled_t attached by the builder (backend.py).
 
-Semantics (ported from kv_cache/heavy_hitter_cache.py — see eviction.py
-for the forbidden-variants list):
+Addressing (I2, the only legal chain): compact slot s -> j = s // P,
+r = s % P -> b_j = certified_row[j] -> k_cache[b_j, r]. The certified
+row prefix length is the scheduler's frontier for this step
+(cdiv(computed_t + scheduled_t, P)); the blockplan check runs BEFORE any
+tensor indexing and raises with the full I6 context if the write span
+would exceed it (docs/31 I3 — the v2026-10-04t OOB class is impossible by
+construction: indices are bounded by the certified prefix).
 
-- DEFERRED EVICTION (v2026-10-04l, semantics fix after the 64k sweep came
-  back 0/64 at every slot count): per-chunk eviction scored keys with only
-  the last-64-token tail of each 8192-token chunk, so the actual question
-  (at the very end of the prompt) never contributed, and mid-document fact
-  records were evicted by filler before the question arrived. The old
-  harness instead accumulated attention column sums over the WHOLE prefill
-  and compressed once at the first decode step (heavy_hitter_cache.py
-  header, lines 11-15). We reproduce that: prefill chunks only score into
-  the snapshot table; nothing is evicted while total <= V8_MAX_SEQ_TOKENS;
-  the first decode step (C==1) finds total >> budget and evicts once, with
-  the question's attention mass present in the snapshot.
-- Prefill chunk (q_len > 1): score with the observation window (last
-  min(obs, C) query rows) against [compact; chunk], scatter into the
-  per-orig-position snapshot, grow compact to the full chunk, write back,
-  then attend (compact cols unmasked, chunk cols causal).
-- Decode (q_len == 1): allowance = budget; append, then evict when over
-  allowance. Decode tokens compete at the prefill mean attention mass
-  (never +inf).
-- Cost model change, stated plainly: per-request block footprint now
-  tracks prompt length up to V8_MAX_SEQ_TOKENS (same as full-KV baseline
-  and the old harness). Constant-footprint decode is unchanged. Real
-  memory savings need mid-request block freeing — a separate phase.
+Semantics (ported from kv_cache/heavy_hitter_cache.py; unchanged by this
+rewrite — eviction/attention math only, see eviction.py):
+- DEFERRED EVICTION: prefill chunks only score into the snapshot table;
+  nothing is evicted while total <= V8_MAX_SEQ_TOKENS; the first decode
+  step (C==1) evicts once, with the question's attention mass present.
+- Prefill chunk (C > 1): score with the observation window against
+  [compact; chunk], scatter into the per-orig-position snapshot, grow
+  compact, write back, attend (compact cols unmasked, chunk cols causal).
+- Decode (C == 1): allowance = budget; append, then evict when over.
 """
 import torch
 import torch.nn.functional as F
@@ -43,6 +36,8 @@ from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
 
 from . import eviction
 from . import config
+from . import units
+from .blockplan import build_block_plan
 
 
 class CompressedKVImpl(FlashAttentionImpl):
@@ -60,6 +55,8 @@ class CompressedKVImpl(FlashAttentionImpl):
         # None = not probed yet. SDPA enable_gqa avoids materializing
         # [H, L, D] repeated K/V; probed once per layer with tiny tensors.
         self._gqa_ok = None
+        self._pool_page = None      # P, probed from kv_cache at first fwd
+        self._logged = False
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output=None, output_scale=None, output_block_scale=None):
@@ -70,101 +67,102 @@ class CompressedKVImpl(FlashAttentionImpl):
             return output.fill_(0)
 
         H_kv = self.num_kv_heads
-        bs = kv_cache.shape[2]  # block_size
-        if not getattr(self, "_v8_cfg_logged", False):
-            self._v8_cfg_logged = True
-            print(f"[v8_plugin] layer cfg: bs={bs} H_kv={H_kv} "
-                  f"pool={list(kv_cache.shape)}", flush=True)
+        p_page = int(kv_cache.shape[2])         # P, kernel units
+        if self._pool_page is None:
+            self._pool_page = p_page
+        elif self._pool_page != p_page:
+            raise units.UnitError(
+                f"[v8_plugin] pool page changed between forwards: "
+                f"{self._pool_page} -> {p_page}")
+        if not self._logged:
+            self._logged = True
+            print(f"[v8_plugin] layer cfg: P={p_page} H_kv={H_kv} "
+                  f"pool={list(kv_cache.shape)} B_g="
+                  f"{getattr(attn_metadata, 'mgr_block_size', '?')}",
+                  flush=True)
+
         qsl = attn_metadata.qsl_cpu.tolist()
-        seq_lens = attn_metadata.seq_lens_cpu.tolist()
+        bt = attn_metadata.block_table_tensor
 
         for i, st in enumerate(attn_metadata.req_states):
             qs, qe = qsl[i], qsl[i + 1]
             q_i = query[qs:qe]              # [C, H, D]
             k_new = key[qs:qe]              # [C, H_kv, D]
             v_new = value[qs:qe]
-            n_computed = seq_lens[i] - (qe - qs)
-            self._update_and_attend(st, kv_cache, q_i, k_new, v_new,
-                                    n_computed, H_kv, bs, output, qs, qe)
+            self._update_and_attend(
+                st, bt[i], attn_metadata.req_ids[i],
+                getattr(attn_metadata, "mgr_block_size", 0),
+                attn_metadata.computed_t[i],
+                attn_metadata.scheduled_t[i],
+                q_i, k_new, v_new, H_kv, p_page, output, qs, qe)
 
         return output.view(output.shape[0], -1)
 
-    def _update_and_attend(self, st, kv_cache, q, k_new, v_new,
-                           n_computed, H_kv, bs, output, qs, qe):
+    def _update_and_attend(self, st, row, req_id, b_g, computed_t,
+                           scheduled_t, q, k_new, v_new, H_kv, p_page,
+                           output, qs, qe):
         C = q.shape[0]
         device = q.device
         cfg = self.cfg
         budget = cfg["retention"]
-        # Deferred eviction (v2026-10-04l): prefill chunks accumulate into
-        # the snapshot but do NOT evict to the budget — the question at the
-        # end of the prompt must get to score the keys first (old-harness
-        # semantics). Only decode steps (C==1) enforce the tight budget;
-        # the first decode step after a long prefill does the one-shot
-        # full compress. V8_MAX_SEQ_TOKENS is the prefill safety valve
-        # (and the per-request block cap): beyond it, prefill evicts down
-        # to the allowance instead of growing without bound.
+        # Deferred eviction: prefill chunks accumulate into the snapshot
+        # but do NOT evict to the budget — the question at the end of the
+        # prompt must get to score the keys first. Only decode steps
+        # (C==1) enforce the tight budget; the first decode step after a
+        # long prefill does the one-shot full compress. V8_MAX_SEQ_TOKENS
+        # is the prefill safety valve (and the per-request block cap).
         allowance = budget if C == 1 else max(budget,
                                               config.V8_MAX_SEQ_TOKENS)
         sink_n = min(cfg["sink"], allowance)
         recent_n = min(cfg["recent"], allowance - sink_n)
         hh_budget = allowance - sink_n - recent_n
 
-        st.ensure_gpu(device)
-        # New-request detection was REMOVED here (v2026-10-04p): the
-        # n_computed == 0 heuristic false-fired ~3000x under concurrency —
-        # async scheduling holds num_computed at 0 until a request's prior
-        # step executes, so every prefill chunk looked like a new request
-        # and the snapshot table was wiped every step. The builder now
-        # decides identity from the block table (append-only prefix; any
-        # mismatch on a known blocks[0] = reissued to a new request) and
-        # hands impl.py a fresh state when needed. Do NOT reintroduce
-        # metadata-based reset here.
-        # v2026-10-04n: async scheduling can lag chunk metadata by one chunk
-        # (n_computed < positions already scored). For prefill chunks the
-        # snapshot length IS the true chunk start; heal and flag it. Decode
-        # (C==1) must not take this path (snap_len == prompt length there).
-        if C > 1 and n_computed < st.snap_len:
-            print(f"[v8_plugin] stale metadata healed: n_computed "
-                  f"{n_computed} -> {st.snap_len} C={C}", flush=True)
-            n_computed = st.snap_len
-        st.grow(max(n_computed + C + 1, allowance + bs), device, H_kv)
+        # Chunk start: v8's own processed record (T). The builder already
+        # reset the state if the scheduler frontier ever falls behind it
+        # (preemption/recompute), so snap_len <= computed_t + C holds.
+        chunk_start = st.snap_len
+        if chunk_start > computed_t + C:
+            raise units.UnitError(
+                f"[v8_plugin] state ahead of scheduler frontier: "
+                f"snap_len {chunk_start} > computed {computed_t} + C {C}; "
+                f"req={req_id} B_g={b_g} P={p_page}")
 
-        L = st.compact_len
-        arange_cap = st._gpu[2]
-        # v2026-10-04n: allocate the FULL allowance up front (~1 MiB) instead
-        # of rebuilding on demand. Async scheduling can deliver chunk
-        # metadata one chunk stale (n_computed lags), which made the
-        # on-demand rebuild condition under-allocate and silently truncate
-        # arange_cap[:L2] (crash: value [24576] vs target [16385], where
-        # 16385 was the previous chunk's need_ar).
-        full_ar = config.V8_MAX_SEQ_TOKENS + bs + 16
-        if arange_cap is None or arange_cap.numel() < full_ar:
-            arange_cap = torch.arange(full_ar, device=device)
-            st._gpu = (device, st.blk_tensor, arange_cap)
+        # I3 fail-closed: the write span [0, snap_len + C) may only touch
+        # pool blocks inside this step's certified frontier prefix. The row
+        # itself is a GPU tensor consumed directly below; only its
+        # certified length (in kernel blocks) enters the plan.
+        available = units.cdiv(computed_t + scheduled_t, p_page)
+        build_block_plan(
+            request_id=req_id, group_id=0,
+            span_end=units.Qty(chunk_start + C, units.Unit.S),
+            computed=units.Qty(computed_t, units.Unit.T),
+            scheduled=units.Qty(scheduled_t, units.Unit.T),
+            block_row=available,
+            pool_page=units.Qty(p_page, units.Unit.P),
+            mgr_block_size=b_g)
 
-        # 0.19.1 pool layout: kv_cache = [2, num_blocks, bs, H_kv, D].
+        st.grow(max(chunk_start + C + 1, allowance + p_page), device, H_kv)
+        row_long = row.long()
+
+        # 0.19.1 pool layout: kv_cache = [2, num_blocks, P, H_kv, D].
         k_cache, v_cache = kv_cache.unbind(0)
 
-        # --- gather compact K/V from the request's private blocks ---
-        # slot s -> block slot s//bs -> physical block st.blk[s//bs], offset
-        # s%bs.
+        # --- gather compact K/V from the certified row prefix ---
+        # slot s -> kernel block s//P -> row[s//P], offset s%P. Indices are
+        # bounded by plan.required_pool_blocks <= certified prefix.
+        L = st.compact_len
+        required = units.cdiv(chunk_start + C, p_page)
+        arange_cap = st.arange(max(L, required, C) + 1, device)
         k_comp = v_comp = None
         if L > 0:
-            jb = arange_cap[:L] // bs
-            off = arange_cap[:L] % bs
-            if int(jb.max()) >= st.blk_tensor.numel():
-                raise IndexError(
-                    f"[v8_plugin] compact-gather OOB: L={L} jb_max="
-                    f"{int(jb.max())} n_blk={st.blk_tensor.numel()} "
-                    f"C={C} compact_len={st.compact_len} "
-                    f"snap_len={st.snap_len} n_computed={n_computed} "
-                    f"blocks_len={len(st.blocks)}")
-            bid = st.blk_tensor[jb]
+            jb = arange_cap[:L] // p_page
+            bid = row_long[jb]
+            off = arange_cap[:L] % p_page
             k_comp = k_cache[bid, off].permute(1, 0, 2)  # [H_kv, L, D]
             v_comp = v_cache[bid, off].permute(1, 0, 2)
 
         # --- combined (orig-order) view: [compact; new chunk] ---
-        orig_new = n_computed + arange_cap[:C]
+        orig_new = chunk_start + arange_cap[:C]
         if L > 0:
             orig_all = torch.cat([st.orig[:L], orig_new])
             k_all = torch.cat([k_comp, k_new.permute(1, 0, 2)], dim=1)
@@ -183,22 +181,21 @@ class CompressedKVImpl(FlashAttentionImpl):
             total, per_head = eviction.obs_window_scores(
                 q_lastW, k_comp.float() if L else None,
                 k_new.permute(1, 0, 2).float(), self.scale, causal)
-            # Snapshot table is indexed by ORIGINAL position: scatter, since
-            # compact keys sit at non-contiguous orig positions.
+            # Snapshot table is indexed by ORIGINAL position: scatter.
             st.snap.index_copy_(0, orig_all, total)
             st.snap_per_head.index_copy_(1, orig_all, per_head)
-            st.snap_len = n_computed + C
+            st.snap_len = chunk_start + C
             if not getattr(self, "_v8_scored_logged", False):
                 self._v8_scored_logged = True
                 print(f"[v8_plugin] first obs scoring: L={L} C={C} "
                       f"W={W} snap_len={st.snap_len}", flush=True)
 
-        # --- evict (deferred: only over the allowance, see header) ---
+        # --- evict (deferred: only over the allowance) ---
         if total_len > allowance:
             mid_end = total_len - recent_n
             mid_orig = orig_all[sink_n:mid_end]
-            # Decode-written tokens (orig >= snap_len) compete at the prefill
-            # mean — never +inf (they would flush all prefill heavy hitters).
+            # Decode-written tokens (orig >= snap_len) compete at the
+            # prefill mean — never +inf.
             valid = mid_orig < st.snap_len
             safe = mid_orig.clamp(max=max(st.snap_len - 1, 0))
             scores_mid = torch.where(
@@ -230,27 +227,11 @@ class CompressedKVImpl(FlashAttentionImpl):
             st.orig[:total_len] = orig_all
             st.compact_len = total_len
 
-        # --- write compact layout back into the private blocks ---
+        # --- write compact layout back into the certified row prefix ---
         L2 = st.compact_len
-        if k_all.shape[1] != L2:
-            # Should be unreachable (both derive from L+C or the eviction
-            # cat). v2026-10-04m: print the full现场 and reconcile to the
-            # tensor we actually hold.
-            print(f"[v8_plugin] LAYOUT MISMATCH st={id(st)} L2={L2} "
-                  f"k_all={k_all.shape[1]} L={L} C={C} "
-                  f"n_computed={n_computed} allowance={allowance}", flush=True)
-            L2 = k_all.shape[1]
-            st.compact_len = L2
-        jb2 = arange_cap[:L2] // bs
-        off2 = arange_cap[:L2] % bs
-        if int(jb2.max()) >= st.blk_tensor.numel():
-            raise IndexError(
-                f"[v8_plugin] write-back OOB: L2={L2} jb2_max="
-                f"{int(jb2.max())} n_blk={st.blk_tensor.numel()} "
-                f"C={C} compact_len={st.compact_len} "
-                f"snap_len={st.snap_len} n_computed={n_computed} "
-                f"blocks_len={len(st.blocks)}")
-        bid2 = st.blk_tensor[jb2]
+        jb2 = arange_cap[:L2] // p_page
+        off2 = arange_cap[:L2] % p_page
+        bid2 = row_long[jb2]
         k_cache[bid2, off2] = k_all.permute(1, 0, 2)
         v_cache[bid2, off2] = v_all.permute(1, 0, 2)
 
@@ -260,23 +241,14 @@ class CompressedKVImpl(FlashAttentionImpl):
         v_attn = v_all
         q_h = q.permute(1, 0, 2)                  # [H, C, D]
         if C > 1:
-            # K = [compact; chunk]: compact cols unmasked (invariant 4),
-            # chunk cols causal.
             k_attn = torch.cat([k_attn, k_new.permute(1, 0, 2)], dim=1)
             v_attn = torch.cat([v_attn, v_new.permute(1, 0, 2)], dim=1)
-            # v2026-10-04o: build the additive mask directly in query dtype.
-            # The old fp32 [C, L2+C] zeros + .to(bf16) was ~5 GiB of
-            # transients at 64k prefill and OOMed with 1.3 GiB free.
             attn_mask = torch.zeros(1, 1, C, L2 + C,
                                     device=device, dtype=q_h.dtype)
             attn_mask[..., L2:] = eviction.make_causal_add(
                 C, C, device).to(q_h.dtype)
         else:
             attn_mask = None
-        # v2026-10-04o: enable_gqa broadcasts H_kv -> H inside the kernel
-        # instead of materializing repeated [H, L, D] K/V (was 2 x 1.7 GiB
-        # at 64k). Probe once per layer; fall back to repeat_interleave if
-        # the installed torch rejects the flag.
         if self._gqa_ok is None:
             try:
                 F.scaled_dot_product_attention(

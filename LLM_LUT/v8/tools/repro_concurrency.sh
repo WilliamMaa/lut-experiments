@@ -79,7 +79,7 @@ if [ "$up" != "1" ]; then
     exit 1
 fi
 
-echo "=== version check (must say 2026-10-04t) ==="
+echo "=== version check (must say 2026-10-06a) ==="
 grep "2026-10-04" logs/vllm_repro.log | head -2
 
 echo "=== bench: N=$N docs=$DOCS data=$DATA ==="
@@ -90,14 +90,14 @@ python tools/bench_concurrency.py \
     --out results/bench_repro_c${N}.json
 
 echo "=== verification ==="
-echo -n "state reset count (must be 0): "
-grep -c "state reset" logs/vllm_repro.log
-echo -n "stale metadata healed count (large is OK): "
-grep -c "stale metadata healed" logs/vllm_repro.log
+echo -n "rewind resets (informational, preemption would raise this): "
+grep -c "rewind detected" logs/vllm_repro.log
+echo -n "contract raises (must be 0): "
+grep -c "v8_plugin.*Error\|UnitError\|IdentityError" logs/vllm_repro.log
 echo "=== server errors (must be empty; full traceback of the first crash) ==="
 grep -n -A45 "WorkerProc hit an exception" logs/vllm_repro.log | head -100
 echo "=== our plugin frames in the worker tracebacks (the real crash site) ==="
-grep -n -A3 "vllm_plugin/impl.py\|vllm_plugin/backend.py\|vllm_plugin/eviction.py" logs/vllm_repro.log | head -40
+grep -n -A3 "vllm_plugin/impl.py\|vllm_plugin/backend.py\|vllm_plugin/eviction.py\|vllm_plugin/units.py\|vllm_plugin/blockplan.py" logs/vllm_repro.log | head -40
 echo "=== crashing step, scheduler view (block ids + scheduled tokens) ==="
 grep "Dumping scheduler output" logs/vllm_repro.log | tail -1
 echo "=== sample answers ==="

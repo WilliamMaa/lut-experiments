@@ -40,13 +40,27 @@ class RequestStateStub:
 
 
 class StepContext:
-    """Per-executed-step request identity, set by the runner patch."""
+    """Per-executed-step truth, set by the patched _update_states in the
+    worker process. Carries exactly what the SchedulerOutput said for the
+    step being prepared — request identity AND per-request token frontier
+    (computed/scheduled), both straight from the scheduler's own books
+    (no seq_lens reconstruction, no heuristics).
 
-    def __init__(self, req_ids):
+    computed/scheduled are dicts req_id -> token count (T unit). finished
+    is the step's finished_req_ids (I5 lifecycle)."""
+
+    def __init__(self, req_ids, computed=None, scheduled=None, finished=()):
         self.req_ids = tuple(req_ids)
+        self.computed = dict(computed or {})
+        self.scheduled = dict(scheduled or {})
+        self.finished = tuple(finished)
 
     def __eq__(self, other):
-        return isinstance(other, StepContext) and self.req_ids == other.req_ids
+        return (isinstance(other, StepContext)
+                and self.req_ids == other.req_ids
+                and self.computed == other.computed
+                and self.scheduled == other.scheduled
+                and self.finished == other.finished)
 
 
 _current = None
