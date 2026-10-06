@@ -90,7 +90,7 @@ class CompressedKVImpl(FlashAttentionImpl):
             k_new = key[qs:qe]              # [C, H_kv, D]
             v_new = value[qs:qe]
             self._update_and_attend(
-                st, bt[i], attn_metadata.req_ids[i],
+                st, kv_cache, bt[i], attn_metadata.req_ids[i],
                 getattr(attn_metadata, "mgr_block_size", 0),
                 attn_metadata.computed_t[i],
                 attn_metadata.scheduled_t[i],
@@ -98,7 +98,7 @@ class CompressedKVImpl(FlashAttentionImpl):
 
         return output.view(output.shape[0], -1)
 
-    def _update_and_attend(self, st, row, req_id, b_g, computed_t,
+    def _update_and_attend(self, st, kv_cache, row, req_id, b_g, computed_t,
                            scheduled_t, q, k_new, v_new, H_kv, p_page,
                            output, qs, qe):
         C = q.shape[0]
