@@ -82,7 +82,7 @@ class CompressedKVImpl(FlashAttentionImpl):
                   flush=True)
 
         qsl = attn_metadata.qsl_cpu.tolist()
-        bt = attn_metadata.block_table_tensor
+        bt = attn_metadata.block_table
 
         for i, st in enumerate(attn_metadata.req_states):
             qs, qe = qsl[i], qsl[i + 1]

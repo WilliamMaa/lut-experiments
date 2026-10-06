@@ -22,7 +22,9 @@ TARGET_ARCH = os.environ.get(
 # kernel-unit addressing with P from the pool (I2), fail-closed frontier
 # plan (I3). The n→t heuristic patch chain is gone.
 # 2026-10-06b: NewRequestData field is req_id, not request_id (0.19.1).
-PLUGIN_VERSION = "2026-10-06b"
+# 2026-10-06c: FlashAttentionMetadata keeps the row as .block_table
+# (built by super().build()); impl reads that, not block_table_tensor.
+PLUGIN_VERSION = "2026-10-06c"
 
 # Margin (in blocks) added on top of the retention budget. Eviction keeps
 # L <= retention strictly, the margin only covers decode append-then-evict
