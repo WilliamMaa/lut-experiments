@@ -37,6 +37,7 @@ from .spec import CompressedKVSpec
 from . import config
 from . import identity as idn
 from . import units
+from .blockplan import deferred_allowance, plan_write_span
 
 
 class RequestKVState:
@@ -97,6 +98,8 @@ class CompressedKVMetadata(FlashAttentionMetadata):
     computed_t: list = None
     scheduled_t: list = None
     chunk_start: list = None
+    block_plans: list = None      # docs/32 §2: single plan per request,
+                                  # built here, consumed by impl verbatim
     qsl_cpu: object = None
     mgr_block_size: int = 0
 
@@ -150,7 +153,7 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
         states = self.registry.sync(req_ids)
         self.registry.drop_finished(ctx.finished)
 
-        computed_t, scheduled_t, chunk_starts = [], [], []
+        computed_t, scheduled_t, chunk_starts, plans = [], [], [], []
         for i, rid in enumerate(req_ids):
             C = int(qsl[i + 1] - qsl[i])
             # Scheduler-truth frontier for THIS step (T units). A request
@@ -176,12 +179,24 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
             # layers of a group must see the identical value, built once
             # per step here).
             chunk_starts.append(comp)
+            # docs/32 §2: the single write-span plan for this request this
+            # step. The impl consumes it verbatim (certify_kernel does the
+            # one legal P conversion) and never re-derives token counts.
+            plans.append(plan_write_span(
+                request_id=rid, group_id=0, chunk_start=comp,
+                num_new_tokens=C, compact_len_before=st.compact_len,
+                computed=comp, scheduled=sched,
+                mgr_block_size=int(self.spec.block_size),
+                allowance=deferred_allowance(
+                    C, config.V8_COMPRESS_SLOTS,
+                    config.V8_MAX_SEQ_TOKENS)))
 
         md.req_states = states
         md.req_ids = req_ids
         md.computed_t = computed_t
         md.scheduled_t = scheduled_t
         md.chunk_start = chunk_starts
+        md.block_plans = plans
         md.qsl_cpu = common_attn_metadata.query_start_loc_cpu
         md.mgr_block_size = self.spec.block_size
         return md

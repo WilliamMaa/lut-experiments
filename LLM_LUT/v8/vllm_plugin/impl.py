@@ -37,7 +37,7 @@ from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
 from . import eviction
 from . import config
 from . import units
-from .blockplan import build_block_plan
+from .blockplan import deferred_allowance
 
 
 class CompressedKVImpl(FlashAttentionImpl):
@@ -83,66 +83,68 @@ class CompressedKVImpl(FlashAttentionImpl):
 
         qsl = attn_metadata.qsl_cpu.tolist()
         bt = attn_metadata.block_table
+        plans = getattr(attn_metadata, "block_plans", None)
+        if plans is None or len(plans) != len(attn_metadata.req_states):
+            raise units.UnitError(
+                "[v8_plugin] metadata carries no per-request BlockPlan "
+                "(docs/32 §2): the impl must consume the builder's plan, "
+                "never re-derive the write span")
 
         for i, st in enumerate(attn_metadata.req_states):
             qs, qe = qsl[i], qsl[i + 1]
             q_i = query[qs:qe]              # [C, H, D]
             k_new = key[qs:qe]              # [C, H_kv, D]
             v_new = value[qs:qe]
+            plan = plans[i]
+            if plan.request_id != st.request_id:
+                raise units.UnitError(
+                    f"[v8_plugin] plan/state identity mismatch: "
+                    f"plan={plan.request_id} state={st.request_id}")
             self._update_and_attend(
-                st, kv_cache, bt[i], attn_metadata.req_ids[i],
+                st, kv_cache, bt[i], plan,
                 getattr(attn_metadata, "mgr_block_size", 0),
-                attn_metadata.computed_t[i],
-                attn_metadata.scheduled_t[i],
-                attn_metadata.chunk_start[i],
                 q_i, k_new, v_new, H_kv, p_page, output, qs, qe)
 
         return output.view(output.shape[0], -1)
 
-    def _update_and_attend(self, st, kv_cache, row, req_id, b_g, computed_t,
-                           scheduled_t, chunk_start, q, k_new, v_new, H_kv,
-                           p_page, output, qs, qe):
+    def _update_and_attend(self, st, kv_cache, row, plan, b_g, q, k_new,
+                           v_new, H_kv, p_page, output, qs, qe):
         C = q.shape[0]
         device = q.device
         cfg = self.cfg
         budget = cfg["retention"]
-        # Deferred eviction: prefill chunks accumulate into the snapshot
-        # but do NOT evict to the budget — the question at the end of the
-        # prompt must get to score the keys first. Only decode steps
-        # (C==1) enforce the tight budget; the first decode step after a
-        # long prefill does the one-shot full compress. V8_MAX_SEQ_TOKENS
-        # is the prefill safety valve (and the per-request block cap).
-        allowance = budget if C == 1 else max(budget,
-                                              config.V8_MAX_SEQ_TOKENS)
+        # Deferred eviction (docs/31 §4): the allowance rule lives in
+        # blockplan.deferred_allowance — the single source both the
+        # builder (plan) and the impl (eviction math) consume.
+        allowance = deferred_allowance(C, budget, config.V8_MAX_SEQ_TOKENS)
         sink_n = min(cfg["sink"], allowance)
         recent_n = min(cfg["recent"], allowance - sink_n)
         hh_budget = allowance - sink_n - recent_n
 
-        # Chunk start: pinned by the builder from the scheduler truth
-        # (computed_t), identical for every layer of the group. Do NOT
-        # derive it from st.snap_len here — the impl mutates snap_len in
+        # Chunk start: pinned by the builder in the BlockPlan from the
+        # scheduler's computed_t, identical for every layer of the group.
+        # Do NOT derive it from st.snap_len — the impl mutates snap_len in
         # layer 0's forward, and layer 1 would read the bumped value and
-        # double-count the chunk (06d regression). The builder's rewind
-        # check already guarantees st.snap_len <= chunk_start + C.
+        # double-count the chunk (06d/06e regression class).
+        chunk_start = plan.chunk_start_t
         if st.snap_len > chunk_start + C:
             raise units.UnitError(
                 f"[v8_plugin] state ahead of scheduler frontier: "
                 f"snap_len {st.snap_len} > chunk_start {chunk_start} + "
-                f"C {C}; req={req_id} B_g={b_g} P={p_page}")
+                f"C {C}; req={plan.request_id} B_g={b_g} P={p_page}")
 
-        # I3 fail-closed: the write span [0, snap_len + C) may only touch
-        # pool blocks inside this step's certified frontier prefix. The row
-        # itself is a GPU tensor consumed directly below; only its
-        # certified length (in kernel blocks) enters the plan.
-        available = units.cdiv(computed_t + scheduled_t, p_page)
-        build_block_plan(
-            request_id=req_id, group_id=0,
-            span_end=units.Qty(chunk_start + C, units.Unit.S),
-            computed=units.Qty(computed_t, units.Unit.T),
-            scheduled=units.Qty(scheduled_t, units.Unit.T),
-            block_row=available,
-            pool_page=units.Qty(p_page, units.Unit.P),
-            mgr_block_size=b_g)
+        # docs/32 §2/§3: the impl consumes the builder's plan. The ONLY
+        # conversion it performs is certify_kernel (manager allocation ->
+        # kernel capacity via the block_table.py expansion), which is
+        # fail-closed BEFORE any tensor indexing. No token count is
+        # re-derived here.
+        certified = plan.certify_kernel(p_page)  # raises before any indexing
+        assert certified.request_id == plan.request_id
+        if plan.num_new_tokens != C:
+            raise units.UnitError(
+                f"[v8_plugin] plan/impl chunk mismatch: plan C="
+                f"{plan.num_new_tokens}, actual {C}; "
+                f"req={plan.request_id}")
 
         st.grow(max(chunk_start + C + 1, allowance + p_page), device, H_kv)
         row_long = row.long()
@@ -151,11 +153,12 @@ class CompressedKVImpl(FlashAttentionImpl):
         k_cache, v_cache = kv_cache.unbind(0)
 
         # --- gather compact K/V from the certified row prefix ---
-        # slot s -> kernel block s//P -> row[s//P], offset s%P. Indices are
-        # bounded by plan.required_pool_blocks <= certified prefix.
+        # slot s -> kernel block s//P -> row[s//P], offset s%P. Every index
+        # is < plan span bound <= certified kernel capacity (certify_kernel
+        # already raised otherwise), so the gather cannot leave the
+        # scheduler-certified prefix.
         L = st.compact_len
-        required = units.cdiv(chunk_start + C, p_page)
-        arange_cap = st.arange(max(L, required, C) + 1, device)
+        arange_cap = st.arange(max(L, C, plan.span_end_t) + 1, device)
         k_comp = v_comp = None
         if L > 0:
             jb = arange_cap[:L] // p_page
@@ -232,6 +235,14 @@ class CompressedKVImpl(FlashAttentionImpl):
 
         # --- write compact layout back into the certified row prefix ---
         L2 = st.compact_len
+        # docs/32 §2 consistency: the eviction math must land inside the
+        # builder's planned span. If this ever fires, planner and impl
+        # diverged — fail closed, never write past the plan.
+        if L2 > plan.span_end_t:
+            raise units.UnitError(
+                f"[v8_plugin] impl exceeded planned write span: compact_len "
+                f"{L2} > plan span_end {plan.span_end_t} (allowance "
+                f"{allowance}, C {C}); req={plan.request_id} P={p_page}")
         jb2 = arange_cap[:L2] // p_page
         off2 = arange_cap[:L2] % p_page
         bid2 = row_long[jb2]
