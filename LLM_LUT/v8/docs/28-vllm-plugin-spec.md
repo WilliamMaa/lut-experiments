@@ -592,7 +592,7 @@ python tools/gen_longctx_multiturn.py --target-tokens 32768 --num-docs 8 --token
 ```bash
 bash tools/repro_concurrency.sh
 ```
-通过标准（脚本自行打印）：版本 = 2026-10-06d；无 `[v8_plugin]` raise；fact_acc ≥ 0.7。
+通过标准（脚本自行打印）：版本 = 2026-10-06e；无 `[v8_plugin]` raise；fact_acc ≥ 0.7。
 
 ### 8.3 slots 扫描（约 2 小时）
 ```bash

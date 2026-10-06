@@ -94,13 +94,14 @@ class CompressedKVImpl(FlashAttentionImpl):
                 getattr(attn_metadata, "mgr_block_size", 0),
                 attn_metadata.computed_t[i],
                 attn_metadata.scheduled_t[i],
+                attn_metadata.chunk_start[i],
                 q_i, k_new, v_new, H_kv, p_page, output, qs, qe)
 
         return output.view(output.shape[0], -1)
 
     def _update_and_attend(self, st, kv_cache, row, req_id, b_g, computed_t,
-                           scheduled_t, q, k_new, v_new, H_kv, p_page,
-                           output, qs, qe):
+                           scheduled_t, chunk_start, q, k_new, v_new, H_kv,
+                           p_page, output, qs, qe):
         C = q.shape[0]
         device = q.device
         cfg = self.cfg
@@ -117,15 +118,17 @@ class CompressedKVImpl(FlashAttentionImpl):
         recent_n = min(cfg["recent"], allowance - sink_n)
         hh_budget = allowance - sink_n - recent_n
 
-        # Chunk start: v8's own processed record (T). The builder already
-        # reset the state if the scheduler frontier ever falls behind it
-        # (preemption/recompute), so snap_len <= computed_t + C holds.
-        chunk_start = st.snap_len
-        if chunk_start > computed_t + C:
+        # Chunk start: pinned by the builder from the scheduler truth
+        # (computed_t), identical for every layer of the group. Do NOT
+        # derive it from st.snap_len here — the impl mutates snap_len in
+        # layer 0's forward, and layer 1 would read the bumped value and
+        # double-count the chunk (06d regression). The builder's rewind
+        # check already guarantees st.snap_len <= chunk_start + C.
+        if st.snap_len > chunk_start + C:
             raise units.UnitError(
                 f"[v8_plugin] state ahead of scheduler frontier: "
-                f"snap_len {chunk_start} > computed {computed_t} + C {C}; "
-                f"req={req_id} B_g={b_g} P={p_page}")
+                f"snap_len {st.snap_len} > chunk_start {chunk_start} + "
+                f"C {C}; req={req_id} B_g={b_g} P={p_page}")
 
         # I3 fail-closed: the write span [0, snap_len + C) may only touch
         # pool blocks inside this step's certified frontier prefix. The row

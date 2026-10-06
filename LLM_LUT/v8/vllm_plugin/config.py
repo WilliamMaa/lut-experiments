@@ -26,7 +26,11 @@ TARGET_ARCH = os.environ.get(
 # (built by super().build()); impl reads that, not block_table_tensor.
 # 2026-10-06d: _update_and_attend was missing the kv_cache parameter
 # (NameError at first forward; caught by repro).
-PLUGIN_VERSION = "2026-10-06d"
+# 2026-10-06e: chunk_start pinned by the metadata builder from the
+# scheduler's computed_t. Reading st.snap_len inside the impl doubled the
+# chunk for layer >= 1 of a group (layer 0 bumps snap_len mid-step), which
+# made the block plan demand 2x the certified frontier (UnitError).
+PLUGIN_VERSION = "2026-10-06e"
 
 # Margin (in blocks) added on top of the retention budget. Eviction keeps
 # L <= retention strictly, the margin only covers decode append-then-evict

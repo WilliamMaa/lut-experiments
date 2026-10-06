@@ -96,6 +96,7 @@ class CompressedKVMetadata(FlashAttentionMetadata):
     req_ids: list = None
     computed_t: list = None
     scheduled_t: list = None
+    chunk_start: list = None
     qsl_cpu: object = None
     mgr_block_size: int = 0
 
@@ -149,7 +150,7 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
         states = self.registry.sync(req_ids)
         self.registry.drop_finished(ctx.finished)
 
-        computed_t, scheduled_t = [], []
+        computed_t, scheduled_t, chunk_starts = [], [], []
         for i, rid in enumerate(req_ids):
             C = int(qsl[i + 1] - qsl[i])
             # Scheduler-truth frontier for THIS step (T units). A request
@@ -168,11 +169,19 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
                 states[i] = st
             computed_t.append(comp)
             scheduled_t.append(sched)
+            # Layer-consistency: the first token of THIS chunk is at
+            # original position comp (scheduler truth), NOT st.snap_len —
+            # the impl mutates snap_len during layer 0's forward, so any
+            # layer reading it as chunk_start would double-count (all
+            # layers of a group must see the identical value, built once
+            # per step here).
+            chunk_starts.append(comp)
 
         md.req_states = states
         md.req_ids = req_ids
         md.computed_t = computed_t
         md.scheduled_t = scheduled_t
+        md.chunk_start = chunk_starts
         md.qsl_cpu = common_attn_metadata.query_start_loc_cpu
         md.mgr_block_size = self.spec.block_size
         return md
