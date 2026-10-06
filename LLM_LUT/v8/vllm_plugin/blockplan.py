@@ -1,9 +1,11 @@
-"""Per-step write-span plan with fail-closed frontier check (docs/31 I3/I6).
+"""Per-step write-span plan with fail-closed frontier check (docs/31 I3/I6,
+docs/32 §2 single-plan architecture). Pure python.
 
-Pure python. The metadata builder calls build_block_plan() once per request
-per step BEFORE any state is touched or tensor indexed. The plan is the
-single source of truth for how many pool blocks the write-back may span and
-which block ids are addressable this step.
+The metadata builder calls plan_write_span() once per request per step
+BEFORE any state is touched or tensor indexed, and attaches the plan to
+the metadata; the impl consumes it via certify_kernel() and never
+re-derives token counts. build_block_plan() remains as the low-level
+fail-closed primitive used by earlier gates/tests.
 
 Why the frontier math is trustworthy (unlike the v2026-10-04q/r/s saga):
 - required (numerator) is bounded by the v8 write span in the SAME step the

@@ -13,11 +13,12 @@ Interface (vLLM 0.19.1):
 
 Addressing (I2, the only legal chain): compact slot s -> j = s // P,
 r = s % P -> b_j = certified_row[j] -> k_cache[b_j, r]. The certified
-row prefix length is the scheduler's frontier for this step
-(cdiv(computed_t + scheduled_t, P)); the blockplan check runs BEFORE any
-tensor indexing and raises with the full I6 context if the write span
-would exceed it (docs/31 I3 — the v2026-10-04t OOB class is impossible by
-construction: indices are bounded by the certified prefix).
+row capacity comes from the builder's BlockPlan: certify_kernel()
+converts the manager allocation (cdiv(frontier, B_g) blocks) to kernel
+capacity via the B_g // P expansion and raises BEFORE any tensor
+indexing if the planned span exceeds it (docs/31 I3 + docs/32 §2/§3 —
+the impl consumes the plan and never re-derives token counts; the
+v2026-10-04t OOB class is impossible by construction).
 
 Semantics (ported from kv_cache/heavy_hitter_cache.py; unchanged by this
 rewrite — eviction/attention math only, see eviction.py):

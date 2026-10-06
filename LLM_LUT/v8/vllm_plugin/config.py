@@ -30,7 +30,13 @@ TARGET_ARCH = os.environ.get(
 # scheduler's computed_t. Reading st.snap_len inside the impl doubled the
 # chunk for layer >= 1 of a group (layer 0 bumps snap_len mid-step), which
 # made the block plan demand 2x the certified frontier (UnitError).
-PLUGIN_VERSION = "2026-10-06e"
+# 2026-10-06f: docs/32 single-plan architecture. The builder produces the
+# per-request BlockPlan (plan_write_span, T-unit fail-closed); the impl
+# only consumes it (certify_kernel is the one legal P conversion) and
+# never re-derives token counts. Local integration harness added:
+# vllm_plugin/tests/{fake_vllm,harness}.py + test_integration.py (8 cases
+# + random interleaving) + test_forbidden.py (banned-pattern scan).
+PLUGIN_VERSION = "2026-10-06f"
 
 # Margin (in blocks) added on top of the retention budget. Eviction keeps
 # L <= retention strictly, the margin only covers decode append-then-evict

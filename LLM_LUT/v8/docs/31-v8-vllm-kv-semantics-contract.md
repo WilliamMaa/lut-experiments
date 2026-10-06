@@ -106,9 +106,16 @@ mamba_block_size : 1056    (mamba_cache_mode=align; mamba page 2162688 B)
 | Gate 1 probe | `tools/probe_kv_units.py`（服务器，只读配置） | **B_g=1056 钉死** |
 | Gate 2 | `vllm_plugin/identity.py` + `tests/test_identity.py`（7 种调度序列） | **PASS** |
 | Gate 3 | `vllm_plugin/blockplan.py` + `tests/test_blockplan.py`（4 组 × 20k 随机） | **PASS** |
+| Gate 4a | integration harness（docs/32）：`tests/test_integration.py` 8 case + 1200 步随机交错 + `tests/test_forbidden.py` 禁止项扫描 | **待跑**（需 torch，远程 lut_py310） |
 
 剩余唯一未钉值：serve 时 P 的实机确认（integration 启动 assert 自动完成）。
-Gate 4（加载 35B，1→2→4 并发）在 integration 重写后执行。
+
+**Gate 4 拆分（docs/32）**：原 Gate 4 混了两个问题，拆为两关——
+- **Gate 4b integration 正确性**：2 并发 32k、chunked prefill + decode +
+  multi-turn，标准 = 不崩、无 OOB、无跨请求泄漏、contract raises = 0
+  （`tools/repro_concurrency.sh` 的 verification 段）；
+- **Gate 4c 算法质量**：fact_acc ≥ 0.7（slots 扫描，`run_concurrency_sweep.sh`）。
+fact_acc 下降不再阻塞 integration 判定，反之亦然。
 
 ## 2. 必须成立的不变量（每个都写成可执行检查）
 
