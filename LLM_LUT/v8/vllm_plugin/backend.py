@@ -162,11 +162,18 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
             sched = int(ctx.scheduled.get(rid, C))
             st = states[i]
             # Rewind detection (preemption/recompute): the scheduler's
-            # frontier must never be behind v8's processed record.
-            if st.snap_len > comp + C:
-                print(f"[v8_plugin] rewind detected: {rid} snap_len="
-                      f"{st.snap_len} > computed {comp} + C {C}; state "
-                      "reset", flush=True)
+            # computed frontier must never run BEHIND v8's processed
+            # record. `comp < snap_len` is the exact test for a rewound
+            # timeline — comparing against comp + C would miss the case
+            # where a preempted request's first re-scheduled chunk is
+            # larger than the old snap_len (caught by the property test:
+            # state keeps a stale compact layout while the scheduler
+            # restarts from 0). Normal flow never triggers: chunk steps
+            # have comp == snap_len, decode steps comp > snap_len.
+            if comp < st.snap_len:
+                print(f"[v8_plugin] rewind detected: {rid} computed {comp} "
+                      f"fell behind snap_len {st.snap_len} (preemption/"
+                      "recompute); state reset", flush=True)
                 st = RequestKVState(rid)
                 self.registry.states[rid] = st
                 states[i] = st

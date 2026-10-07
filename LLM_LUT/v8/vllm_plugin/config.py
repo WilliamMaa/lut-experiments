@@ -36,7 +36,13 @@ TARGET_ARCH = os.environ.get(
 # never re-derives token counts. Local integration harness added:
 # vllm_plugin/tests/{fake_vllm,harness}.py + test_integration.py (8 cases
 # + random interleaving) + test_forbidden.py (banned-pattern scan).
-PLUGIN_VERSION = "2026-10-06f"
+# 2026-10-06g: rewind condition tightened to `comp < snap_len` (was
+# snap_len > comp + C). The old test missed preemption followed by a
+# re-scheduled chunk larger than the old snap_len: the stale compact
+# layout survived while the scheduler restarted from 0, and the plan
+# fail-closed on the inconsistent frontier (found by the harness property
+# test, R21 case).
+PLUGIN_VERSION = "2026-10-06g"
 
 # Margin (in blocks) added on top of the retention budget. Eviction keeps
 # L <= retention strictly, the margin only covers decode append-then-evict

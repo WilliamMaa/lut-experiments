@@ -128,11 +128,11 @@ class CompressedKVImpl(FlashAttentionImpl):
         # layer 0's forward, and layer 1 would read the bumped value and
         # double-count the chunk (06d/06e regression class).
         chunk_start = plan.chunk_start_t
-        if st.snap_len > chunk_start + C:
+        if st.snap_len > chunk_start:
             raise units.UnitError(
                 f"[v8_plugin] state ahead of scheduler frontier: "
-                f"snap_len {st.snap_len} > chunk_start {chunk_start} + "
-                f"C {C}; req={plan.request_id} B_g={b_g} P={p_page}")
+                f"snap_len {st.snap_len} > chunk_start {chunk_start} "
+                f"(C {C}); req={plan.request_id} B_g={b_g} P={p_page}")
 
         # docs/32 §2/§3: the impl consumes the builder's plan. The ONLY
         # conversion it performs is certify_kernel (manager allocation ->
