@@ -224,11 +224,11 @@ class FakeWorld:
             if st.snap_len > rec.computed:
                 errs.append(f"{rid}: snap_len {st.snap_len} ahead of "
                             f"scheduler computed {rec.computed}")
-            self._verify_layout(rid, rows_at_serve[rid], rec.computed, st,
-                                errs)
+            self._verify_layout(rid, rows_at_serve[rid], rec.computed,
+                                rec.k_store, st, errs)
         return errs
 
-    def _verify_layout(self, rid, kernel_ids, processed, st, errs):
+    def _verify_layout(self, rid, kernel_ids, processed, k_store, st, errs):
         """The strong check: compact slot s must hold exactly the K of
         original position st.orig[s] (eviction never modifies K, so the
         read-back must be exact). Catches wrong addressing, cross-request
@@ -250,7 +250,7 @@ class FakeWorld:
             return
         bid = torch.tensor(kernel_ids, dtype=torch.int64)[j]
         got = self.pool[0, bid, r]                        # [L, H_kv, D]
-        want = rec.k_store[o]
+        want = k_store[o]
         if not torch.allclose(got, want, atol=1e-5):
             bad = int((got - want).abs().amax(dim=(1, 2)).argmax())
             errs.append(f"{rid}: K read-back mismatch at slot {bad} "
