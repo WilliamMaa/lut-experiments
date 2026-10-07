@@ -106,7 +106,7 @@ mamba_block_size : 1056    (mamba_cache_mode=align; mamba page 2162688 B)
 | Gate 1 probe | `tools/probe_kv_units.py`（服务器，只读配置） | **B_g=1056 钉死** |
 | Gate 2 | `vllm_plugin/identity.py` + `tests/test_identity.py`（7 种调度序列） | **PASS** |
 | Gate 3 | `vllm_plugin/blockplan.py` + `tests/test_blockplan.py`（4 组 × 20k 随机） | **PASS** |
-| Gate 4a | integration harness（docs/32）：`tests/test_integration.py` 8 case + 1200 步随机交错 + `tests/test_forbidden.py` 禁止项扫描 | **待跑**（需 torch，远程 lut_py310） |
+| Gate 4a | integration harness（docs/32）：`tests/test_integration.py` 8 case + 2194 request-steps 随机交错 + `tests/test_forbidden.py` 禁止项扫描 | **PASS**（2026-10-06h，远程 lut_py310） |
 
 剩余唯一未钉值：serve 时 P 的实机确认（integration 启动 assert 自动完成）。
 
