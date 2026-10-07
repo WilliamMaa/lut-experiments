@@ -248,11 +248,13 @@ def negative_no_plan():
     w.add_request("A", 20)
     _, errs = w.step([("A", 20)])
     assert not errs, errs
-    # build a metadata object without block_plans and confirm impl raises
+    # build a metadata object with the plan stripped and confirm the
+    # impl refuses it (docs/32 §2 fail-closed direction)
     md = w.builder.build(0, type("C", (), {
         "query_start_loc_cpu": torch.tensor([0, 5], dtype=torch.int32),
         "num_reqs": 1})())
     md.block_table = torch.zeros(1, 8, dtype=torch.int64)
+    md.block_plans = None
     try:
         w.impl.forward(None, torch.randn(5, 4, 8), torch.randn(5, 2, 8),
                        torch.randn(5, 2, 8), w.pool, md,

@@ -170,19 +170,27 @@ class FakeWorld:
             self._free(self.reqs[rid])
             self.reqs[rid].active = False
         self.n_steps += 1
-        return md, self.verify(md, schedule, pre_computed, out)
+        return md, self.verify(md, schedule, pre_computed, out, finished)
 
     # ---- invariant verification (docs/32) ------------------------------
-    def verify(self, md, schedule, pre_computed, out):
+    def verify(self, md, schedule, pre_computed, out, finished=()):
         errs = []
+        finished = set(finished)
         if not torch.isfinite(out).all():
             errs.append("non-finite attention output")
         for i, (rid, n) in enumerate(schedule):
             rec = self.reqs[rid]
-            st = self.builder.registry.states.get(rid)
-            if st is None:
-                errs.append(f"{rid}: state missing after step")
-                continue
+            # I4 batch-order tie-in: the served state object must BE the
+            # registry's state for a live request, and finished requests
+            # must be gone from the registry (drop_finished, I5).
+            st = md.req_states[i]
+            live = self.builder.registry.states.get(rid)
+            if rid in finished:
+                if live is not None:
+                    errs.append(f"{rid}: finished but still in registry")
+            elif live is not st:
+                errs.append(f"{rid}: served state is not the registry "
+                            f"state (identity desync)")
             if st.request_id != rid:
                 errs.append(f"{rid}: state identity {st.request_id}")
             plan = md.block_plans[i]
