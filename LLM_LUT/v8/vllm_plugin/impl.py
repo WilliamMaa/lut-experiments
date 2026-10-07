@@ -111,6 +111,19 @@ class CompressedKVImpl(FlashAttentionImpl):
     def _update_and_attend(self, st, kv_cache, row, plan, b_g, q, k_new,
                            v_new, H_kv, p_page, output, qs, qe):
         C = q.shape[0]
+        chunk_start = plan.chunk_start_t
+        # Group layers share ONE state object and ONE plan per step.
+        # Layer 0 runs the full update (scores, evicts, writes the compact
+        # layout) and marks the state; layers 1..N-1 see the marker and
+        # only attend over what layer 0 wrote. Without the marker every
+        # layer appended the chunk again — the v2026-10-07 16384/8192
+        # double-append (harness single-layer blind spot, fixed by the
+        # multi-layer FakeWorld case). The marker value (chunk_start, C)
+        # is unique per step because chunk_start strictly advances.
+        if getattr(st, "applied", None) == (chunk_start, C):
+            self._attend_only(st, kv_cache, row, plan, q, k_new,
+                              H_kv, p_page, output, qs, qe)
+            return
         device = q.device
         cfg = self.cfg
         budget = cfg["retention"]
@@ -122,18 +135,16 @@ class CompressedKVImpl(FlashAttentionImpl):
         recent_n = min(cfg["recent"], allowance - sink_n)
         hh_budget = allowance - sink_n - recent_n
 
-        # Chunk start: pinned by the builder in the BlockPlan from the
-        # scheduler's computed_t, identical for every layer of the group.
-        # Do NOT derive it from st.snap_len — the impl mutates snap_len in
-        # layer 0's forward, and layer 1 would read the bumped value and
-        # double-count the chunk (06d/06e regression class).
-        chunk_start = plan.chunk_start_t
-        if max(st.snap_len, st.compact_len) > chunk_start:
+        # Chunk start is pinned by the builder in the BlockPlan (identical
+        # for every layer). The state-ahead frontier check lives ONLY in
+        # the builder (once per step, before any layer); here we only
+        # guard the opposite direction, layer-safely: a mid-step state
+        # reset would shrink compact_len below the plan's recorded value.
+        if st.compact_len < plan.compact_len_before:
             raise units.UnitError(
-                f"[v8_plugin] state ahead of scheduler frontier: "
-                f"snap_len {st.snap_len} / compact_len {st.compact_len} "
-                f"> chunk_start {chunk_start} (C {C}); "
-                f"req={plan.request_id} B_g={b_g} P={p_page}")
+                f"[v8_plugin] state shrank below the plan: compact_len "
+                f"{st.compact_len} < plan {plan.compact_len_before} "
+                f"(C {C}); req={plan.request_id} B_g={b_g} P={p_page}")
 
         # docs/32 §2/§3: the impl consumes the builder's plan. The ONLY
         # conversion it performs is certify_kernel (manager allocation ->
@@ -252,13 +263,62 @@ class CompressedKVImpl(FlashAttentionImpl):
         v_cache[bid2, off2] = v_all.permute(1, 0, 2)
 
         # --- attention ---
-        n_rep = q.shape[1] // H_kv
-        k_attn = k_all                            # [H_kv, L2, D]
+        k_attn = k_all
         v_attn = v_all
-        q_h = q.permute(1, 0, 2)                  # [H, C, D]
         if C > 1:
             k_attn = torch.cat([k_attn, k_new.permute(1, 0, 2)], dim=1)
             v_attn = torch.cat([v_attn, v_new.permute(1, 0, 2)], dim=1)
+        # Mark the state BEFORE attending: if attention itself raised, the
+        # next layer must not rerun the update on a half-written state.
+        # The write-back above is complete at this point.
+        st.applied = (chunk_start, C)
+        self._sdpa(q, k_attn, v_attn, C, L2, device, output, qs, qe)
+
+    def _attend_only(self, st, kv_cache, row, plan, q, k_new, H_kv, p_page,
+                     output, qs, qe):
+        """Layers 1..N-1 of a group: layer 0 already scored, evicted and
+        wrote the compact layout into the pool. This layer gathers that
+        layout back and attends — it must NOT mutate the shared state."""
+        C = q.shape[0]
+        device = q.device
+        L2 = st.compact_len
+        if L2 > plan.span_end_t:
+            raise units.UnitError(
+                f"[v8_plugin] compact layout exceeds planned span: "
+                f"{L2} > {plan.span_end_t}; req={plan.request_id}")
+        row_long = row.long()
+        k_cache, v_cache = kv_cache.unbind(0)
+        if L2 > 0:
+            idx = st.arange(L2 + 1, device)[:L2]
+            jb = idx // p_page
+            off = idx % p_page
+            bid = row_long[jb]
+            k_attn = k_cache[bid, off].permute(1, 0, 2)   # [H_kv, L2, D]
+            v_attn = v_cache[bid, off].permute(1, 0, 2)
+        else:
+            k_attn = v_attn = None
+        if C > 1:
+            k_new_t = k_new.permute(1, 0, 2)
+            v_new_t = v_new.permute(1, 0, 2)
+            k_attn = (torch.cat([k_attn, k_new_t], dim=1)
+                      if k_attn is not None else k_new_t)
+            v_attn = (torch.cat([v_attn, v_new_t], dim=1)
+                      if v_attn is not None else v_new_t)
+        elif k_attn is None:
+            # single-token step with an empty compact region: the token
+            # attends to itself
+            k_attn = k_new.permute(1, 0, 2)
+            v_attn = v_new.permute(1, 0, 2)
+            L2 = 0
+        self._sdpa(q, k_attn, v_attn, C, L2, device, output, qs, qe)
+
+    def _sdpa(self, q, k_attn, v_attn, C, L2, device, output, qs, qe):
+        """The attention tail shared by the full-update and attend-only
+        paths: compact columns unmasked, chunk columns causal."""
+        H_kv = k_attn.shape[0]
+        n_rep = q.shape[1] // H_kv
+        q_h = q.permute(1, 0, 2)                  # [H, C, D]
+        if C > 1:
             attn_mask = torch.zeros(1, 1, C, L2 + C,
                                     device=device, dtype=q_h.dtype)
             attn_mask[..., L2:] = eviction.make_causal_add(

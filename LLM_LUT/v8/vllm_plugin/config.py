@@ -47,7 +47,14 @@ TARGET_ARCH = os.environ.get(
 # compact_len grows; after preemption, comp(0) < snap_len(0) looked
 # consistent while a stale compact layout survived (harness property
 # test, R211 case).
-PLUGIN_VERSION = "2026-10-06h"
+# 2026-10-06i: group layers share one state — the full update (score/
+# evict/write) now runs on layer 0 ONLY, marked by st.applied=
+# (chunk_start, C); layers 1..N-1 attend over what layer 0 wrote. Every
+# layer previously re-appended the chunk to the mutated compact layout:
+# the v2026-10-07 16384/8192 double-append crash (10-layer group, caught
+# on the 35B repro; the single-layer harness could not see it — the
+# multi-layer FakeWorld case closes that gap).
+PLUGIN_VERSION = "2026-10-06i"
 
 # Margin (in blocks) added on top of the retention budget. Eviction keeps
 # L <= retention strictly, the margin only covers decode append-then-evict

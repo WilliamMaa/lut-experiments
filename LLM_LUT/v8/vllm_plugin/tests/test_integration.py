@@ -188,11 +188,30 @@ def case8():
         pass
     check("8 two groups different P/B_g", errs)
 
+# case 9: multi-layer group (the real topology: all full-attn layers of
+# a group share ONE state — the update must run once, layers 1..N attend
+# only; regression case for the v2026-10-07 16384/8192 double-append)
+def case9():
+    w = FakeWorld(seed=9, layers=4)
+    w.add_request("A", 90)
+    w.add_request("B", 40)
+    errs = []
+    _, e = w.step([("A", 50)]); errs += e
+    _, e = w.step([("B", 40)]); errs += e
+    _, e = w.step([("A", 40)]); errs += e
+    for t in range(6):
+        _, e = w.step([("A", 1), ("B", 1)]); errs += e
+    st = w.builder.registry.states["A"]
+    if st.compact_len > 24:
+        errs.append(f"4-layer decode steady-state compact_len "
+                    f"{st.compact_len} > budget 24 (double-append?)")
+    check("9 multi-layer group (4 layers share state)", errs)
+
 # property test: random interleavings (docs/32)
-def property_test(n_steps=1200, seed=99):
+def property_test(n_steps=1200, seed=99, layers=3):
     import random
     rng = random.Random(seed)
-    w = FakeWorld(seed=seed)
+    w = FakeWorld(seed=seed, layers=layers)
     errs = []
     next_rid = 0
     active = []          # rids with remaining prompt or decoding
@@ -236,7 +255,8 @@ def property_test(n_steps=1200, seed=99):
         if errs:
             print(f"[int] property test first failure at step {t}")
             break
-    name = f"property random interleaving ({total_checked} request-steps)"
+    name = (f"property random interleaving ({total_checked} request-steps, "
+            f"{layers} layers)")
     check(name, errs[:8])
 
 # negative case: impl must refuse metadata without plans (docs/32 §2 —
@@ -256,9 +276,9 @@ def negative_no_plan():
     md.block_table = torch.zeros(1, 8, dtype=torch.int64)
     md.block_plans = None
     try:
-        w.impl.forward(None, torch.randn(5, 4, 8), torch.randn(5, 2, 8),
-                       torch.randn(5, 2, 8), w.pool, md,
-                       torch.zeros(5, 4, 8))
+        w.impls[0].forward(None, torch.randn(5, 4, 8), torch.randn(5, 2, 8),
+                           torch.randn(5, 2, 8), w.pool, md,
+                           torch.zeros(5, 4, 8))
     except units.UnitError:
         print("[int] PASS negative: impl refuses plan-less metadata")
         return
@@ -268,6 +288,7 @@ def negative_no_plan():
 
 def main():
     case1(); case2(); case3(); case4(); case5(); case6(); case7(); case8()
+    case9()
     property_test()
     negative_no_plan()
     if FAILURES:

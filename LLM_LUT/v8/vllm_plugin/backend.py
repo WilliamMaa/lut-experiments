@@ -51,7 +51,7 @@ class RequestKVState:
     """
 
     __slots__ = ("request_id", "compact_len", "orig", "snap",
-                 "snap_per_head", "snap_len", "_arange")
+                 "snap_per_head", "snap_len", "applied", "_arange")
 
     def __init__(self, request_id):
         self.request_id = request_id
@@ -60,6 +60,9 @@ class RequestKVState:
         self.snap = None                # fp32 [cap], attention-mass snapshot
         self.snap_per_head = None       # fp32 [H_kv, cap]
         self.snap_len = 0               # tokens processed (T), v8's record
+        self.applied = None             # (chunk_start, C) marker: which step
+                                        # last ran the full update; other
+                                        # layers of the group attend only
         self._arange = None             # (device, arange cache)
 
     def arange(self, n, device):

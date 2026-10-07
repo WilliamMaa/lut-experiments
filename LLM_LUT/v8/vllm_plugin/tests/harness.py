@@ -61,7 +61,7 @@ class FakeWorld:
     finish/preemption and recycled by later requests."""
 
     def __init__(self, *, P=32, B_g=64, H_kv=2, D=8, pool_blocks=256,
-                 seed=0):
+                 seed=0, layers=1):
         assert B_g % P == 0, "manager block must be a multiple of P"
         self.P, self.B_g, self.H_kv, self.D = P, B_g, H_kv, D
         self.kpr = B_g // P                     # kernel ids per manager block
@@ -71,7 +71,11 @@ class FakeWorld:
         self.reqs = {}
         self.builder = CompressedKVMetadataBuilder(
             _Spec(block_size=B_g), ["g0.layer0"], None, "cpu")
-        self.impl = CompressedKVImpl(num_kv_heads=H_kv, scale=D ** -0.5)
+        # layers impls share ONE builder/state — the real topology (all
+        # full-attn layers of a group). Single-layer worlds cannot see
+        # shared-state non-idempotency (v2026-10-07 lesson).
+        self.impls = [CompressedKVImpl(num_kv_heads=H_kv, scale=D ** -0.5)
+                      for _ in range(layers)]
         self.n_steps = 0
 
     # ---- scheduler ops -------------------------------------------------
@@ -164,7 +168,8 @@ class FakeWorld:
             v[off:off + n] = rec.v_store[s:s + n]
             off += n
         out = torch.zeros(T, H, self.D)
-        self.impl.forward(None, q, k, v, self.pool, md, out)
+        for impl in self.impls:
+            impl.forward(None, q, k, v, self.pool, md, out)
 
         for rid, n in schedule:
             self.reqs[rid].computed += n
