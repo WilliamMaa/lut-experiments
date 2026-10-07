@@ -276,3 +276,7 @@ fact accuracy
 **这批结果说明 v8 integration 已经开始可信，但还没有回答核心业务问题。最大的缺口不是再调 v8，而是缺 full-KV 同条件容量基线。**
 
 而且根据模型结构粗算，我会特别警惕“full 只能 1–2 路”这个旧假设——它很可能低估了 full baseline。现在千万不要把这句话带进总结里，直接用实测把它钉死。
+
+python tools/gen_longctx_multiturn.py --target-tokens 65536 --num-docs 64 --tokenizer-path /home/u/downloads/models/Qwen3.6-35B-A3B --out data/longctx_multi_turn_6553664docs.jsonl
+
+BACKENDS="full" bash tools/run_capacity_sweep.sh

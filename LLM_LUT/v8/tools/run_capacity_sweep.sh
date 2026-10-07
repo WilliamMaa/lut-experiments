@@ -109,7 +109,7 @@ start_server() {
     local -a flags=(--enforce-eager --max-model-len "$MAX_LEN"
                     --tensor-parallel-size 2 --max-num-seqs "$n"
                     --gpu-memory-utilization "$UTIL"
-                    --disable-prefix-caching --port "$PORT")
+                    --no-enable-prefix-caching --port "$PORT")
     if [ "$backend" = "full" ]; then
         CUDA_VISIBLE_DEVICES="$GPUS" \
         PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
