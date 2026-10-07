@@ -143,8 +143,10 @@ class FakeWorld:
         k = torch.zeros(T, self.H_kv, self.D)
         v = torch.zeros(T, self.H_kv, self.D)
         off = 0
+        rows_at_serve = {}
         for rid, n in schedule:
             rec = self.reqs[rid]
+            rows_at_serve[rid] = list(rec.kernel_ids)
             s = rec.computed
             if s + n > len(rec.k_store):
                 # decode-generated tokens: extend the store the way the
@@ -170,10 +172,12 @@ class FakeWorld:
             self._free(self.reqs[rid])
             self.reqs[rid].active = False
         self.n_steps += 1
-        return md, self.verify(md, schedule, pre_computed, out, finished)
+        return md, self.verify(md, schedule, pre_computed, out, finished,
+                               rows_at_serve)
 
     # ---- invariant verification (docs/32) ------------------------------
-    def verify(self, md, schedule, pre_computed, out, finished=()):
+    def verify(self, md, schedule, pre_computed, out, finished=(),
+               rows_at_serve=None):
         errs = []
         finished = set(finished)
         if not torch.isfinite(out).all():
@@ -220,10 +224,11 @@ class FakeWorld:
             if st.snap_len > rec.computed:
                 errs.append(f"{rid}: snap_len {st.snap_len} ahead of "
                             f"scheduler computed {rec.computed}")
-            self._verify_layout(rid, rec, st, errs)
+            self._verify_layout(rid, rows_at_serve[rid], rec.computed, st,
+                                errs)
         return errs
 
-    def _verify_layout(self, rid, rec, st, errs):
+    def _verify_layout(self, rid, kernel_ids, processed, st, errs):
         """The strong check: compact slot s must hold exactly the K of
         original position st.orig[s] (eviction never modifies K, so the
         read-back must be exact). Catches wrong addressing, cross-request
@@ -235,15 +240,15 @@ class FakeWorld:
         if bool(torch.any(o[1:] <= o[:-1])):
             errs.append(f"{rid}: orig not strictly increasing: "
                         f"{o[:16].tolist()}")
-        if int(o[0]) < 0 or int(o[-1]) >= rec.computed:
+        if int(o[0]) < 0 or int(o[-1]) >= processed:
             errs.append(f"{rid}: orig range [{int(o[0])}, {int(o[-1])}] "
-                        f"outside processed [0, {rec.computed})")
+                        f"outside processed [0, {processed})")
         idx = torch.arange(L)
         j, r = idx // self.P, idx % self.P
-        if int(j[-1]) >= len(rec.kernel_ids):
+        if int(j[-1]) >= len(kernel_ids):
             errs.append(f"{rid}: slot addressing leaves allocated row")
             return
-        bid = torch.tensor(rec.kernel_ids, dtype=torch.int64)[j]
+        bid = torch.tensor(kernel_ids, dtype=torch.int64)[j]
         got = self.pool[0, bid, r]                        # [L, H_kv, D]
         want = rec.k_store[o]
         if not torch.allclose(got, want, atol=1e-5):
