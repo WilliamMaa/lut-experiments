@@ -106,7 +106,9 @@ mamba_block_size : 1056    (mamba_cache_mode=align; mamba page 2162688 B)
 | Gate 1 probe | `tools/probe_kv_units.py`（服务器，只读配置） | **B_g=1056 钉死** |
 | Gate 2 | `vllm_plugin/identity.py` + `tests/test_identity.py`（7 种调度序列） | **PASS** |
 | Gate 3 | `vllm_plugin/blockplan.py` + `tests/test_blockplan.py`（4 组 × 20k 随机） | **PASS** |
-| Gate 4a | integration harness（docs/32）：`tests/test_integration.py` 8 case + 2194 request-steps 随机交错 + `tests/test_forbidden.py` 禁止项扫描 | **PASS**（2026-10-06h，远程 lut_py310） |
+| Gate 4a | integration harness（docs/32）：`tests/test_integration.py` 8 case + property 随机交错（多层拓扑） + `tests/test_forbidden.py` | **PASS**（2026-10-07，06i；过程中抓出 rewind 判据 ×2 与 group 层双追加共 3 个真 bug） |
+| Gate 4b | integration 正确性：2 并发 32k、chunked prefill + decode + multi-turn（`tools/repro_concurrency.sh`） | **PASS**（2026-10-07，06i：0 crash / 0 contract raises，顺带 fact_acc=0.9375） |
+| Gate 4c | 算法质量：fact_acc ≥ 0.7（slots × N 扫描，`run_concurrency_sweep.sh`） | **PASS @ slots=1024,N=4**（0.9375）；全 Pareto 待扫 |
 
 剩余唯一未钉值：serve 时 P 的实机确认（integration 启动 assert 自动完成）。
 
