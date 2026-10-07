@@ -42,7 +42,12 @@ TARGET_ARCH = os.environ.get(
 # layout survived while the scheduler restarted from 0, and the plan
 # fail-closed on the inconsistent frontier (found by the harness property
 # test, R21 case).
-PLUGIN_VERSION = "2026-10-06g"
+# 2026-10-06h: rewind record completed to max(snap_len, compact_len).
+# C==1 chunks never enter the scoring gate, so snap_len stays 0 while
+# compact_len grows; after preemption, comp(0) < snap_len(0) looked
+# consistent while a stale compact layout survived (harness property
+# test, R211 case).
+PLUGIN_VERSION = "2026-10-06h"
 
 # Margin (in blocks) added on top of the retention budget. Eviction keeps
 # L <= retention strictly, the margin only covers decode append-then-evict
