@@ -121,7 +121,7 @@ class CompressedKVImpl(FlashAttentionImpl):
         # multi-layer FakeWorld case). The marker value (chunk_start, C)
         # is unique per step because chunk_start strictly advances.
         if getattr(st, "applied", None) == (chunk_start, C):
-            self._attend_only(st, kv_cache, row, plan, q, k_new,
+            self._attend_only(st, kv_cache, row, plan, q, k_new, v_new,
                               H_kv, p_page, output, qs, qe)
             return
         device = q.device
@@ -274,8 +274,8 @@ class CompressedKVImpl(FlashAttentionImpl):
         st.applied = (chunk_start, C)
         self._sdpa(q, k_attn, v_attn, C, L2, device, output, qs, qe)
 
-    def _attend_only(self, st, kv_cache, row, plan, q, k_new, H_kv, p_page,
-                     output, qs, qe):
+    def _attend_only(self, st, kv_cache, row, plan, q, k_new, v_new, H_kv,
+                     p_page, output, qs, qe):
         """Layers 1..N-1 of a group: layer 0 already scored, evicted and
         wrote the compact layout into the pool. This layer gathers that
         layout back and attends — it must NOT mutate the shared state."""
