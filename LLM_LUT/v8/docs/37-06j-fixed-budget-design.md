@@ -55,7 +55,8 @@ Scheduler / KVCacheManager / BlockPool / gpu_model_runner / block_table 管道�
 - Gate A：远程 `test_integration.py` 全 PASS，含 case 10 "long-seq pressure eviction (fixed budget)"；property 随机交错 2194 步 × 3 层全过。
 - Gate D：`Maximum concurrency for 131,072 tokens per request` 从 27.08x → **174.55x**（6.4×）——custom accounting 确实进入了 admission path。
 - 冒烟：`tools/repro_concurrency.sh` 版本 06j，0 崩溃 / 0 contract raise / fact_acc 1.0（32k 数据）。
-- **Phase 2（2026-10-08，Gate B 首点 + 质量）**：16 并发 × 64k（压力驱逐全程激活）：`peak_kv_usage=0.168`、preemption 0、**fact_acc 0.9922**（127/128，压力驱逐未兑现质量风险）、吞吐 **118.5 sess/h**（06i 同格只有 65.0——06i 的"2× slowdown"主因是 prefill 对全 prompt 注意力，06j 容量上限把 prefill 注意力压到 ≤17408 后消失，v8 已接近 full 的 ~128）。单点 usage 因 hybrid 口径不可换算块数，形态证明见 phase 3。
+- **Phase 2（2026-10-08，Gate B 首点 + 质量）**：16 并发 × 64k（压力驱逐全程激活）：`peak_kv_usage=0.168`、preemption 0、**fact_acc 0.9922**（127/128，压力驱逐未兑现质量风险）、吞吐 **118.5 sess/h**（06i 同格只有 65.0——06i 的"2× slowdown"主因是 prefill 对全 prompt 注意力，06j 容量上限把 prefill 注意力压到 ≤17408 后消失，v8 已接近 full 的 ~128）。
+- **Phase 3（2026-10-08，Gate B 判定）**：`kv_cache_usage_perc` 形状测试 FAIL（N=1 时 32k→64k 表观翻倍），但 `V8_DEBUG_ALLOC=1` 分配日志（backend.py patch_allocator 门控日志）给出直接证据：**每请求 full-attn 组恰好分配 17 blocks 一次封顶，64k prefill 全 chunk + 全程 decode 不再增长**；日志中 `+1/+8 (num_tokens=8192/16384)` 为 GDN 组分配——usage 指标的 hybrid 分母混有 GDN 按 chunk 增长的分量，**不能作为 per-request residency 度量**（docs/36 警告的口径问题在指标层再现）。判定：**Gate B PASS**（以分配日志为准）。16 并发 v8 full-attn 总分配 272 块 vs full 1008 块（3.7×）。
 
 - **Gate A — 记账单测**（远程 integration）：logical 1k/8k/64k/128k 后每请求持有块数 = B_target，chunk1/chunk2/decode 后总量不变。纯 fake 环境可测大部分。
 - **Gate B — 物理 residency**：N=1/2/4/8，32k/64k/128k 同 slots 请求 steady decode 常驻 footprint 近似相同、∝ N 不随 logical length 线性增长。
