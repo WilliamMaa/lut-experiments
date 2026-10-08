@@ -51,6 +51,11 @@ Scheduler / KVCacheManager / BlockPool / gpu_model_runner / block_table 管道�
 
 ## 验收 Gate（不过不往下走）
 
+**2026-10-08 实测：A ✅ D ✅ 冒烟 ✅（B/C 见 phase 2）**
+- Gate A：远程 `test_integration.py` 全 PASS，含 case 10 "long-seq pressure eviction (fixed budget)"；property 随机交错 2194 步 × 3 层全过。
+- Gate D：`Maximum concurrency for 131,072 tokens per request` 从 27.08x → **174.55x**（6.4×）——custom accounting 确实进入了 admission path。
+- 冒烟：`tools/repro_concurrency.sh` 版本 06j，0 崩溃 / 0 contract raise / fact_acc 1.0（32k 数据）。
+
 - **Gate A — 记账单测**（远程 integration）：logical 1k/8k/64k/128k 后每请求持有块数 = B_target，chunk1/chunk2/decode 后总量不变。纯 fake 环境可测大部分。
 - **Gate B — 物理 residency**：N=1/2/4/8，32k/64k/128k 同 slots 请求 steady decode 常驻 footprint 近似相同、∝ N 不随 logical length 线性增长。
 - **Gate C — preemption/rebuild**：A running → preempt → B 吃容量 → A resume → 结果正确、记账正确。
