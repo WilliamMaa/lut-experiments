@@ -57,11 +57,15 @@ class Tree:
 
     def naive_indices(self, x):  # x [N, dim] -> leaf idx [N]
         node = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+        ar = torch.arange(x.shape[0], device=x.device)
         for lvl in range(self.depth):
             sel = node * 2
-            c = self.ch[sel]
-            go_right = (x[torch.arange(x.shape[0], device=x.device), c]
-                        * self.w[sel] + self.b[sel]) > 0
+            # at the last level the children are leaves: no params exist
+            # for them, clamp the param gather (the child index itself is
+            # computed from unclamped sel and stays correct)
+            pc = sel.clamp(max=self.n_internal - 1)
+            c = self.ch[pc]
+            go_right = (x[ar, c] * self.w[pc] + self.b[pc]) > 0
             node = sel + 1 + go_right.long()
         return node - self.n_internal  # leaf index [0, 2^d)
 
@@ -71,8 +75,9 @@ class Tree:
         node = torch.zeros(N, dtype=torch.long, device=x.device)
         for lvl in range(self.depth):
             sel = node * 2
-            c = self.ch[sel]
-            go_right = (x[ar, c] * self.w[sel] + self.b[sel]) > 0
+            pc = sel.clamp(max=self.n_internal - 1)
+            c = self.ch[pc]
+            go_right = (x[ar, c] * self.w[pc] + self.b[pc]) > 0
             node = sel + 1 + go_right.long()
         return node - self.n_internal
 
