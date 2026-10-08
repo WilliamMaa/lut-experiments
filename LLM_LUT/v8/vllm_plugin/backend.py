@@ -309,16 +309,34 @@ def patch_allocator() -> None:
     if getattr(SingleTypeKVCacheManager, "_v8_patched", False):
         return
     orig = SingleTypeKVCacheManager.get_num_blocks_to_allocate
+    import os
+    _debug = os.environ.get("V8_DEBUG_ALLOC") == "1"
+    _logged_pool = [False]
 
     def patched(self, request_id, num_tokens, new_computed_blocks,
                 total_computed_tokens, num_tokens_main_model):
         spec = self.kv_cache_spec
         if isinstance(spec, CompressedKVSpec):
             cap_tokens = spec.blocks_per_request * spec.block_size
-            if num_tokens > cap_tokens:
-                num_tokens = cap_tokens
-        return orig(self, request_id, num_tokens, new_computed_blocks,
-                    total_computed_tokens, num_tokens_main_model)
+            clamped = min(num_tokens, cap_tokens)
+            if _debug and not _logged_pool[0]:
+                _logged_pool[0] = True
+                nb = getattr(getattr(self, "block_pool", None),
+                             "num_blocks", -1)
+                print(f"[v8_alloc] pool num_blocks={nb} "
+                      f"blocks_per_request={spec.blocks_per_request} "
+                      f"B_g={spec.block_size} cap_tokens={cap_tokens}",
+                      flush=True)
+            if clamped != num_tokens and _debug:
+                print(f"[v8_alloc] clamp req={request_id[-12:]} "
+                      f"tokens {num_tokens} -> {clamped}", flush=True)
+            num_tokens = clamped
+        new_blocks = orig(self, request_id, num_tokens, new_computed_blocks,
+                          total_computed_tokens, num_tokens_main_model)
+        if _debug and new_blocks > 0:
+            print(f"[v8_alloc] alloc req={request_id[-12:]} "
+                  f"+{new_blocks} blocks (num_tokens={num_tokens})", flush=True)
+        return new_blocks
 
     SingleTypeKVCacheManager.get_num_blocks_to_allocate = patched
     SingleTypeKVCacheManager._v8_patched = True
