@@ -79,8 +79,8 @@ if [ "$up" != "1" ]; then
     exit 1
 fi
 
-echo "=== version check (must say 2026-10-06i) ==="
-grep "2026-10-04" logs/vllm_repro.log | head -2
+echo "=== version check (must say 2026-10-08j) ==="
+grep "2026-10-08" logs/vllm_repro.log | head -2
 
 echo "=== bench: N=$N docs=$DOCS data=$DATA ==="
 python tools/bench_concurrency.py \

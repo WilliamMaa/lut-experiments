@@ -14,12 +14,16 @@ The allocator-side cap (blocks per request) comes from the
 SingleTypeKVCacheManager monkeypatch: 0.19.1's
 get_num_blocks_to_allocate is cdiv(num_tokens, block_size) with no spec hook.
 
-v2026-10-04l semantics change: eviction is DEFERRED to the first decode
-step (see impl.py header), so a request's blocks must cover its whole
-prompt up to V8_MAX_SEQ_TOKENS — the constant-footprint claim now holds
-for the decode steady state only, same memory profile as the old harness
-and the full-KV baseline during prefill. Mid-request block freeing is a
-separate phase.
+v2026-10-08j fixed-budget semantics (docs/37): blocks_per_request is a
+FIXED small budget — cdiv(SLOTS + STAGING, B_g) + BLOCK_MARGIN — with no
+dependence on the request's logical length. Physically the pool per
+request is SLOTS + STAGING tokens: slots [0, SLOTS) hold the steady-state
+compact layout [sink | heavy-hitter | recent]; slots
+[SLOTS, SLOTS+STAGING) are prefill staging that deferred eviction may
+still grow into. Prompts outgrowing SLOTS+STAGING trigger pressure
+eviction (allowance = min(deferred, capacity - C), blockplan.py). The
+whole-prompt reservation of v2026-10-04l is gone: memory per request is
+constant from admission to finish.
 """
 import copy
 from dataclasses import dataclass
@@ -41,23 +45,23 @@ class CompressedKVSpec(FullAttentionSpec):
     def __post_init__(self):
         super().__post_init__()
         bs = self.block_size
-        # v2026-10-04l: deferred eviction — blocks must hold the WHOLE
-        # prompt (up to V8_MAX_SEQ_TOKENS), not just the retention budget.
-        # Blocks are allocated lazily by the scheduler as prefill advances;
-        # this is only the per-request cap.
-        # 2026-10-06a: bs here IS the group manager block size B_g (1056
-        # for the hybrid target, set by HybridAttentionMambaModelConfig
-        # before any spec is built) — manager units, docs/31 §1.1. The
-        # kernel page P never appears in this formula.
-        n = (config.V8_MAX_SEQ_TOKENS + bs - 1) // bs + config.BLOCK_MARGIN
+        # v2026-10-08j (docs/37): FIXED budget — SLOTS + STAGING tokens of
+        # physical pool, independent of logical length. bs here IS the
+        # group manager block size B_g (1056 for the hybrid target, set by
+        # HybridAttentionMambaModelConfig before any spec is built) —
+        # manager units, docs/31 §1.1. The kernel page P never appears in
+        # this formula. Blocks are still allocated lazily as prefill
+        # advances, but stop at this cap instead of growing with the
+        # prompt.
+        n = (-(-(config.V8_COMPRESS_SLOTS + config.V8_STAGING_TOKENS)
+               // bs)) + config.BLOCK_MARGIN
         object.__setattr__(self, "blocks_per_request", n)
 
     def max_memory_usage_bytes(self, vllm_config) -> int:
-        # Upper bound for the max-concurrency estimate: a fully-grown
-        # request (max_seq_tokens). Actual usage tracks prompt length and
-        # shrinks to the retention budget's worth of blocks only after
-        # mid-request freeing lands (separate phase); decode attention
-        # itself only ever touches the compact region.
+        # Upper bound for the max-concurrency estimate: the fixed per-
+        # request budget (docs/37), paid in full once the staging region
+        # is touched; unlike stock full attention it does NOT scale with
+        # --max-model-len, which is exactly the admission-path win.
         return self.blocks_per_request * self.page_size_bytes
 
     @classmethod

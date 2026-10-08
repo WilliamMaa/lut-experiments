@@ -22,9 +22,15 @@ v2026-10-04t OOB class is impossible by construction).
 
 Semantics (ported from kv_cache/heavy_hitter_cache.py; unchanged by this
 rewrite — eviction/attention math only, see eviction.py):
-- DEFERRED EVICTION: prefill chunks only score into the snapshot table;
-  nothing is evicted while total <= V8_MAX_SEQ_TOKENS; the first decode
-  step (C==1) evicts once, with the question's attention mass present.
+- DEFERRED EVICTION with a fixed-budget cap (docs/37): prefill chunks
+  only score into the snapshot table; nothing is evicted while
+  total <= allowance, where allowance = min(deferred_allowance(...),
+  certified_capacity - C) comes from blockplan.deferred_allowance — the
+  single source both the builder (plan) and this impl (eviction math)
+  consume. While the prompt fits SLOTS+STAGING the capacity term does
+  not bind and behavior is byte-identical to 06i (eviction deferred to
+  the first decode step, question-aware); longer prompts trigger pressure
+  eviction mid-prefill, scored by the attention mass observed so far.
 - Prefill chunk (C > 1): score with the observation window against
   [compact; chunk], scatter into the per-orig-position snapshot, grow
   compact, write back, attend (compact cols unmasked, chunk cols causal).
@@ -127,13 +133,6 @@ class CompressedKVImpl(FlashAttentionImpl):
         device = q.device
         cfg = self.cfg
         budget = cfg["retention"]
-        # Deferred eviction (docs/31 §4): the allowance rule lives in
-        # blockplan.deferred_allowance — the single source both the
-        # builder (plan) and the impl (eviction math) consume.
-        allowance = deferred_allowance(C, budget, config.V8_MAX_SEQ_TOKENS)
-        sink_n = min(cfg["sink"], allowance)
-        recent_n = min(cfg["recent"], allowance - sink_n)
-        hh_budget = allowance - sink_n - recent_n
 
         # Chunk start is pinned by the builder in the BlockPlan (identical
         # for every layer). The state-ahead frontier check lives ONLY in
@@ -158,6 +157,25 @@ class CompressedKVImpl(FlashAttentionImpl):
                 f"[v8_plugin] plan/impl chunk mismatch: plan C="
                 f"{plan.num_new_tokens}, actual {C}; "
                 f"req={plan.request_id}")
+
+        # Deferred eviction (docs/31 §4) under the fixed-budget cap
+        # (docs/37): the allowance rule lives in
+        # blockplan.deferred_allowance — the single source BOTH the
+        # builder (plan) and this impl (eviction math) consume. Capacity
+        # is the plan's fixed manager-block budget x B_g — the same
+        # token count as certified.available_pool_blocks x P once the
+        # (frontier-clamped) allocation reaches the budget, and always
+        # >= the certified row's real capacity; budget 0 = legacy
+        # uncapped.
+        capacity_tokens = None
+        if certified.mgr_block_budget > 0:
+            capacity_tokens = certified.mgr_block_budget * \
+                certified.mgr_block_size
+        allowance = deferred_allowance(C, budget, config.V8_MAX_SEQ_TOKENS,
+                                       capacity_tokens)
+        sink_n = min(cfg["sink"], allowance)
+        recent_n = min(cfg["recent"], allowance - sink_n)
+        hh_budget = allowance - sink_n - recent_n
 
         st.grow(max(chunk_start + C + 1, allowance + p_page), device, H_kv)
         row_long = row.long()
@@ -225,23 +243,34 @@ class CompressedKVImpl(FlashAttentionImpl):
                 obs_window=cfg["obs"], span_window=cfg["span"])
             hh_k = k_all[:, sink_n:mid_end, :][:, kept, :]
             hh_v = v_all[:, sink_n:mid_end, :][:, kept, :]
-            hh_v = eviction.fold_evicted_values(
-                hh_v, v_all[:, sink_n:mid_end, :], kept, mid_orig,
-                st.snap_per_head)
+            if kept.shape[0] > 0:
+                # hh_budget 0 (allowance pressed below sink+recent by the
+                # docs/37 capacity clamp) leaves nothing to fold into —
+                # fold_evicted_values would index an empty kept table.
+                hh_v = eviction.fold_evicted_values(
+                    hh_v, v_all[:, sink_n:mid_end, :], kept, mid_orig,
+                    st.snap_per_head)
+            # recent tail: total_len-recent_n, NOT -recent_n — with the
+            # capacity clamp allowance can press recent_n to 0, and
+            # t[-0:] is the WHOLE tensor (silent compact corruption).
             new_orig = torch.cat([
-                orig_all[:sink_n], mid_orig[kept], orig_all[-recent_n:]])
+                orig_all[:sink_n], mid_orig[kept],
+                orig_all[total_len - recent_n:]])
             k_all = torch.cat(
-                [k_all[:, :sink_n, :], hh_k, k_all[:, -recent_n:, :]], dim=1)
+                [k_all[:, :sink_n, :], hh_k,
+                 k_all[:, total_len - recent_n:, :]], dim=1)
             v_all = torch.cat(
-                [v_all[:, :sink_n, :], hh_v, v_all[:, -recent_n:, :]], dim=1)
+                [v_all[:, :sink_n, :], hh_v,
+                 v_all[:, total_len - recent_n:, :]], dim=1)
             st.orig[:k_all.shape[1]] = new_orig
             st.compact_len = k_all.shape[1]
             if not getattr(self, "_v8_evict_logged", False):
                 self._v8_evict_logged = True
+                tail = (f"orig=[{int(new_orig[0])}..{int(new_orig[-1])}] "
+                        if new_orig.numel() else "orig=[] ")
                 print(f"[v8_plugin] first eviction: kept="
                       f"{int(kept.shape[0])} L={st.compact_len} "
-                      f"orig=[{int(new_orig[0])}..{int(new_orig[-1])}] "
-                      f"allowance={allowance} C={C}", flush=True)
+                      f"{tail}allowance={allowance} C={C}", flush=True)
         else:
             st.orig[:total_len] = orig_all
             st.compact_len = total_len
@@ -255,7 +284,8 @@ class CompressedKVImpl(FlashAttentionImpl):
             raise units.UnitError(
                 f"[v8_plugin] impl exceeded planned write span: compact_len "
                 f"{L2} > plan span_end {plan.span_end_t} (allowance "
-                f"{allowance}, C {C}); req={plan.request_id} P={p_page}")
+                f"{allowance}, capacity {capacity_tokens}, C {C}); "
+                f"req={plan.request_id} P={p_page}")
         jb2 = arange_cap[:L2] // p_page
         off2 = arange_cap[:L2] % p_page
         bid2 = row_long[jb2]

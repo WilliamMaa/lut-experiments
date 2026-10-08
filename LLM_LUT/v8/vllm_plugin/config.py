@@ -54,17 +54,31 @@ TARGET_ARCH = os.environ.get(
 # the v2026-10-07 16384/8192 double-append crash (10-layer group, caught
 # on the 35B repro; the single-layer harness could not see it — the
 # multi-layer FakeWorld case closes that gap).
-PLUGIN_VERSION = "2026-10-06i"
+# 2026-10-08j: docs/37 fixed-budget KV allocation. The scheduler now books
+# a FIXED B_target manager blocks per request (cdiv(SLOTS+STAGING, B_g) +
+# BLOCK_MARGIN), independent of logical length; prefill staging beyond
+# SLOTS+STAGING triggers pressure eviction via
+# allowance = min(deferred_allowance(...), capacity - C) in
+# blockplan.deferred_allowance (single source, builder + impl).
+PLUGIN_VERSION = "2026-10-08j"
 
 # Margin (in blocks) added on top of the retention budget. Eviction keeps
 # L <= retention strictly, the margin only covers decode append-then-evict
 # transients and debug headroom (~0.3MB per request per layer at bs=16).
 BLOCK_MARGIN = 1
 
-# Per-request block cap / prefill allowance (v2026-10-04l). Deferred
-# eviction means a request's blocks must cover its WHOLE prompt; prefill
-# chunks do not evict below this many tokens. Must be >= the server's
-# --max-model-len. Memory cost is paid only as prefill actually advances
-# (scheduler allocates lazily); post-prefill decode touches only the
-# compact region, but the blocks stay reserved until the request ends.
+# Prefill staging budget, in tokens (docs/37). The physical pool per
+# request is SLOTS + STAGING tokens: [0, SLOTS) is the steady-state
+# compact region, [SLOTS, SLOTS+STAGING) is prefill staging that deferred
+# eviction may still grow into before pressure eviction kicks in.
+# Default 2x the 8192-token prefill chunk; raise it to trade memory
+# savings for quality on prompts that outgrow the staging region.
+V8_STAGING_TOKENS = int(os.environ.get("V8_STAGING_TOKENS", "16384"))
+
+# Prefill allowance ceiling BEFORE the fixed-budget capacity clamp
+# (v2026-10-04l, kept as the deferred-eviction ceiling). Since
+# 2026-10-08j this NO LONGER drives allocation: blocks are booked at the
+# fixed B_target (see V8_STAGING_TOKENS), and the per-step allowance is
+# min(this ceiling, certified_capacity - C). Memory cost no longer scales
+# with prompt length.
 V8_MAX_SEQ_TOKENS = int(os.environ.get("V8_MAX_SEQ_TOKENS", "131072"))

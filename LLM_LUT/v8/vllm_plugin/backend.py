@@ -157,6 +157,11 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
         self.registry.drop_finished(ctx.finished)
 
         computed_t, scheduled_t, chunk_starts, plans = [], [], [], []
+        b_g = int(self.spec.block_size)
+        # docs/37 fixed budget: B_target manager blocks per request, from
+        # the spec itself. 0/missing = legacy uncapped behavior.
+        budget_blocks = int(getattr(self.spec, "blocks_per_request", 0) or 0)
+        capacity_tokens = budget_blocks * b_g if budget_blocks > 0 else None
         for i, rid in enumerate(req_ids):
             C = int(qsl[i + 1] - qsl[i])
             # Scheduler-truth frontier for THIS step (T units). A request
@@ -194,14 +199,19 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
             # docs/32 §2: the single write-span plan for this request this
             # step. The impl consumes it verbatim (certify_kernel does the
             # one legal P conversion) and never re-derives token counts.
+            # 2026-10-08j: the allowance goes through the SAME
+            # blockplan.deferred_allowance the impl uses, with the fixed-
+            # budget capacity (docs/37) — builder and impl must consume
+            # one function (docs/32 铁律).
             plans.append(plan_write_span(
                 request_id=rid, group_id=0, chunk_start=comp,
                 num_new_tokens=C, compact_len_before=st.compact_len,
                 computed=comp, scheduled=sched,
-                mgr_block_size=int(self.spec.block_size),
+                mgr_block_size=b_g,
                 allowance=deferred_allowance(
                     C, config.V8_COMPRESS_SLOTS,
-                    config.V8_MAX_SEQ_TOKENS)))
+                    config.V8_MAX_SEQ_TOKENS, capacity_tokens),
+                block_budget=budget_blocks))
 
         md.req_states = states
         md.req_ids = req_ids
@@ -210,7 +220,7 @@ class CompressedKVMetadataBuilder(FlashAttentionMetadataBuilder):
         md.chunk_start = chunk_starts
         md.block_plans = plans
         md.qsl_cpu = common_attn_metadata.query_start_loc_cpu
-        md.mgr_block_size = self.spec.block_size
+        md.mgr_block_size = b_g
         return md
 
 
@@ -279,15 +289,19 @@ def register_backend_enum() -> None:
 
 
 def patch_allocator() -> None:
-    """Clamp per-request block allocation at blocks_per_request.
+    """Clamp per-request block allocation at the fixed budget (docs/37).
 
     0.19.1 has no spec hook here: get_num_blocks_to_allocate derives the
     requirement from the token count in manager units
     (cdiv(tokens, B_g)) — units.scheduler_mgr_blocks is the same math and
     the only place outside the scheduler where BG-unit division is legal
-    (docs/31 I2). The cap follows the deferred-eviction design: a
-    request's blocks must cover its whole prompt up to
-    V8_MAX_SEQ_TOKENS; blocks are allocated lazily as prefill advances.
+    (docs/31 I2). The function returns the required TOTAL minus blocks
+    already owned (incremental), so the correct fixed-budget semantics is
+    to clamp the token count such that cdiv(tokens, B_g) <=
+    spec.blocks_per_request — cdiv is monotonic, so clamping
+    num_tokens to blocks_per_request * block_size caps the required
+    total at B_target and the stock code returns the remaining increment.
+    Returning a fixed value per call would be wrong (double-booking).
     """
     from vllm.v1.core.single_type_kv_cache_manager import (
         SingleTypeKVCacheManager)
@@ -300,8 +314,9 @@ def patch_allocator() -> None:
                 total_computed_tokens, num_tokens_main_model):
         spec = self.kv_cache_spec
         if isinstance(spec, CompressedKVSpec):
-            if num_tokens > config.V8_MAX_SEQ_TOKENS:
-                num_tokens = config.V8_MAX_SEQ_TOKENS
+            cap_tokens = spec.blocks_per_request * spec.block_size
+            if num_tokens > cap_tokens:
+                num_tokens = cap_tokens
         return orig(self, request_id, num_tokens, new_computed_blocks,
                     total_computed_tokens, num_tokens_main_model)
 

@@ -48,6 +48,9 @@ class BlockPlan:
     compact_len_after_max: int = 0  # == span_end_t (post-write bound)
     mgr_blocks_allocated: int = 0   # cdiv(frontier, B_g), manager units
     mgr_block_size: int = 0         # B_g (manager tokens per block)
+    mgr_block_budget: int = 0       # docs/37: fixed B_target manager
+                                    # blocks per request (0 = uncapped
+                                    # legacy); capacity = budget x B_g
 
     @property
     def write_start(self) -> int:
@@ -100,22 +103,33 @@ class BlockPlan:
             compact_len_before=self.compact_len_before,
             compact_len_after_max=self.compact_len_after_max,
             mgr_blocks_allocated=self.mgr_blocks_allocated,
-            mgr_block_size=bg)
+            mgr_block_size=bg, mgr_block_budget=self.mgr_block_budget)
 
 
 def deferred_allowance(num_new_tokens: int, retention_budget: int,
-                       max_seq_tokens: int) -> int:
+                       max_seq_tokens: int,
+                       capacity_tokens: int = None) -> int:
     """Deferred-eviction allowance (single source of truth, docs/31 §4):
     decode steps (C==1) enforce the tight retention budget; prefill chunks
-    allow up to max_seq_tokens so scoring happens before any eviction."""
-    return retention_budget if num_new_tokens == 1 else max(
+    allow up to max_seq_tokens so scoring happens before any eviction.
+
+    2026-10-08j (docs/37): with fixed-budget allocation the physical pool
+    per request is only B_target manager blocks, so when capacity_tokens
+    is given the allowance is additionally capped at capacity_tokens - C
+    (room must be left for this chunk's own staging). capacity_tokens=None
+    keeps the legacy uncapped behavior (harness/old callers).
+    """
+    base = retention_budget if num_new_tokens == 1 else max(
         retention_budget, max_seq_tokens)
+    if capacity_tokens is None:
+        return base
+    return min(base, capacity_tokens - num_new_tokens)
 
 
 def plan_write_span(*, request_id: str, group_id: int, chunk_start: int,
                     num_new_tokens: int, compact_len_before: int,
                     computed: int, scheduled: int, mgr_block_size: int,
-                    allowance: int) -> BlockPlan:
+                    allowance: int, block_budget: int = 0) -> BlockPlan:
     """Builder-side planner (docs/32 §2): turns this step's scheduler truth
     into the single write-span plan the impl will consume.
 
@@ -124,6 +138,13 @@ def plan_write_span(*, request_id: str, group_id: int, chunk_start: int,
     happens in pure T units (span_end <= frontier), which implies the
     kernel-block check after expansion (B_g % P == 0, docs/31 §1.1).
     FAIL-CLOSED: never clamps span down to the frontier.
+
+    block_budget (docs/37): fixed per-request manager-block budget
+    B_target; the recorded mgr_blocks_allocated is clamped to it so that
+    certify_kernel's available reflects the real (capped) allocation.
+    0 = legacy uncapped. The eviction allowance itself comes from
+    blockplan.deferred_allowance — the caller passes the already-clamped
+    value; both sides must consume that one function (docs/32 铁律).
     """
     if chunk_start != computed:
         # The first token of this chunk IS at orig position `computed`
@@ -147,6 +168,8 @@ def plan_write_span(*, request_id: str, group_id: int, chunk_start: int,
             f"scheduled {scheduled}); req={request_id} B_g={mgr_block_size}")
     mgr_blocks = required_mgr_blocks(
         Qty(frontier, Unit.S), Qty(mgr_block_size, Unit.BG))
+    if block_budget > 0 and mgr_blocks > block_budget:
+        mgr_blocks = block_budget
     return BlockPlan(
         request_id=request_id, group_id=group_id, span_end_t=span_end,
         token_computed_t=computed, token_scheduled_t=scheduled,
@@ -155,7 +178,7 @@ def plan_write_span(*, request_id: str, group_id: int, chunk_start: int,
         chunk_start_t=chunk_start, num_new_tokens=num_new_tokens,
         compact_len_before=compact_len_before,
         compact_len_after_max=span_end, mgr_blocks_allocated=mgr_blocks,
-        mgr_block_size=mgr_block_size)
+        mgr_block_size=mgr_block_size, mgr_block_budget=block_budget)
 
 
 def build_block_plan(request_id: str, group_id: int,

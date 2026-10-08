@@ -12,6 +12,7 @@ file), and the tensors (small random CPU tensors standing in for Q/K/V).
 """
 import torch
 
+from vllm_plugin import config as v8config
 from vllm_plugin import identity as idn
 from vllm_plugin.backend import (CompressedKVMetadataBuilder,
                                  RequestKVState)
@@ -46,10 +47,16 @@ class RequestRec:
 
 
 class _Spec:
-    """Minimal stand-in for CompressedKVSpec (only block_size is read)."""
+    """Minimal stand-in for CompressedKVSpec (only what the builder
+    reads). blocks_per_request uses the REAL spec formula (docs/37 fixed
+    budget) so the fake scheduler clamps allocation exactly like the
+    patched SingleTypeKVCacheManager."""
 
     def __init__(self, block_size):
         self.block_size = block_size
+        self.blocks_per_request = (
+            -(-(v8config.V8_COMPRESS_SLOTS + v8config.V8_STAGING_TOKENS)
+              // block_size)) + v8config.BLOCK_MARGIN
 
 
 class FakeWorld:
@@ -88,8 +95,11 @@ class FakeWorld:
 
     def _allocate(self, rec, frontier):
         """Lazily allocate manager blocks so the row covers the frontier
-        (SingleTypeKVCacheManager semantics)."""
-        need = -(-frontier // self.B_g)  # cdiv
+        (SingleTypeKVCacheManager semantics), clamped at the fixed
+        per-request budget B_target (docs/37) exactly like the patched
+        get_num_blocks_to_allocate."""
+        budget = self.builder.spec.blocks_per_request
+        need = min(-(-frontier // self.B_g), budget)  # cdiv, clamped
         while len(rec.kernel_ids) < need * self.kpr:
             m = self.free_mgr.pop(0)
             rec.kernel_ids.extend(range(m * self.kpr, (m + 1) * self.kpr))
@@ -215,8 +225,24 @@ class FakeWorld:
                             f"{plan.frontier_t}")
             if plan.write_start != 0 or plan.write_end != plan.span_end_t:
                 errs.append(f"{rid}: write span fields inconsistent")
-            if plan.mgr_blocks_allocated * self.B_g < plan.frontier_t:
-                errs.append(f"{rid}: mgr allocation does not cover frontier")
+            # docs/37: the plan's mgr_blocks_allocated must mirror the
+            # fake allocator exactly — cdiv(frontier, B_g) clamped at the
+            # fixed budget. Beyond the budget the row deliberately does
+            # NOT cover the logical frontier (that is the point of fixed-
+            # budget accounting); certify against the row, not frontier.
+            budget = self.builder.spec.blocks_per_request
+            want_blocks = min(-(-plan.frontier_t // self.B_g), budget)
+            if plan.mgr_blocks_allocated != want_blocks:
+                errs.append(f"{rid}: plan mgr_blocks "
+                            f"{plan.mgr_blocks_allocated} != allocator "
+                            f"{want_blocks} (frontier {plan.frontier_t}, "
+                            f"budget {budget})")
+            if len(rows_at_serve[rid]) > budget * self.kpr:
+                errs.append(f"{rid}: holds {len(rows_at_serve[rid])} kernel "
+                            f"blocks > fixed budget {budget * self.kpr}")
+            if plan.mgr_blocks_allocated * self.kpr > \
+                    len(rows_at_serve[rid]):
+                errs.append(f"{rid}: plan claims more blocks than allocated")
             certified = plan.certify_kernel(self.P)
             if certified.required_pool_blocks > \
                     certified.available_pool_blocks:

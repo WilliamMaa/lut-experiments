@@ -6,14 +6,18 @@ import os
 import sys
 
 # Small-scale config BEFORE any vllm_plugin import (impl reads config at
-# construction; prefill allowance = max(budget, max_seq) drives whether
-# eviction fires mid-prefill vs at decode).
+# construction; prefill allowance = min(max(budget, max_seq),
+# capacity - C) drives whether eviction fires mid-prefill vs at decode).
+# STAGING=48 with SLOTS=24 -> B_target = cdiv(72, B_g=64) + 1 = 3 blocks
+# = 192 tokens of fixed pool: prompts > 72 tokens exercise the docs/37
+# pressure-eviction path; prompts <= 72 stay byte-identical to 06i.
 os.environ.setdefault("V8_COMPRESS_SLOTS", "24")
 os.environ.setdefault("V8_SINK_TOKENS", "2")
 os.environ.setdefault("V8_RECENT_TOKENS", "4")
 os.environ.setdefault("V8_OBS_WINDOW", "8")
 os.environ.setdefault("V8_SPAN_WINDOW", "2")
 os.environ.setdefault("V8_MAX_SEQ_TOKENS", "96")
+os.environ.setdefault("V8_STAGING_TOKENS", "48")
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(os.path.dirname(_HERE)))  # project root
@@ -207,7 +211,62 @@ def case9():
                     f"{st.compact_len} > budget 24 (double-append?)")
     check("9 multi-layer group (4 layers share state)", errs)
 
-# property test: random interleavings (docs/32)
+# case 10: long-sequence pressure eviction (docs/37) — logical length
+# 300 >> SLOTS+STAGING (72) with 128-token chunks. The fixed pool is
+# B_target = cdiv(24+48, 64)+1 = 3 blocks = 192 tokens, so the capacity
+# clamp (allowance = min(deferred, capacity - C)) binds at C=128
+# (192-128 = 64 < MAX_SEQ 96) and eviction fires MID-PREFILL with snap-
+# so-far scores, not only at the first decode step.
+def case10():
+    w = FakeWorld(seed=10)
+    w.add_request("A", 300)
+    errs = []
+    capacity = 3 * 64  # B_target blocks x B_g for this env
+    computed = 0
+    first_L = None
+    for n in (128, 128, 44):
+        md, e = w.step([("A", n)])
+        errs += e
+        st = w.builder.registry.states["A"]
+        plan = md.block_plans[0]
+        # (a) plan span within the certified capacity: certify_kernel
+        # raising already fails the case loudly (fail-closed = plan/impl
+        # disagreement); assert the capacity bound explicitly too.
+        certified = plan.certify_kernel(w.P)
+        if certified.required_pool_blocks > \
+                certified.available_pool_blocks:
+            errs.append(f"span {plan.span_end_t} exceeds certified "
+                        f"capacity {certified.available_pool_blocks * w.P}")
+        if plan.span_end_t > capacity:
+            errs.append(f"span {plan.span_end_t} > fixed capacity "
+                        f"{capacity}")
+        # (b) eviction landed inside the allowance
+        if st.compact_len > plan.span_end_t:
+            errs.append(f"compact_len {st.compact_len} > allowance "
+                        f"(span {plan.span_end_t})")
+        if first_L is None:
+            first_L = st.compact_len
+        computed += n
+    # capacity clamp proof: legacy allowance was 96 (MAX_SEQ), the clamp
+    # pressed chunk1 (C=128) to 192-128 = 64
+    if first_L != 64:
+        errs.append(f"chunk1 capacity-clamped compact_len expected 64, "
+                    f"got {first_L}")
+    st = w.builder.registry.states["A"]
+    if st.compact_len != 96:
+        errs.append(f"prefill end: expected allowance-capped 96, got "
+                    f"{st.compact_len}")
+    # (c) decode continues correctly after mid-prefill pressure evictions
+    for _ in range(4):
+        _, e = w.step([("A", 1)])
+        errs += e
+    st = w.builder.registry.states["A"]
+    if st.compact_len > 24:
+        errs.append(f"decode steady-state compact_len {st.compact_len} "
+                    f"> budget 24")
+    check("10 long-seq pressure eviction (fixed budget)", errs)
+
+
 def property_test(n_steps=1200, seed=99, layers=3):
     import random
     rng = random.Random(seed)
@@ -288,7 +347,7 @@ def negative_no_plan():
 
 def main():
     case1(); case2(); case3(); case4(); case5(); case6(); case7(); case8()
-    case9()
+    case9(); case10()
     property_test()
     negative_no_plan()
     if FAILURES:

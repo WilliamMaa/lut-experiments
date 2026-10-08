@@ -60,7 +60,7 @@ v8 侧启动日志同样报 `GPU KV cache size: 921,888 tokens`（27.08x）—�
 
 **1. full-KV 能承接的并发远比旧假设大，但"没有内存墙"尚未证明。** N=32（32 路活跃请求）也 0 OOM 完成全部 64 会话——但这只说明 server 能把请求服务完，不说明 32 路 64k KV 同时 resident：vLLM 的正常机制是 preempt → free blocks → recompute。docs/33 中"full 只能扛 1–2 路"的断言**删除**；而"该配置下并发不由显存决定"这一 stronger  claim 需要 preemption/recompute telemetry 才能成立（docs/36 指出启动日志两个数本身矛盾：`921,888 / 131,072 ≈ 7.0× ≠ 27.29x`，hybrid 模型的 KV 记账是 group-aware 的，`GPU KV cache size` 的 token 数不能拿来直接除 64k）。
 
-**2. 吞吐饱和形态与 compute-bound 一致，但 KV pressure 未被排除。** full 从 N=4 起 sess/h 停在 ~122–128，N=8→32 只把 P50 从 204s 推到 868s；v8-1024 从 N=8 起停在 ~64–65。两边都在排队。这"当然可能是 compute-bound，也可能同时存在 KV admission/preemption 被吞吐饱和掩盖"——定性需要 telemetry（下一步 A）。
+**2. 吞吐饱和形态与 compute-bound 一致，telemetry 已支持（2026-10-08 补测）。** full 从 N=4 起 sess/h 停在 ~122–128，N=8→32 只把 P50 从 204s 推到 868s；v8-1024 从 N=8 起停在 ~64–65。两边都在排队。telemetry（`tools/telemetry_probe.sh`，full、16 并发 × 64k、16 会话）：`kv_cache_usage_perc` 峰值 **0.137**，`num_preemptions_total` **0 → 0**，bench 0 错误。即 16 路 64k 并发只占 KV 池约 14%、零抢占；线性外推 N=32 也远低于饱和。**"该配置下 full 不 KV-bound、瓶颈在 compute"成立。**
 
 **3. v8 的吞吐代价是恒定的 ~2×。** 每个 N 档位 v8 的 sess/h 都约为 full 的一半（N=1: 41.9 vs 77.4；N=16: 65.0 vs 127.6），单会话时延翻倍（86s vs 46s）。v8 用 ~2× 的 wall 换来了相同的 64 会话完成量。这 2× 来自插件的 compact pool 注意力路径（非 FlashAttention 原生 kernel 的 gather/scatter 实现），在长上下文 decode 中成为主开销。
 
@@ -91,6 +91,6 @@ v8 侧启动日志同样报 `GPU KV cache size: 921,888 tokens`（27.08x）—�
 
 **下一步（不再扫 concurrency，只做两件）**：
 
-- **A. full 的真实 KV pressure telemetry（便宜，先做）**：选 N=16/32 短重跑（或从已有 server 日志/metrics 提取），记录 preemption count、recompute tokens、KV utilization timeline、running/waiting。若 preemption=0 且 KV usage 无压力，"compute-bound"才真正站住；若有大量 preemption，"N=32 无 OOM"要重新解释为"靠 scheduler recycling KV 硬扛"。
+- **A. full 的真实 KV pressure telemetry —— 已完成（2026-10-08）**：full、N=16 × 64k × 16 会话，KV usage 峰值 0.137、preemption 0、0 错误。"compute-bound"站住。原始数据：`results/telemetry_full_c32.json`、`logs/telemetry_full_c32.log`。
 - **B. compressed-aware KV admission/allocation（核心）**：让 vLLM scheduler 按压缩后 footprint 记账。对 Qwen3.6 这种 hybrid（40 层仅 10 层 full attention，其余 Gated DeltaNet）只能重定义**被压缩的 full-attention group** 的 residency accounting，GDN recurrent-state group 照常。候选实现方向：把 v8 attention group 的 block_size/记账粒度改为按 compact budget 声明，使 per-request 分配 ≈ slots×layers 而非 logical tokens；然后重读 `num_gpu_blocks` / per-group blocks-per-request / `kv_cache_max_concurrency` 验证 allocator 真的多 admit。做B之前先查 vLLM 0.19.1 源码确认 block accounting 的 hook 点（hybrid group-aware 路径）。
 - v8-4096 sweep：同意 docs/36，暂不跑（1024≈4096 质量无差异 + kernel 开销特征相同，七小时换不来新信息）。
