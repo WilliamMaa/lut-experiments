@@ -27,9 +27,27 @@ Usage (remote, lut_py310):
 
 import argparse
 import sys
+import types
 from pathlib import Path
 
 import torch
+
+# The pickled tree objects reference classes from the training script
+# (build_lut_ffn_output_v3_shared_coarse). We only read their attributes,
+# so inject a stub module that fabricates any requested class on demand —
+# this avoids importing the real training script and all of its deps.
+class _StubModule(types.ModuleType):
+    def __getattr__(self, name):
+        cls = type(name, (), {})
+        setattr(self, name, cls)
+        return cls
+
+
+for _mod_name in ("build_lut_ffn_output_v3_shared_coarse",
+                  "build_lut_ffn_output",
+                  "build_lut_ffn_output_v3_lowrank",
+                  "build_pairwise_correction_v3"):
+    sys.modules.setdefault(_mod_name, _StubModule(_mod_name))
 
 
 def _load_ckpt(path: Path) -> dict:
