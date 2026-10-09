@@ -272,7 +272,7 @@ def main():
                      - lut_flat(x).float()).abs().max().item()
             flag = "OK" if delta <= 0.05 else "WARNING"
             print(f"      triton max|delta| vs flat = {delta:.5f} [{flag}]")
-            t = bench(lut_triton, args.iters)
+            t = bench(lambda: lut_triton(x), args.iters)
             tg = bench(make_graphed(lut_triton, x), args.iters)
             tgratio = tg / d
         verdict.append((N, d, n, f, ratio, g, gratio, t, tg, tgratio))
