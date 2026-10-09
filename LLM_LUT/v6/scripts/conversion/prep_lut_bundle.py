@@ -196,7 +196,7 @@ def main() -> None:
     resid = {}
     for key in ("ch", "signs", "thr", "leaf", "left", "right"):
         resid[key] = torch.stack(
-            [_padded_tree_arrays(resid_trees[gid], n_r[gid])[key]
+            [_padded_tree_arrays(resid_trees[gid], n_r_max)[key]
              for gid in gids], dim=0).contiguous()  # [G, n_r_max, ...]
     print(f"[prep_lut_bundle] tree nodes: coarse={n_c} "
           f"resid max={n_r_max} (full would be "
