@@ -97,16 +97,21 @@ fp32 加和）、`vllm_plugin/tests/test_lut_ffn.py`（数值对照）、
 真机验证序列（按序，每步过了再走下一步）：
 
 ```bash
-# 0. 确认 checkpoint 在（P1.3 前置，一直没人确认过）
-ls -d ~/lut-experiments/LLM_LUT/v6/outputs_ffn_lut_layer3*/checkpoints 2>/dev/null
+# 0. checkpoint 位置（2026-10-08 已确认）：/data/mamingyu/，不在 ~/lut-experiments。
+#    锁定 multilayer_l37_l39 评估同款组合：L37/L38 onpolicy + L39 multilayer。
+ls -d /data/mamingyu/outputs_ffn_lut_layer3*/checkpoints
 
-ls -d /data/mamingyu/outputs_ff_lut_layer3* 2>/dev/null; \
-find /data/mamingyu /home/u/mmy ~/lut-experiments -maxdepth 4 -name "replacement_g0.pt" 2>/dev/null
-
-# 1. 打包 L39（lut_py310）
-python v6/scripts/conversion/prep_lut_bundle.py \
-  --checkpoint_dir ~/lut-experiments/LLM_LUT/v6/outputs_ffn_lut_layer39_shared_expert_v3_onpolicy_as_v4/checkpoints \
-  --output /data/mamingyu/lut_bundles/layer39.pt
+# 1. 打包三层（vllm_py310）
+mkdir -p /data/mamingyu/lut_bundles
+for spec in \
+  "37 outputs_ffn_lut_layer37_shared_expert_v3_onpolicy_as_v4" \
+  "38 outputs_ffn_lut_layer38_shared_expert_v3_onpolicy_as_v4" \
+  "39 outputs_ffn_lut_layer39_shared_expert_v3_onpolicy_multilayer_as_v4"; do
+  set -- $spec
+  python v6/scripts/conversion/prep_lut_bundle.py \
+    --checkpoint_dir /data/mamingyu/$2/checkpoints \
+    --output /data/mamingyu/lut_bundles/layer$1.pt
+done
 
 # 2. 数值测试（kernel vs torch reference，vllm_py310）
 python vllm_plugin/tests/test_lut_ffn.py
@@ -121,7 +126,9 @@ python -m vllm_plugin.serve /home/u/downloads/models/Qwen3.6-35B-A3B \
 # 4. 冒烟：同 repro_concurrency 的 2-doc 小 bench + fact_acc，与 v8-only 对比
 ```
 
-注意：checkpoint 目录名以步骤 0 的实际输出为准（`_onpolicy_as_v4/checkpoints`）。
+注意：L39 存在三个变体（onpolicy / rollout / onpolicy_multilayer），Phase 1 锁定
+**multilayer** 版——它是 multilayer_l37_l39 质量评估（PPL 6.075→9.123）用的资产，
+三层组合与现有质量证据链一致。
 
 ## P1.4 — 系统对比（天级）
 
