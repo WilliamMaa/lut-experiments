@@ -60,7 +60,11 @@ TARGET_ARCH = os.environ.get(
 # SLOTS+STAGING triggers pressure eviction via
 # allowance = min(deferred_allowance(...), capacity - C) in
 # blockplan.deferred_allowance (single source, builder + impl).
-PLUGIN_VERSION = "2026-10-08j"
+# 2026-10-08k: docs/43 P1.3 shared_expert LUT replacement. Optional env
+# switches (V8_LUT_LAYERS / V8_LUT_BUNDLE_DIR, both default off) wrap
+# Qwen3NextSparseMoeBlock.__init__ and swap shared_expert.forward for a
+# triton LUT lookup; with V8_LUT_LAYERS empty the behavior is unchanged.
+PLUGIN_VERSION = "2026-10-08k"
 
 # Margin (in blocks) added on top of the retention budget. Eviction keeps
 # L <= retention strictly, the margin only covers decode append-then-evict
@@ -82,3 +86,13 @@ V8_STAGING_TOKENS = int(os.environ.get("V8_STAGING_TOKENS", "16384"))
 # min(this ceiling, certified_capacity - C). Memory cost no longer scales
 # with prompt length.
 V8_MAX_SEQ_TOKENS = int(os.environ.get("V8_MAX_SEQ_TOKENS", "131072"))
+
+# P1.3 shared_expert LUT replacement (docs/43). Comma/space separated
+# layer indices, e.g. "39" or "37,38,39". Empty = feature off (default) —
+# patch() then skips the LUT wrap entirely.
+V8_LUT_LAYERS = os.environ.get("V8_LUT_LAYERS", "")
+
+# Directory holding one bundle.pt per LUT layer, named layer{N}.pt
+# (produced by v6/scripts/conversion/prep_lut_bundle.py). Ignored when
+# V8_LUT_LAYERS is empty.
+V8_LUT_BUNDLE_DIR = os.environ.get("V8_LUT_BUNDLE_DIR", "")

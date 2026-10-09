@@ -60,35 +60,65 @@ python v6/scripts/benchmarks/micro_lut_vs_gemm.py \
     --model-path /home/u/downloads/models/Qwen3.6-35B-A3B
 ```
 
-成功线：`t_graph/dense ≤ 1.0` → production 可行，进 P1.3；1–2× → 边际但
-teacher 成本已崩，仍进 P1.3；>2× → 访问模式没救，Phase 1 结案。
+**P1.2 结果（2026-10-08，已跑）**：数值校验全 OK（max|Δ|=0.016 < 0.05）。
+**t_graph/dense decode 尺寸 0.11–0.39×（比 dense 快 2.5–9 倍）**，eager triton
+已与 dense 打平（~0.05ms）。N=8192 prefill 4.7× dense（gather 随机读在
+大 N 下效率下降），serving 时 prefill 可保持 GEMM 或后续优化，不挡 decode 结论。
+→ **P1.2 成功，按判据进 P1.3 插件集成。**
 
 真机首跑候选报错点（本机无法验证）：triton 标量 loop-carried 变量
 （`node` 从 python int 0 起被 tensor 重赋值）在 triton 3.x 合法，但旧版
 编译器可能报 type unification 错——报错就把 `node = 0` 改成
 `node = tl.zeros((), dtype=tl.int32)`（或升级 triton）。
 
-## P1.3 — vLLM 插件集成（天级）
+## P1.3 — vLLM 插件集成（已实现 2026-10-08k，待真机验证）
 
-把 v6 引擎的 LUT 查表逻辑移植进 `vllm_plugin` 的 Qwen3_5Moe patch 路径。
+实现要点（与硬要求的对应）：
+1. **替换 module forward**：包装 `Qwen3NextSparseMoeBlock.__init__`，实例属性遮蔽
+   `shared_expert.forward` 为 triton 查表，原 GEMM 不执行（满足硬要求 1）。
+2. **TP 正确性**：`SharedFusedMoE` 对 shared 输出做 all-reduce，故只有 tp_rank 0
+   返回 LUT 结果、其余 rank 返回 zeros（all-reduce 后恰为单次结果）。
+3. **显存**：表 tensor 在构造期 `register_buffer(persistent=False)` 挂到
+   shared_expert 实例，随 .to(device) 移动、profile_run 前计入 non-KV memory。
+   已知冗余：replacer 惰性 _to(device) 产生第二份副本（~640MiB/层而非 320MiB），
+   P1.4 若 HBM 敏感再去重。
+4. **配置**：环境变量 `V8_LUT_LAYERS`（"39" / "37,38,39"，空=关闭）、
+   `V8_LUT_BUNDLE_DIR`。**无 CLI 参数**（对齐插件现有风格；runbook 早先的
+   `--v8-lut-layers` 字样作废）。
+5. **版本 2026-10-08k**：config.py / repro_concurrency.sh 注释 / docs/28 §8.2
+   三处已同步；本机 py_compile + test_ast_names + test_forbidden + bash -n 全过。
 
-**硬要求**：
-1. **替换 module forward，不是 hook 后置覆盖**。v6 HF 引擎的 hook 是先算完原 FFN
-   再覆盖（MAC 节省恒 0，docs/40 记录在案）；在 vLLM 里必须直接改写
-   `shared_expert.forward` 为查表，原 GEMM 不执行，compute 才算真被替掉。
-2. 层：L37–39（现有 `_as_v4/checkpoints`，步骤 0 已确认远端数据在；checkpoint
-   确认命令见下）。先 1 层（L39）再 3 层。
-3. 显式单卡/显式 TP，**禁 device_map="auto"**（AGENTS.md 红线 5）。
-4. CUDA graph 兼容：先用 `--enforce-eager` 验证正确性，再试 vLLM 全图模式；
-   若 capture 失败，LUT 层退回 eager（P1.4 两种模式都报数）。
-5. 升版三处同步：`vllm_plugin/config.py` PLUGIN_VERSION、`tools/repro_concurrency.sh`
-   must-say 行、`docs/28-vllm-plugin-spec.md` §8.2。
+新增/改动文件：`vllm_plugin/lut_ffn.py`（3 kernel：`_k_leaf` 树遍历（不动点
+自环处理早停树，coarse T=1 / residual T=32 复用）、`_k_gather_add` coarse+residual
+fp32 加和）、`vllm_plugin/tests/test_lut_ffn.py`（数值对照）、
+`v6/scripts/conversion/prep_lut_bundle.py`（checkpoint 目录 → 单文件 bundle，
+ pickled 树 → padded 自环张量）、`config.py`、`__init__.py`。
 
-**checkpoint 确认**（P1.3 前置）：
+真机验证序列（按序，每步过了再走下一步）：
 
 ```bash
+# 0. 确认 checkpoint 在（P1.3 前置，一直没人确认过）
 ls -d ~/lut-experiments/LLM_LUT/v6/outputs_ffn_lut_layer3*/checkpoints 2>/dev/null
+
+# 1. 打包 L39（lut_py310）
+python v6/scripts/conversion/prep_lut_bundle.py \
+  --checkpoint_dir ~/lut-experiments/LLM_LUT/v6/outputs_ffn_lut_layer39_shared_expert_v3_onpolicy_as_v4/checkpoints \
+  --output /data/mamingyu/lut_bundles/layer39.pt
+
+# 2. 数值测试（kernel vs torch reference，vllm_py310）
+python vllm_plugin/tests/test_lut_ffn.py
+
+# 3. 带 LUT 起 server（vllm_py310），grep 确认 "LUT shared_expert layer 39 installed"
+V8_LUT_LAYERS=39 V8_LUT_BUNDLE_DIR=/data/mamingyu/lut_bundles \
+python -m vllm_plugin.serve /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --enforce-eager --no-enable-prefix-caching --max-model-len 131072 \
+  --tensor-parallel-size 2 --max-num-seqs 4 --gpu-memory-utilization 0.88 \
+  --port 18002 2>&1 | tee logs/lut_l39.log | grep -E "LUT shared_expert|KV cache size"
+
+# 4. 冒烟：同 repro_concurrency 的 2-doc 小 bench + fact_acc，与 v8-only 对比
 ```
+
+注意：checkpoint 目录名以步骤 0 的实际输出为准（`_onpolicy_as_v4/checkpoints`）。
 
 ## P1.4 — 系统对比（天级）
 

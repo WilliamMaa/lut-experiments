@@ -1,14 +1,16 @@
 """v8 compressed-KV vLLM plugin (vLLM 0.19.1 target).
 
-patch() performs three monkeypatches:
+patch() performs the monkeypatches, in order:
 1. Attention.__init__: inject CompressedKVBackend into every full-attention
    layer of the target model. GDN/linear layers never construct vllm
    Attention modules, so gating on the model arch is sufficient.
 2. Attention.get_kv_cache_spec: convert the layer's FullAttentionSpec into
    CompressedKVSpec (0.19.1 has no customize_spec hook). Without this the
    allocator group keeps the stock max_model_len-sized spec.
-3. SingleTypeKVCacheManager.get_num_blocks_to_allocate: cap per-request
-   blocks at spec.blocks_per_request (see backend.patch_allocator).
+3-6. backend.py: KV cache manager enum/spec manager registration,
+   per-request block cap (get_num_blocks_to_allocate), step-context patch.
+7. lut_ffn (P1.3, optional): shared_expert.forward -> triton LUT lookup on
+   V8_LUT_LAYERS. Skipped when the env switch is empty.
 
 v1 constraints (enforced in serve.py, not optional):
 - --enforce-eager (per-request Python state, no CUDA graphs)
@@ -33,6 +35,13 @@ def patch() -> None:
     register_spec_manager()
     patch_allocator()
     patch_step_context()
+    # 7. P1.3 shared_expert LUT replacement (docs/43): swaps
+    #    shared_expert.forward for a triton LUT lookup on V8_LUT_LAYERS.
+    #    Runs only when the env switch is set — default is off.
+    from . import lut_ffn
+    lut_layers = lut_ffn.parse_layers(config.V8_LUT_LAYERS)
+    if lut_layers:
+        lut_ffn.patch_shared_expert_lut(lut_layers)
     _patched = True
     # Runs in the API-server process: this line in the log proves patch()
     # executed and which code version is live. Absent => stale files or
@@ -41,6 +50,7 @@ def patch() -> None:
     print(f"[v8_plugin] patch() installed v{config.PLUGIN_VERSION}, "
           f"TARGET_ARCH={config.TARGET_ARCH}, "
           f"slots={config.V8_COMPRESS_SLOTS}, "
+          f"lut={config.V8_LUT_LAYERS or 'off'}, "
           f"pid={os.getpid()}", flush=True)
 
 
