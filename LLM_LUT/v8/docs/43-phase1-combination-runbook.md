@@ -100,6 +100,9 @@ fp32 加和）、`vllm_plugin/tests/test_lut_ffn.py`（数值对照）、
 # 0. 确认 checkpoint 在（P1.3 前置，一直没人确认过）
 ls -d ~/lut-experiments/LLM_LUT/v6/outputs_ffn_lut_layer3*/checkpoints 2>/dev/null
 
+ls -d /data/mamingyu/outputs_ff_lut_layer3* 2>/dev/null; \
+find /data/mamingyu /home/u/mmy ~/lut-experiments -maxdepth 4 -name "replacement_g0.pt" 2>/dev/null
+
 # 1. 打包 L39（lut_py310）
 python v6/scripts/conversion/prep_lut_bundle.py \
   --checkpoint_dir ~/lut-experiments/LLM_LUT/v6/outputs_ffn_lut_layer39_shared_expert_v3_onpolicy_as_v4/checkpoints \
