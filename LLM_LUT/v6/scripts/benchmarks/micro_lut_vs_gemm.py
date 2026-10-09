@@ -13,6 +13,9 @@ What it measures, per batch size N (decode N=1..64, prefill N=8192):
   flat  : the "flattened ideal" this project could ship: batched tree
           traversal (14/16 sequential levels, one tensor op per level over
           all N x 33 trees) + one fused row gather per table
+  graph : P1.1 experiment (v8/docs/43): the flat path captured in a single
+          CUDA graph -- if naive~=flat but graph<<flat, the 55ms floor was
+          pure kernel-launch dispatch and no triton is needed yet
 
 Tables are sized exactly like v6's L37 checkpoint (~320 MiB fp16):
   coarse    [16384, 2048]      (14-bit shared tree, full output dim)
@@ -93,6 +96,29 @@ def bench(fn, iters, warmup=20):
     return (time.perf_counter() - t0) / iters * 1e3  # ms
 
 
+def make_graphed(fn, example):
+    """CUDA-graph capture of fn (static shapes, no CPU sync inside).
+
+    Returns a zero-arg replay callable. This is the P1.1 experiment from
+    v8/docs/43: naive ~= flat ~= 55ms screams launch-overhead floor, so
+    capturing the whole flat path in one graph should collapse dispatch
+    cost. If replay is still slow, the time is in the kernels themselves
+    (memory-bound gathers) and only a triton rewrite (P1.2) can help.
+    """
+    static_in = example.clone()
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        for _ in range(3):
+            fn(static_in)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fn(static_in)  # captured; output buffer owned by the graph
+    return graph.replay
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model-path", required=True)
@@ -137,24 +163,34 @@ def main():
         return out + rows.transpose(0, 1).reshape(x.shape[0], -1)
 
     print(f"{'N':>6} {'dense ms':>10} {'naive ms':>10} {'flat ms':>10} "
-          f"{'flat/dense':>11}")
+          f"{'graph ms':>10} {'graph/dense':>12}")
     verdict = []
     for N in [int(n) for n in args.Ns.split(",")]:
         x = torch.randn(N, hidden, device=device, dtype=dtype)
         d = bench(lambda: dense(x), args.iters)
         n = bench(lambda: lut_naive(x), max(10, args.iters // 10))
         f = bench(lambda: lut_flat(x), args.iters)
+        replay = make_graphed(lut_flat, x)
+        g = bench(replay, args.iters)
         ratio = f / d
-        verdict.append((N, d, n, f, ratio))
-        print(f"{N:>6} {d:>10.4f} {n:>10.4f} {f:>10.4f} {ratio:>10.2f}x")
-        del x
+        gratio = g / d
+        verdict.append((N, d, n, f, ratio, g, gratio))
+        print(f"{N:>6} {d:>10.4f} {n:>10.4f} {f:>10.4f} "
+              f"{g:>10.4f} {gratio:>11.2f}x")
+        del x, replay
         torch.cuda.empty_cache()
 
     worst = max(v[4] for v in verdict if v[0] <= 64)
+    worst_g = max(v[6] for v in verdict if v[0] <= 64)
     print(f"\n[verdict] worst flat/dense at decode sizes: {worst:.2f}x")
-    print("[verdict] route viable ONLY if a fused kernel beats 'flat' "
-          "significantly (it removes the per-level temporaries); if even "
-          "'flat' is >2x slower than dense, kernelization cannot save it.")
+    print(f"[verdict] worst graph/dense at decode sizes: {worst_g:.2f}x")
+    print("[verdict P1.1] graph~flat  => launch-bound confirmed; time is in "
+          "the kernels themselves, triton (P1.2) required.")
+    print("[verdict P1.1] graph<<flat => dispatch was the floor; LUT "
+          "execution may be production-viable without triton.")
+    print("[verdict] route viable ONLY if 'graph' (or a fused kernel) beats "
+          "'flat' significantly; if even 'graph' is >2x slower than dense, "
+          "kernelization cannot save it.")
 
 
 if __name__ == "__main__":

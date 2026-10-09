@@ -1,5 +1,11 @@
 # 15 - FFN 层数边界扫描计划（v6 → v8 eval 协议对齐；最大测点 24 层，40 层条件补测）
 
+> **状态：冻结延后至 Phase 2/3**（2026-10-08，依据 `v8/docs/42-reflection.md`）。
+> 触发条件：Phase 1（`v8/docs/43-phase1-combination-runbook.md`）出正信号。
+> 延后理由：eager LUT 未 GPU 化之前，层数质量边界无系统意义；且 on-policy
+> 扩展成本取决于 Phase 2 的 t(k) 测量，届时本计划形态可能调整（不再以
+> off-policy 扫描为主）。本文档内容冻结，三个改动脚本保留备用。
+
 > 状态：待批准。本文档是 runbook：测什么、怎么测、每步命令、时间预算、判据。
 > 前置结论（docs/41 修订版）：v6 不停。先把 FFN 替换从 3 层扩到 40 层，量出真正的
 > 质量–覆盖–存储边界，再决定 routed experts 是否另开路线。
