@@ -38,17 +38,35 @@ python v6/scripts/benchmarks/micro_lut_vs_gemm.py \
 | 1.0–2.0 | production 边际，但 teacher 成本已砍两个数量级 | P1.2 尝试 triton；P1.3 照跑拿真实系统数 |
 | > 2.0 | 时间真在 kernel 本体（memory-bound gather） | 必须 P1.2 triton；triton 也 >2× 则 Phase 1 以"组合假设未证实"结案 |
 
+**P1.1 结果（2026-10-08，已跑）**：graph capture 把 55ms 砍到 **11.2ms**
+（dense 的 **208×**）。55ms 的构成被拆开：**~44ms 是纯 dispatch**，剩 ~11ms 是
+~2600 个小 kernel 的图内执行地板（每 kernel ~4µs 时长地板）。→ 触发 P1.2。
+推论：每 token 实际计算仅 ~2k FLOPs / ~8KB 访存，11ms 纯粹是 kernel 数量问题，
+融合成个位数 kernel 后有 realistic 路径压到百 µs 以内、甚至接近 dense（53µs）。
+
 **注意**：graph 列没算输入拷贝（[N,2048] bf16 拷贝 ~µs 级，忽略）；prefill N=8192
 一行仅供参考，decode 尺寸才是判据。
 
-## P1.2 — Triton fused kernel（条件触发，天级）
+## P1.2 — Triton fused kernel（已开工，待真机数字）
 
-触发条件：P1.1 graph/dense > 1.0。目标：单 kernel 完成"树遍历 + 双级 gather"，
-消除 per-level temporaries 和随机读的有效带宽损失。decode N≤64 优先，prefill
-可走 eager/graph 混合。成功线：graph/dense ≤ 1.0；若 >2× 则全路线停，写结案文档。
+**设计（已实现，在 microbench 内）**：3 个 kernel——
+`_k_coarse`（grid (N,)，14 级树遍历 + 2048 宽行 gather）、`_k_resid`
+（grid (N,32)，16 级遍历 + 64 宽切片 gather，写 [N,2048] 的组切片）、
+`_k_add`（grid (N,)，fp32 加和转 bf16）。eager 两列 `triton ms` /
+`t_graph ms`（graph capture 后）+ 对 flat 的数值校验（atol 0.05）。
 
-设计要点（开工时再细化）：14 级 coarse 遍历 + 32×16 级 group 遍历全部 in-kernel；
-表常驻 HBM（coarse 64MiB + residual 256MiB/层，vLLM 集成时计入显存预算）。
+```bash
+python v6/scripts/benchmarks/micro_lut_vs_gemm.py \
+    --model-path /home/u/downloads/models/Qwen3.6-35B-A3B
+```
+
+成功线：`t_graph/dense ≤ 1.0` → production 可行，进 P1.3；1–2× → 边际但
+teacher 成本已崩，仍进 P1.3；>2× → 访问模式没救，Phase 1 结案。
+
+真机首跑候选报错点（本机无法验证）：triton 标量 loop-carried 变量
+（`node` 从 python int 0 起被 tensor 重赋值）在 triton 3.x 合法，但旧版
+编译器可能报 type unification 错——报错就把 `node = 0` 改成
+`node = tl.zeros((), dtype=tl.int32)`（或升级 triton）。
 
 ## P1.3 — vLLM 插件集成（天级）
 

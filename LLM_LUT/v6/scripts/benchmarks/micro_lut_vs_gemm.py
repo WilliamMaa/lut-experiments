@@ -34,6 +34,13 @@ import time
 import torch
 import torch.nn.functional as F
 
+try:
+    import triton
+    import triton.language as tl
+    HAS_TRITON = True
+except Exception:  # local box has no GPU stack; remote vllm_py310 has triton
+    HAS_TRITON = False
+
 
 def load_dims(model_path: str):
     cfg_path = os.path.join(model_path, "config.json")
@@ -94,6 +101,63 @@ def bench(fn, iters, warmup=20):
         fn()
     torch.cuda.synchronize()
     return (time.perf_counter() - t0) / iters * 1e3  # ms
+
+
+if HAS_TRITON:
+    # P1.2 (v8/docs/43): the flat path spends its 11ms graph floor on
+    # ~2600 tiny kernels (33 trees x ~16 levels x several ops).  Fusing
+    # traversal + gather into 3 kernels removes the per-kernel duration
+    # floor; per-token work is only ~2k FLOPs / ~8KB traffic.
+
+    @triton.jit
+    def _k_coarse(x_ptr, ch_ptr, w_ptr, b_ptr, tbl_ptr, out_ptr,
+                  D: tl.constexpr, DEPTH: tl.constexpr):
+        n = tl.program_id(0)
+        n_internal = (1 << DEPTH) - 1
+        node = 0
+        for _lvl in range(DEPTH):
+            sel = node * 2
+            pc = tl.minimum(sel, n_internal - 1)
+            c = tl.load(ch_ptr + pc)
+            xv = tl.load(x_ptr + n * D + c).to(tl.float32)
+            w = tl.load(w_ptr + pc)
+            b = tl.load(b_ptr + pc)
+            right = ((xv * w + b) > 0.0).to(tl.int32)
+            node = sel + 1 + right
+        leaf = node - n_internal
+        cols = tl.arange(0, D)
+        vals = tl.load(tbl_ptr + leaf * D + cols)
+        tl.store(out_ptr + n * D + cols, vals)
+
+    @triton.jit
+    def _k_resid(x_ptr, ch_ptr, w_ptr, b_ptr, tbl_ptr, out_ptr,
+                 D: tl.constexpr, CH: tl.constexpr, DEPTH: tl.constexpr):
+        n = tl.program_id(0)
+        g = tl.program_id(1)
+        n_internal = (1 << DEPTH) - 1
+        n_leaf = 1 << DEPTH
+        node = 0
+        for _lvl in range(DEPTH):
+            sel = node * 2
+            pc = tl.minimum(sel, n_internal - 1)
+            c = tl.load(ch_ptr + g * n_internal + pc)
+            xv = tl.load(x_ptr + n * D + c).to(tl.float32)
+            w = tl.load(w_ptr + g * n_internal + pc)
+            b = tl.load(b_ptr + g * n_internal + pc)
+            right = ((xv * w + b) > 0.0).to(tl.int32)
+            node = sel + 1 + right
+        leaf = node - n_internal
+        cols = tl.arange(0, CH)
+        vals = tl.load(tbl_ptr + (g * n_leaf + leaf) * CH + cols)
+        tl.store(out_ptr + n * D + g * CH + cols, vals)
+
+    @triton.jit
+    def _k_add(coarse_ptr, resid_ptr, out_ptr, D: tl.constexpr):
+        n = tl.program_id(0)
+        cols = tl.arange(0, D)
+        acc = tl.load(coarse_ptr + n * D + cols).to(tl.float32)
+        acc += tl.load(resid_ptr + n * D + cols).to(tl.float32)
+        tl.store(out_ptr + n * D + cols, acc.to(tl.bfloat16))
 
 
 def make_graphed(fn, example):
@@ -162,8 +226,35 @@ def main():
         rows = resid[torch.arange(G, device=device).unsqueeze(1), idxs]
         return out + rows.transpose(0, 1).reshape(x.shape[0], -1)
 
+    lut_triton = None
+    if HAS_TRITON:
+        coarse_ch = coarse_t.ch.to(torch.int32).contiguous()
+        coarse_w = coarse_t.w.float().contiguous()
+        coarse_b = coarse_t.b.float().contiguous()
+        resid_ch = torch.stack([t.ch for t in resid_ts]).to(torch.int32)
+        resid_ch = resid_ch.contiguous()
+        resid_w = torch.stack([t.w for t in resid_ts]).float().contiguous()
+        resid_b = torch.stack([t.b for t in resid_ts]).float().contiguous()
+
+        def lut_triton(x):
+            N = x.shape[0]
+            xc = x.contiguous()
+            coarse_out = torch.empty(N, hidden, device=x.device,
+                                     dtype=torch.float16)
+            resid_out = torch.empty(N, hidden, device=x.device,
+                                    dtype=torch.float16)
+            out = torch.empty(N, hidden, device=x.device,
+                              dtype=torch.bfloat16)
+            _k_coarse[(N,)](xc, coarse_ch, coarse_w, coarse_b, coarse,
+                            coarse_out, D=hidden, DEPTH=14)
+            _k_resid[(N, G)](xc, resid_ch, resid_w, resid_b, resid,
+                             resid_out, D=hidden, CH=CH, DEPTH=16)
+            _k_add[(N,)](coarse_out, resid_out, out, D=hidden)
+            return out
+
     print(f"{'N':>6} {'dense ms':>10} {'naive ms':>10} {'flat ms':>10} "
-          f"{'graph ms':>10} {'graph/dense':>12}")
+          f"{'graph ms':>10} {'triton ms':>10} {'t_graph':>10} "
+          f"{'tg/dense':>9}")
     verdict = []
     for N in [int(n) for n in args.Ns.split(",")]:
         x = torch.randn(N, hidden, device=device, dtype=dtype)
@@ -174,9 +265,19 @@ def main():
         g = bench(replay, args.iters)
         ratio = f / d
         gratio = g / d
-        verdict.append((N, d, n, f, ratio, g, gratio))
+        t = tg = 0.0
+        tgratio = float("nan")
+        if lut_triton is not None:
+            delta = (lut_triton(x).float()
+                     - lut_flat(x).float()).abs().max().item()
+            flag = "OK" if delta <= 0.05 else "WARNING"
+            print(f"      triton max|delta| vs flat = {delta:.5f} [{flag}]")
+            t = bench(lut_triton, args.iters)
+            tg = bench(make_graphed(lut_triton, x), args.iters)
+            tgratio = tg / d
+        verdict.append((N, d, n, f, ratio, g, gratio, t, tg, tgratio))
         print(f"{N:>6} {d:>10.4f} {n:>10.4f} {f:>10.4f} "
-              f"{g:>10.4f} {gratio:>11.2f}x")
+              f"{g:>10.4f} {t:>10.4f} {tg:>10.4f} {tgratio:>8.2f}x")
         del x, replay
         torch.cuda.empty_cache()
 
@@ -184,13 +285,27 @@ def main():
     worst_g = max(v[6] for v in verdict if v[0] <= 64)
     print(f"\n[verdict] worst flat/dense at decode sizes: {worst:.2f}x")
     print(f"[verdict] worst graph/dense at decode sizes: {worst_g:.2f}x")
+    tg_vals = [v[9] for v in verdict if v[0] <= 64 and v[9] == v[9]]
+    if tg_vals:
+        worst_tg = max(tg_vals)
+        print(f"[verdict] worst triton_graph/dense at decode sizes: "
+              f"{worst_tg:.2f}x")
+        if worst_tg <= 1.0:
+            print("[verdict P1.2] triton_graph <= dense: LUT execution is "
+                  "production-viable; go to P1.3 integration.")
+        elif worst_tg <= 2.0:
+            print("[verdict P1.2] 1-2x dense: marginal for production, but "
+                  "teacher-generation cost already collapsed; still do P1.3.")
+        else:
+            print("[verdict P1.2] >2x dense even fused: kernelization cannot "
+                  "save this access pattern; Phase 1 closes as unproven.")
+    else:
+        print("[verdict] triton not available; rerun in vllm_py310 on the "
+              "GPU box.")
     print("[verdict P1.1] graph~flat  => launch-bound confirmed; time is in "
           "the kernels themselves, triton (P1.2) required.")
     print("[verdict P1.1] graph<<flat => dispatch was the floor; LUT "
           "execution may be production-viable without triton.")
-    print("[verdict] route viable ONLY if 'graph' (or a fused kernel) beats "
-          "'flat' significantly; if even 'graph' is >2x slower than dense, "
-          "kernelization cannot save it.")
 
 
 if __name__ == "__main__":
