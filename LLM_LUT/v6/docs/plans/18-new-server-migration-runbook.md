@@ -68,6 +68,10 @@ for k in ('architectures','num_hidden_layers','num_experts','num_experts_per_tok
     print(k, '=', d.get(k))
 print('layer_types head:', (d('layer_types') or [])[:8])
 "
+
+curl -s https://hf-mirror.com/Qwen/Qwen3.635B-A3B/raw/main/config.json -o /tmp/official.json
+diff <(python -m json.tool /tmp/official.json) \
+     <(python -m json.tool /home/u/downloads/models/config.json)
 ```
 
 **下载不可用（内网机/限速）时的回退**：从老机器 rsync（断点续传）：
