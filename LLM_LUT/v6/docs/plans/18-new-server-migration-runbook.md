@@ -33,22 +33,41 @@ ls $REPO/v6/scripts/data_collection/collect_shared_expert_data.py
 conda env list                  # 应看到 lut_py310 / vllm_py310，没有则 §3 装
 ```
 
-## 2. 模型权重：没有就从老机器 rsync
+## 2. 模型权重：优先直接下载，不行再 rsync
 
-权重目录大（~70GB），用 rsync 断点续传，从老机器推到新机器：
+模型是公开的 `Qwen/Qwen3.6-35B-A3B`（bf16，~70GB），新机器能联外网就直接下载，
+比 rsync 省事（`hf` 自带断点续传）：
 
 ```bash
-# 在新机器上执行（把 $OLD 换成老机器实际 ssh 别名）：
-mkdir -p /data/mamingyu/models
-rsync -avP --exclude='*.pyc' \
-  $OLD:/home/u/downloads/models/Qwen3.6-35B-A3B/ \
-  /data/mamingyu/models/Qwen3.6-35B-A3B/
-# 传完后校验文件数与大小
-du -sh /data/mamingyu/models/Qwen3.6-35B-A3B
+# lut_py310 或 vllm_py310 里装一次下载工具
+pip install -U "huggingface_hub[hf_transfer]"
+
+# 国内网络走镜像（可选但推荐）：
+export HF_ENDPOINT=https://hf-mirror.com
+
+hf download Qwen/Qwen3.6-35B-A3B \
+  --local-dir /data/mamingyu/models/Qwen3.6-35B-A3B \
+  --local-dir-use-symlinks False
 ```
 
-> 若老机器权重在别的路径，先 `ssh $OLD 'ls -d /home/*/downloads/models/Qwen3.6-35B-A3B /data/downloads/Qwen3.6/models/Qwen3.6-35B-A3B 2>/dev/null'` 找到再改 rsync 源。
-> 传完设 `MODEL=/data/mamingyu/models/Qwen3.6-35B-A3B`。
+> ModelScope 备选（阿里云内网通常更快）：
+> `pip install modelscope && modelscope download --model Qwen/Qwen3.6-35B-A3B --local_dir /data/mamingyu/models/Qwen3.6-35B-A3B`
+
+下完校验再设路径：
+
+```bash
+du -sh /data/mamingyu/models/Qwen3.6-35B-A3B   # 应 ~70GB
+export MODEL=/data/mamingyu/models/Qwen3.6-35B-A3B
+```
+
+**下载不可用（内网机/限速）时的回退**：从老机器 rsync（断点续传）：
+
+```bash
+rsync -avP mamingyu@u:/home/u/downloads/models/Qwen3.6-35B-A3B/ \
+  /data/mamingyu/models/Qwen3.6-35B-A3B/
+```
+
+> 若老机器权重在别的路径，先 `ssh mamingyu@u 'ls -d /home/*/downloads/models/Qwen3.6-35B-A3B /data/downloads/Qwen3.6/models/Qwen3.6-35B-A3B 2>/dev/null'` 找到再改 rsync 源。
 
 ## 3. 环境：两个 conda env
 
