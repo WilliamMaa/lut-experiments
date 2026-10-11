@@ -21,10 +21,11 @@
 ```bash
 # 显卡
 nvidia-smi                      # 确认 8×A800、驱动版本、有无他人占用
-# 模型权重是否已存在（常见位置都查一遍）
+# 模型权重是否已存在（常见位置都查一遍；注意老机器权重可能没有模型名子目录，
+# 直接躺在 downloads/models/ 根下，靠里面的 config.json 辨认）
 ls -d /home/*/downloads/models/Qwen3.6-35B-A3B \
-      /data/downloads/Qwen3.6/models/Qwen3.6-35B-A3B \
-      /data/*/models/Qwen3.6-35B-A3B 2>/dev/null
+      /home/*/downloads/models \
+      /data/downloads/Qwen3.6/models/Qwen3.6-35B-A3B 2>/dev/null
 # 磁盘空间（模型 ~70GB，实验产物 ~20GB，预留 150GB+）
 df -h /data /home
 # 代码
@@ -35,7 +36,8 @@ conda env list                  # 应看到 lut_py310 / vllm_py310，没有则 �
 
 ## 2. 模型权重：优先直接下载，不行再 rsync
 
-模型是公开的 `Qwen/Qwen3.6-35B-A3B`（bf16，~70GB），新机器能联外网就直接下载，
+模型是公开的 `Qwen/Qwen3.6-35B-A3B`（bf16，~70GB，多模态 MoE：40 层 hybrid、
+256 routed expert top-8、1 个 shared expert、hidden 2048），新机器能联外网就直接下载，
 比 rsync 省事（`hf` 自带断点续传）：
 
 ```bash
@@ -58,30 +60,21 @@ hf download Qwen/Qwen3.6-35B-A3B \
 ```bash
 du -sh /data/mamingyu/models/Qwen3.6-35B-A3B   # 应 ~70GB
 export MODEL=/data/mamingyu/models/Qwen3.6-35B-A3B
-
-python -c "
-from transformers import AutoConfig
-c = AutoConfig.from_pretrained('/home/u/downloads/models/<那个目录>')
-print(type(c).__name__)
-d = c.to_dict()
-for k in ('architectures','num_hidden_layers','num_experts','num_experts_per_tok','hidden_size','intermediate_size'):
-    print(k, '=', d.get(k))
-print('layer_types head:', (d('layer_types') or [])[:8])
-"
-
-curl -s https://hf-mirror.com/Qwen/Qwen3.635B-A3B/raw/main/config.json -o /tmp/official.json
-diff <(python -m json.tool /tmp/official.json) \
-     <(python -m json.tool /home/u/downloads/models/config.json)
 ```
 
-**下载不可用（内网机/限速）时的回退**：从老机器 rsync（断点续传）：
+**下载不可用（内网机/限速）时的回退**：从老机器 rsync（断点续传）。
+注意（2026-10-10 已确认）：老机器 `mamingyu@u` 上的权重**直接放在
+`/home/u/downloads/models/` 根下，没有模型名子目录**，但该目录的
+config.json 已逐字段核对，与 Qwen3.6-35B-A3B 架构完全一致，就是本项目
+一直在用的模型。rsync 源是这个目录本身：
 
 ```bash
-rsync -avP mamingyu@u:/home/u/downloads/models/Qwen3.6-35B-A3B/ \
+rsync -avP mamingyu@u:/home/u/downloads/models/ \
   /data/mamingyu/models/Qwen3.6-35B-A3B/
 ```
 
-> 若老机器权重在别的路径，先 `ssh mamingyu@u 'ls -d /home/*/downloads/models/Qwen3.6-35B-A3B /data/downloads/Qwen3.6/models/Qwen3.6-35B-A3B 2>/dev/null'` 找到再改 rsync 源。
+> 老机器历史上还出现过 `/data/downloads/Qwen3.6/models/Qwen3.6-35B-A3B` 的
+> 写法（更早的机器），迁移时以实际 `ls` 到的为准。
 
 ## 3. 环境：两个 conda env
 
