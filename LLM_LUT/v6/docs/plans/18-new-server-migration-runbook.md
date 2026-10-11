@@ -211,7 +211,7 @@ grep -E "LUT shared_expert|KV cache size|Error|Traceback" logs/lut_l39.log
 `~/mmy/datasets/`）重跑链不依赖，但建议 rsync 到 `/data/mamingyu/` 留作对照：
 
 ```bash
-rsync -avP $OLD:'~/lut-experiments/outputs_ffn_lut_* ~/mmy/datasets ~/mmy/qwen_35b_shared_expert_l*.pt' \
+rsync -avP mamingyu@u:'~/lut-experiments/outputs_ffn_lut_* ~/mmy/datasets ~/mmy/qwen_35b_shared_expert_l*.pt' \
   /data/mamingyu/from_old/
 ```
 
