@@ -58,6 +58,16 @@ hf download Qwen/Qwen3.6-35B-A3B \
 ```bash
 du -sh /data/mamingyu/models/Qwen3.6-35B-A3B   # 应 ~70GB
 export MODEL=/data/mamingyu/models/Qwen3.6-35B-A3B
+
+python -c "
+from transformers import AutoConfig
+c = AutoConfig.from_pretrained('/home/u/downloads/models/<那个目录>')
+print(type(c).__name__)
+d = c.to_dict()
+for k in ('architectures','num_hidden_layers','num_experts','num_experts_per_tok','hidden_size','intermediate_size'):
+    print(k, '=', d.get(k))
+print('layer_types head:', (d('layer_types') or [])[:8])
+"
 ```
 
 **下载不可用（内网机/限速）时的回退**：从老机器 rsync（断点续传）：
