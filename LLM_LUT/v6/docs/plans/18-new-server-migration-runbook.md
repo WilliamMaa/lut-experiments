@@ -10,7 +10,7 @@
 ## 0. 变量约定
 
 下文 `$MODEL` = 新机器上 Qwen3.6-35B-A3B 权重目录的绝对路径（见 §2 确定），
-`$OLD` = 老机器 ssh 地址（如 `mamingyu@u`），`$REPO` = 本仓库根（含 `v6/` 的目录）。
+`$REPO` = 本仓库根（含 `v6/` 的目录）。
 
 所有 GPU 命令遵循 AGENTS.md 红线：显式指定单卡或固定卡集合，
 **严禁** `device_map="auto"`；采集用 `balanced_low_0` 前先用
