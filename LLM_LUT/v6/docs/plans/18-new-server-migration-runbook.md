@@ -101,8 +101,11 @@ pip install vllm==0.19.1 torch==2.10.0 --index-url https://download.pytorch.org/
 
 ```bash
 conda activate lut_py310
-pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu124
+pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 ```
+
+（cu124 索引最高就是 2.6.0，2.7 起官方不再发 cu124 wheel；`torch.accelerator`
+恰好是 2.6.0 引入的，满足 transformers 4.5x 的最低要求。）
 
 ## 4. 数据与 teacher 权重
 

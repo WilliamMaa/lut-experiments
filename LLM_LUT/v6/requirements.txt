@@ -16,8 +16,10 @@
 # transformers 4.5x 认识，而 4.5x 内部依赖 torch.accelerator（torch 2.6+ 才有），
 # 所以 torch 不能低于 2.6——原先钉的 2.5.1 会在 import AutoModelForCausalLM 时炸
 # AttributeError: module 'torch' has no attribute 'accelerator'。
+# 注意：PyTorch 官方站 cu124 索引最高只有 2.6.0（2.7 起不再发 cu124 wheel），
+# 所以这里钉 2.6.0 而不是更高的版本。
 
-torch==2.7.1+cu124
+torch==2.6.0+cu124
 numpy<2
 tqdm
 transformers>=4.40.0
