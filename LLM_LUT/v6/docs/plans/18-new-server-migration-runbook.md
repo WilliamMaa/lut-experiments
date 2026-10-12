@@ -82,7 +82,7 @@ rsync -avP mamingyu@u:/home/u/downloads/models/ \
 # lut_py310：训练/采集/prep 用（spec 见 v6/requirements.txt 头部注释）
 conda create -n lut_py310 python=3.10 -y
 conda activate lut_py310
-pip install -r $REPO/v6/requirements.txt \
+pip install -r v6/requirements.txt \
   --index-url https://download.pytorch.org/whl/cu124 \
   --extra-index-url https://mirrors.aliyun.com/pypi/simple/
 
@@ -103,7 +103,7 @@ pip install vllm==0.19.1 torch==2.10.0 --index-url https://download.pytorch.org/
 ```bash
 conda activate lut_py310
 mkdir -p /data/mamingyu/datasets
-python -u $REPO/v6/scripts/conversion/extract_shared_expert.py \
+python -u v6/scripts/conversion/extract_shared_expert.py \
   --model_path $MODEL \
   --layer_idx 37 --layer_idx 38 --layer_idx 39 \
   --output_path /data/mamingyu/qwen_35b_shared_expert_l37.pt \
