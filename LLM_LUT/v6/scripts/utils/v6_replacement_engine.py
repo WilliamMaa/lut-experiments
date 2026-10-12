@@ -13,7 +13,10 @@ import torch
 import torch.nn as nn
 
 import sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, "..", "..", "archive"))
+sys.path.insert(0, os.path.join(_HERE, "..", "training"))
+sys.path.insert(0, _HERE)
 from build_lut_ffn_output import AddressGreedyTree, Address2D, AddressHighOrderRandom, _TreeNode
 from build_lut_ffn_output_v3_shared_coarse import (
     AddressGreedyTree as _V3AddressGreedyTree,
