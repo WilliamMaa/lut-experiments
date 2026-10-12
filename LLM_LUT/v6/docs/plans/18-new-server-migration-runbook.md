@@ -84,7 +84,7 @@ conda create -n lut_py310 python=3.10 -y
 conda activate lut_py310
 pip install -r v6/requirements.txt \
   --index-url https://download.pytorch.org/whl/cu124 \
-  --extra-index-url https://mirrors.aliyun.com/pypi/simple/
+  --extra-index-url https://pypi.tuna.tsinghua.edu.cn/simple
 
 # vllm_py310：数值测试 + vLLM serve 用（无安装脚本，按 v8/docs/28 规格手装）
 conda create -n vllm_py310 python=3.10 -y
@@ -94,6 +94,15 @@ pip install vllm==0.19.1 torch==2.10.0 --index-url https://download.pytorch.org/
 
 验证：`python -c "import torch, vllm; print(torch.__version__, vllm.__version__)"`
 （vllm 只在 vllm_py310 里验证；driver 需 ≥ 550.90.07 同代，共享机不能动驱动。）
+
+**已装好的 lut_py310 遇到 `AttributeError: module 'torch' has no attribute
+'accelerator'`**（transformers 4.5x 需要 torch≥2.6，2026-10-10 实机踩过）：
+只升级 torch 即可，不用重建 env——
+
+```bash
+conda activate lut_py310
+pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu124
+```
 
 ## 4. 数据与 teacher 权重
 
