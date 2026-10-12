@@ -27,6 +27,10 @@ from typing import List, Dict
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+import os
+import sys
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, "..", "utils"))
 from v6_replacement_engine import V6ReplacementEngine
 
 

@@ -47,7 +47,9 @@ from tqdm import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 import sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, "..", "utils"))
+sys.path.insert(0, _HERE)
 from v6_replacement_engine import V6ReplacementEngine
 
 
