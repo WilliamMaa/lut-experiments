@@ -109,6 +109,14 @@ pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu124
 
 ## 4. 数据与 teacher 权重
 
+> **每个新终端先跑这段**（环境变量不跨 shell；老机器用第一行，新机器用第二行）：
+
+```bash
+export MODEL=/home/u/downloads/models
+# export MODEL=/data/mamingyu/models/Qwen3.6-35B-A3B   # 新机器用这行
+export REPO=~/lut-experiments/LLM_LUT                   # 改成你的 repo 路径
+```
+
 - 候选 prompt 池 `v6/candidate_prompts.jsonl`（1000 条）**已在 repo 里，不用重建**。
 - teacher 权重不拷贝，直接从模型抽（`extract_shared_expert.py` 支持一次多层）：
 
@@ -125,6 +133,8 @@ python -u v6/scripts/conversion/extract_shared_expert.py \
 ```
 
 ## 5. 重跑链（顺序执行，一律 lut_py310；采集占满圈定卡，训练只占 cuda:0，采集与训练不要并行）
+
+> 如果提示 `--model_path: expected one argument`，就是 `$MODEL` 没 export，回 §4 开头那段。
 
 ### 5.1 采 L37 数据（无替换）
 
@@ -199,6 +209,7 @@ python -u v6/scripts/conversion/convert_v3_to_v4_checkpoints.py \
 ## 6. 打包 + serve（切 vllm_py310）
 
 ```bash
+# 新终端别忘了：export MODEL=...（见 §4 开头）+ export REPO=...
 conda activate vllm_py310
 mkdir -p /data/mamingyu/lut_bundles
 for spec in \
