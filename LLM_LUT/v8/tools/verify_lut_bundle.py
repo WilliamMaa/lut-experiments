@@ -41,6 +41,10 @@ import torch
 # stub 模块，只读属性、不 import 真实训练脚本。
 class _StubModule(types.ModuleType):
     def __getattr__(self, name):
+        # 双下划线属性（如 __file__）必须正常缺失，否则 inspect 等遍历
+        # sys.modules 的标准库会把假类当文件名用（2026-10-14 实机炸过）。
+        if name.startswith("__"):
+            raise AttributeError(name)
         cls = type(name, (), {})
         setattr(self, name, cls)
         return cls
