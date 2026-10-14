@@ -126,7 +126,7 @@ python -m vllm_plugin.serve /home/u/downloads/models/Qwen3.6-35B-A3B \
 # 4. 冒烟：同 repro_concurrency 的 2-doc 小 bench + fact_acc，与 v8-only 对比
 
 curl -s http://localhost:18002/v1/chat/completions -H "Content-Type: application/json" \
-  -d '{"model":"default","messages":[{"role":"user","content":"用一句话介绍北京"}],"max_tokens":64}'
+  -d '{"model":"/home/u/downloads/models/Qwen3.6-35B-A3B","messages":[{"role":"user","content":"用一句话介绍北京"}],"max_tokens":64}'
 
 ```
 
