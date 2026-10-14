@@ -153,25 +153,17 @@ v8 + LUT×3     （L37–39）
 #   V8_COMPRESS_SLOTS（默认 512）、V8_LUT_LAYERS（"39" 或 "37 38 39"）、
 #   V8_LUT_BUNDLE_DIR。共享机 utilization 用 0.70。
 CUDA_VISIBLE_DEVICES=6,7 V8_COMPRESS_SLOTS=1024 \
-V8_LUT_LAYERS="37 38 39" V8_LUT_BUNDLE_DIR=/data/mamingyu/lut_bundles \
+V8_LUT_LAYERS="39" V8_LUT_BUNDLE_DIR=/data/mamingyu/lut_bundles \
 python -m vllm_plugin.serve /home/u/downloads/models/Qwen3.6-35B-A3B \
   --enforce-eager --no-enable-prefix-caching --max-model-len 131072 \
   --tensor-parallel-size 2 --max-num-seqs 16 --gpu-memory-utilization 0.70 \
-<<<<<<< HEAD
-  --v8-slots 1024 --port 18002
-=======
   --port 18002
->>>>>>> 2f1eb59351b27765159b5409f0373ca771fa56b6
 
 # bench（与 docs/38 同数据同并发档；--concurrency 是 bench_concurrency.py 的真实参数名）
 python tools/bench_concurrency.py --base-url http://localhost:18002 \
   --model /home/u/downloads/models/Qwen3.6-35B-A3B \
   --data data/longctx_multi_turn_65536_64docs.jsonl \
-<<<<<<< HEAD
-  --concurrency 16 --max-docs 64 --out results/phase1_39_c16.json
-=======
   --concurrency 16 --max-docs 64 --out results/phase1_l37l38l39_c16.json
->>>>>>> 2f1eb59351b27765159b5409f0373ca771fa56b6
 
 # fact_acc（v8 协议红线 ≥0.734；--model 是必填，缺了直接 argparse 报错）
 python tools/eval_longctx_server.py --base-url http://localhost:18002 \
