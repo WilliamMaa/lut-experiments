@@ -7,5 +7,7 @@ pycache/
 __pycache__/
 
 results/
+logs/*
 
 config.ini
+v8_eval_texts.jsonl
