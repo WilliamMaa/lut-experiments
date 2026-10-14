@@ -170,8 +170,10 @@ done
 # 数值测试过了再 serve（kernel vs torch reference，atol=0.05）
 python vllm_plugin/tests/test_lut_ffn.py
 
-# 起服务：完整日志落盘，别用 grep 过滤启动输出（报错会被吞）
+# 起服务：2 张卡（TP=2），用 CUDA_VISIBLE_DEVICES 圈定空闲卡（老机器约定 6,7）；
+# 完整日志落盘，别用 grep 过滤启动输出（报错会被吞）
 cd ~/lut-experiments/LLM_LUT/v8
+CUDA_VISIBLE_DEVICES=6,7 \
 V8_LUT_LAYERS=39 V8_LUT_BUNDLE_DIR=/data/mamingyu/lut_bundles \
 python -m vllm_plugin.serve /home/u/downloads/models \
   --enforce-eager --no-enable-prefix-caching --max-model-len 131072 \
