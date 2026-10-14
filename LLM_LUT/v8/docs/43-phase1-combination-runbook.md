@@ -120,7 +120,7 @@ python vllm_plugin/tests/test_lut_ffn.py
 CUDA_VISIBLE_DEVICES=6,7 V8_LUT_LAYERS=39 V8_LUT_BUNDLE_DIR=/data/mamingyu/lut_bundles \
 python -m vllm_plugin.serve /home/u/downloads/models/Qwen3.6-35B-A3B \
   --enforce-eager --no-enable-prefix-caching --max-model-len 131072 \
-  --tensor-parallel-size 2 --max-num-seqs 4 --gpu-memory-utilization 0.88 \
+  --tensor-parallel-size 2 --max-num-seqs 4 --gpu-memory-utilization 0.70 \
   --port 18002 2>&1 | tee logs/lut_l39.log | grep -E "LUT shared_expert|KV cache size"
 
 # 4. 冒烟：同 repro_concurrency 的 2-doc 小 bench + fact_acc，与 v8-only 对比
