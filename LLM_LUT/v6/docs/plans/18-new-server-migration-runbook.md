@@ -177,10 +177,16 @@ CUDA_VISIBLE_DEVICES=6,7 \
 V8_LUT_LAYERS=39 V8_LUT_BUNDLE_DIR=/data/mamingyu/lut_bundles \
 python -m vllm_plugin.serve /home/u/downloads/models \
   --enforce-eager --no-enable-prefix-caching --max-model-len 131072 \
-  --tensor-parallel-size 2 --max-num-seqs 4 --gpu-memory-utilization 0.88 \
+  --tensor-parallel-size 2 --max-num-seqs 4 --gpu-memory-utilization 0.70 \
   --port 18002 > logs/lut_l39.log 2>&1 &
 grep -E "LUT shared_expert|KV cache size|Error|Traceback" logs/lut_l39.log
 ```
+
+> **关于 0.88 → 0.70**（2026-10-14 实机踩过）：这台是共享机，邻居任务
+> （如 gemma4_infer 全卡常驻 13.3GB）显存随时涨落，0.88 要求启动瞬间
+> ~70GB/卡 全空，基本靠碰运气；0.70 = 57GB 预算，权重 ~35GB + KV ~3GB
+> 很宽裕，邻居再涨 10GB 也不死。若仍报 Free memory，先 `nvidia-smi`
+> 换最轻的两张卡，或再降到 0.6。
 
 ## 7. 验收
 
