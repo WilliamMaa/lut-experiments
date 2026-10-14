@@ -34,32 +34,29 @@ import torch
 from . import config
 
 
-def _detect_triton():
-    """True when triton imports (remote vllm_py310); False on this box.
-    A def + top-level assign (not a try/except or `if` block) so the
-    test_ast_names scanner sees HAS_TRITON from every scope."""
-    try:
-        import triton  # noqa: F401
-        import triton.language as tl  # noqa: F401
-        return True
-    except Exception:  # local box has no GPU stack
-        return False
-
-
-HAS_TRITON = _detect_triton()
+# Module-level so the @triton.jit kernels' __globals__ carry triton/tl:
+# the JIT resolves kernel-body names (tl.arange, tl.constexpr, ...) from
+# fn.__globals__ only — a function-local import is invisible there and
+# older triton (lut_py310, torch 2.6) dies with NameError('tl is not
+# defined') at compile time even though newer triton (vllm_py310) happens
+# to resolve it. Module-level try/except (not an `if` block) so the
+# test_ast_names scanner still sees all three names from every scope and
+# boxes without a GPU stack can import this module.
+try:
+    import triton
+    import triton.language as tl
+    HAS_TRITON = True
+except Exception:  # local box has no GPU stack
+    triton = None
+    tl = None
+    HAS_TRITON = False
 
 
 def _define_kernels():
     # Kernels live inside a top-level def (not a module-level `if` block)
-    # so the test_ast_names top-level-scope scanner can place them; the
-    # triton import is local for the same reason. Called (via _KERNELS)
-    # only when HAS_TRITON.
-    try:
-        import triton
-        import triton.language as tl
-    except Exception:
-        return None, None
-
+    # so the test_ast_names top-level-scope scanner can place them. They
+    # read triton/tl from module globals (see the import above) — the
+    # JIT resolves kernel-body names from fn.__globals__ only.
     @triton.jit
     def _k_leaf(x_ptr, ch_ptr, sg_ptr, thr_ptr, leaf_ptr, left_ptr,
                 right_ptr, out_ptr, D, n_max, T_out, OUT_OFF,

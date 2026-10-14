@@ -154,10 +154,12 @@ def check_file(path, rel):
                               ast.ClassDef))]
     top_stores = {}
     for top in tops:
-        # allowed = module level + everything bound anywhere inside this
-        # top-level scope (closures and sibling branches included on
-        # purpose — over-approximation, see module docstring)
-        top_stores[id(top)] = mod | BUILTIN_NAMES | subtree_stores(top)
+        # allowed = module level (incl. names bound in module-level
+        # try/except or other compound blocks) + everything bound
+        # anywhere inside this top-level scope (closures and sibling
+        # branches included on purpose — over-approximation, see module
+        # docstring)
+        top_stores[id(top)] = mod_allowed | subtree_stores(top)
 
     def allowed_for(node):
         if node is None:
