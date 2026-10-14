@@ -151,14 +151,14 @@ v8 + LUT×3     （L37–39）
 # server（LUT 配置加 --v8-lut-layers 39 或 "37 38 39"，参数名以 P1.3 实现为准）
 python -m vllm_plugin.serve /home/u/downloads/models/Qwen3.6-35B-A3B \
   --enforce-eager --no-enable-prefix-caching --max-model-len 131072 \
-  --tensor-parallel-size 2 --max-num-seqs 16 --gpu-memory-utilization 0.88 \
+  --tensor-parallel-size 2 --max-num-seqs 16 --gpu-memory-utilization 0.70 \
   --v8-slots 1024 --port 18002
 
 # bench（与 docs/38 同数据同并发档）
 python tools/bench_concurrency.py --base-url http://localhost:18002 \
   --model /home/u/downloads/models/Qwen3.6-35B-A3B \
   --data data/longctx_multi_turn_65536_64docs.jsonl \
-  --currency 16 --max-docs 64 --out results/phase1_<cfg>_c16.json
+  --concurrency 16 --max-docs 64 --out results/phase1_39_c16.json
 
 # fact_acc（v8 协议红线 ≥0.734）
 python tools/eval_longctx_server.py --base-url http://localhost:18002 \
