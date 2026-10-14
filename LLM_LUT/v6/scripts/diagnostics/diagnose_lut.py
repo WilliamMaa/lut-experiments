@@ -30,7 +30,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 import sys
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, "..", "..", "archive"))
+sys.path.insert(0, os.path.join(_HERE, "..", "training"))
+sys.path.insert(0, _HERE)
 from build_lut_ffn_output import (
     estimate_eval_files_needed,
     collect_calibration_and_eval,

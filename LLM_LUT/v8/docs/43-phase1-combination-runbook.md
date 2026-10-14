@@ -157,11 +157,7 @@ V8_LUT_LAYERS="39" V8_LUT_BUNDLE_DIR=/data/mamingyu/lut_bundles \
 python -m vllm_plugin.serve /home/u/downloads/models/Qwen3.6-35B-A3B \
   --enforce-eager --no-enable-prefix-caching --max-model-len 131072 \
   --tensor-parallel-size 2 --max-num-seqs 16 --gpu-memory-utilization 0.70 \
-<<<<<<< HEAD
-  --port 18002
-=======
   --v8-slots 1024 --port 18002
->>>>>>> 37c4240727be15ff216741884174853dc190a1eb
 
 # bench（与 docs/38 同数据同并发档；--concurrency 是 bench_concurrency.py 的真实参数名）
 python tools/bench_concurrency.py --base-url http://localhost:18002 \
