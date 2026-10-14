@@ -30,9 +30,27 @@
 import argparse
 import json
 import sys
+import types
 from pathlib import Path
 
 import torch
+
+
+# v4 checkpoint 里的树对象是 pickle，类引用指向训练脚本模块名。
+# 与 v6/scripts/conversion/prep_lut_bundle.py 同款方案：注入按需造类的
+# stub 模块，只读属性、不 import 真实训练脚本。
+class _StubModule(types.ModuleType):
+    def __getattr__(self, name):
+        cls = type(name, (), {})
+        setattr(self, name, cls)
+        return cls
+
+
+for _mod_name in ("build_lut_ffn_output_v3_shared_coarse",
+                  "build_lut_ffn_output",
+                  "build_lut_ffn_output_v3_lowrank",
+                  "build_pairwise_correction_v3"):
+    sys.modules.setdefault(_mod_name, _StubModule(_mod_name))
 
 
 def check_pack(bundle_dir: str, ckpt_root: str, layers) -> dict:
