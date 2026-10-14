@@ -122,6 +122,14 @@ def check_qual(bundle_dir, model_path, layers, device, prompt=None,
         model_path, torch_dtype=torch.bfloat16,
         device_map="balanced_low_0")
     model.eval()
+    devs: dict = {}
+    for p in model.parameters():
+        devs[str(p.device)] = devs.get(str(p.device), 0) + 1
+    print("[qual] param devices:", devs, flush=True)
+    if any("cpu" in k for k in devs):
+        print("[qual] WARNING: 部分参数在 CPU（共享机显存不够，accelerate "
+              "自动 offload）。LUT kernel 只吃 CUDA 张量，请用 "
+              "CUDA_VISIBLE_DEVICES 指定更多空卡后重跑。", flush=True)
 
     reps = {L: LutFfnReplacer(f"{bundle_dir}/layer{L}.pt", "cpu")
             for L in layers}
