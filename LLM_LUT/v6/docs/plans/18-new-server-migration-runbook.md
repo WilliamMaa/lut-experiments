@@ -188,6 +188,44 @@ grep -E "LUT shared_expert|KV cache size|Error|Traceback" logs/lut_l39.log
 > 很宽裕，邻居再涨 10GB 也不死。若仍报 Free memory，先 `nvidia-smi`
 > 换最轻的两张卡，或再降到 0.6。
 
+## 6.5 serve 起来之后（冒烟 → bench → fact_acc，依据 v8/docs/43 P1.3 第 4 步 / P1.4）
+
+**① 确认启动成功**（serve 常驻，别关终端）：
+
+```bash
+grep -E "LUT shared_expert layer 39 installed|GPU KV cache size|Uvicorn running" logs/lut_l39.log
+```
+
+**② 冒烟对话**（模型名 = 模型路径全串，404 "model does not exist" 就是名字不对；
+先 `curl -s http://localhost:18002/v1/models` 可查到准确 id）：
+
+```bash
+curl -s http://localhost:18002/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model":"/home/u/downloads/models/Qwen3.6-35B-A3B","messages":[{"role":"user","content":"用一句话介绍北京"}],"max_tokens":64}'
+```
+
+**③ bench 出数**（客户端都在 v8/ 下，serve 保持运行，另开窗口跑）：
+
+```bash
+cd ~/lut-experiments/LLM_LUT/v8
+# 数据缺失就先按 docs/43 §8.1 生成：
+# python tools/gen_longctx_multiturn.py --target-tokens 65536 --num-docs 64 \
+#   --tokenizer-path /home/u/downloads/models --out data/longctx_multi_turn_65536_64docs.jsonl
+
+python tools/bench_concurrency.py --base-url http://localhost:18002 \
+  --model /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --data data/longctx_multi_turn_65536_64docs.jsonl \
+  --currency 16 --max-docs 64 --out results/phase1_lutx1_c16.json
+
+python tools/eval_longctx_server.py --base-url http://localhost:18002 \
+  --data data/longctx_multi_turn_65536_64docs.jsonl --max-docs 16
+```
+
+**④ 看数与判据**（完整判据表在 docs/43 P1.4）：sess/h 对照 v8-only 基准
+（docs/38 的 118.4 sess/h @N=16，fact_acc 红线 ≥0.734）；硬门 = server 全程
+存活 + 0 contract raises。v8-only 对拍需另起 baseline serve
+（GPU 0,1 / 端口 18003，见 v8/tools/start_baseline.sh）。
+
 ## 7. 验收
 
 | 步骤 | 通过标准 |
@@ -197,3 +235,5 @@ grep -E "LUT shared_expert|KV cache size|Error|Traceback" logs/lut_l39.log
 | 5.3/5.6/5.9 | `*_as_v4/checkpoints/` 下 32 个 `replacement_g*.pt` |
 | 6 | 三个 bundle 各 ~626 MiB；`test_lut_ffn.py` 全 OK |
 | 6 serve | 日志出现 `LUT shared_expert layer 39 installed`；端口 18002 可访问 |
+| 6.5 ② | curl 返回通顺中文回复 |
+| 6.5 ③ | `results/phase1_lutx1_c16.json` 生成；fact_acc ≥ 0.734；server 全程存活 |
