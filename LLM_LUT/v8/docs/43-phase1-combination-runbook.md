@@ -114,7 +114,7 @@ for spec in \
 done
 
 # 2. 数值测试（kernel vs torch reference，vllm_py310）
-python vllm_plugin/tests/test_lut_ffn.py
+python v8/vllm_plugin/tests/test_lut_ffn.py
 
 # 3. 带 LUT 起 server（vllm_py310），grep 确认 "LUT shared_expert layer 39 installed"
 CUDA_VISIBLE_DEVICES=6,7 V8_LUT_LAYERS=39 V8_LUT_BUNDLE_DIR=/data/mamingyu/lut_bundles \
