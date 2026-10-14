@@ -70,38 +70,43 @@ def check_pack(bundle_dir: str, ckpt_root: str, layers) -> dict:
         if not cands:
             report[L] = {"error": f"no v4 checkpoint found for layer {L}"}
             continue
-        ck_dir = cands[0].parent
         G = bundle["num_groups"]
         E_c, E_r = (1 << bundle["coarse_num_bits"],
                     1 << bundle["residual_num_bits"])
         gs = bundle["group_size"]
-        max_tbl, max_tree = 0.0, 0
-        n_groups = 0
-        for gid in range(G):
-            ck = torch.load(ck_dir / f"replacement_g{gid}.pt",
-                            map_location="cpu", weights_only=False)
-            tables = ck["lut_tables"]
-            coarse = tables[0].reshape(E_c, gs).half()
-            resid = tables[1].reshape(E_r, gs).half()
-            max_tbl = max(max_tbl,
-                          (coarse - bundle["coarse_table"][:, gid*gs:(gid+1)*gs]).abs().max().item(),
-                          (resid - bundle["resid_table"][gid]).abs().max().item())
-            t_b = bundle["resid"]
-            n = ck["addresses"][1].node_channel_idx.shape[0]
-            for key, ck_key in (("ch", "node_channel_idx"),
-                                ("thr", "node_threshold")):
-                a = getattr(ck["addresses"][1], ck_key)
-                b = t_b[key][gid, :n]
-                if key == "thr":
-                    ok = torch.isclose(a.float(), b.float(),
-                                       rtol=1e-4, atol=1e-4,
-                                       equal_nan=True) | (a == b)
-                    max_tree = max(max_tree, int((~ok).sum()))
-                else:
-                    max_tree = max(max_tree, int((a != b).sum()))
-            n_groups += 1
-        report[L] = {"checkpoint": str(ck_dir), "groups": n_groups,
-                     "max_table_diff": max_tbl, "tree_row_mismatches": max_tree}
+        t_b = bundle["resid"]
+        entries = []
+        for c0 in cands:
+            ck_dir = c0.parent
+            max_tbl, max_tree = 0.0, 0
+            for gid in range(G):
+                ck = torch.load(ck_dir / f"replacement_g{gid}.pt",
+                                map_location="cpu", weights_only=False)
+                tables = ck["lut_tables"]
+                coarse = tables[0].reshape(E_c, gs).half()
+                resid = tables[1].reshape(E_r, gs).half()
+                max_tbl = max(max_tbl,
+                              (coarse - bundle["coarse_table"][:, gid*gs:(gid+1)*gs]).abs().max().item(),
+                              (resid - bundle["resid_table"][gid]).abs().max().item())
+                n = ck["addresses"][1].node_channel_idx.shape[0]
+                for key, ck_key in (("ch", "node_channel_idx"),
+                                    ("thr", "node_threshold")):
+                    a = getattr(ck["addresses"][1], ck_key)
+                    b = t_b[key][gid, :n]
+                    if key == "thr":
+                        ok = torch.isclose(a.float(), b.float(),
+                                           rtol=1e-4, atol=1e-4,
+                                           equal_nan=True) | (a == b)
+                        max_tree = max(max_tree, int((~ok).sum()))
+                    else:
+                        max_tree = max(max_tree, int((a != b).sum()))
+            entries.append({"checkpoint": str(ck_dir), "groups": G,
+                            "max_table_diff": max_tbl,
+                            "tree_row_mismatches": max_tree})
+        exact = [e for e in entries
+                 if e["max_table_diff"] == 0.0
+                 and e["tree_row_mismatches"] == 0]
+        report[L] = {"PASS": bool(exact), "candidates": entries}
     return report
 
 
