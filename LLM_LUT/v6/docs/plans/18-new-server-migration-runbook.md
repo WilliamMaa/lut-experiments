@@ -82,7 +82,7 @@ python -u v6/scripts/conversion/extract_shared_expert.py \
 
 ```bash
 cd ~/lut-experiments/LLM_LUT
-python -u v6/scripts/data_collection/collect_shared_expert_data.py \
+nohup python -u v6/scripts/data_collection/collect_shared_expert_data.py \
   --model_path /home/u/downloads/models --layer_idx 37 \
   --calib_file v6/candidate_prompts.jsonl \
   --output_dir /data/mamingyu/datasets/layer37_shared_expert_v3_onpolicy \
@@ -95,7 +95,7 @@ python -u v6/scripts/data_collection/collect_shared_expert_data.py \
 ### 5.2 训 L37 v3
 
 ```bash
-python -u v6/scripts/training/build_lut_ffn_output_v3_shared_coarse.py \
+nohup python -u v6/scripts/training/build_lut_ffn_output_v3_shared_coarse.py \
   --teacher_weight_path /data/mamingyu/qwen_35b_shared_expert_l37.pt \
   --dataset_dir /data/mamingyu/datasets/layer37_shared_expert_v3_onpolicy/input \
   --output_dataset_dir /data/mamingyu/datasets/layer37_shared_expert_v3_onpolicy/output \
@@ -105,7 +105,7 @@ python -u v6/scripts/training/build_lut_ffn_output_v3_shared_coarse.py \
   --calib_size 600000 --eval_size 69000 \
   --coarse_finetune_epochs 10 --residual_finetune_epochs 10 --finetune_epochs 50 \
   --finetune_loss_mode multi --device cuda:0 \
-  > train_l37.log 2>&1 &
+  > v6/logs/train_l37.log 2>&1 &
 ```
 
 token 数不足时脚本会报错，按实际把 `--calib_size`/`--eval_size` 调小（参考 collect 日志里的总 token 数）。
