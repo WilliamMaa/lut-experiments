@@ -199,21 +199,26 @@ class LutFfnReplacer:
         leaf_out = torch.empty((n, t_out), dtype=torch.int32,
                                device=x.device)
         xc = x.contiguous()
-        _k_leaf[(n, 1)](
-            xc, self._c["ch"], self._c["signs"], self._c["thr"],
-            self._c["leaf"], self._c["left"], self._c["right"],
-            leaf_out, d, self._c_n, t_out, 0,
-            DEPTH=self.coarse_num_bits)
-        _k_leaf[(n, self.num_groups)](
-            xc, self._r["ch"], self._r["signs"], self._r["thr"],
-            self._r["leaf"], self._r["left"], self._r["right"],
-            leaf_out, d, self._r_n, t_out, 1,
-            DEPTH=self.residual_num_bits)
-        out = torch.empty((n, d), dtype=torch.bfloat16, device=x.device)
-        _k_gather_add[(n,)](
-            leaf_out, self.coarse_table, self.resid_table, out,
-            d, self.group_size, self.resid_table.shape[1], t_out,
-            BLOCK=self._blocks)
+        # Triton validates pointers against the CURRENT cuda context: with
+        # the tables and x on cuda:1+ (accelerate multi-device sharding)
+        # a launch from the cuda:0 context fails with the misleading
+        # "Pointer argument ... (cpu tensor?)". Launch on x's device.
+        with torch.cuda.device(x.device):
+            _k_leaf[(n, 1)](
+                xc, self._c["ch"], self._c["signs"], self._c["thr"],
+                self._c["leaf"], self._c["left"], self._c["right"],
+                leaf_out, d, self._c_n, t_out, 0,
+                DEPTH=self.coarse_num_bits)
+            _k_leaf[(n, self.num_groups)](
+                xc, self._r["ch"], self._r["signs"], self._r["thr"],
+                self._r["leaf"], self._r["left"], self._r["right"],
+                leaf_out, d, self._r_n, t_out, 1,
+                DEPTH=self.residual_num_bits)
+            out = torch.empty((n, d), dtype=torch.bfloat16, device=x.device)
+            _k_gather_add[(n,)](
+                leaf_out, self.coarse_table, self.resid_table, out,
+                d, self.group_size, self.resid_table.shape[1], t_out,
+                BLOCK=self._blocks)
         return out
 
     # -- pure-torch reference (same padded-tree semantics) --
