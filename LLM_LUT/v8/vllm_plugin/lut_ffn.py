@@ -188,7 +188,11 @@ class LutFfnReplacer:
     def _forward2d(self, x):
         if x.device != self._device:
             self._to(x.device)
-        if not HAS_TRITON:
+        if not HAS_TRITON or not x.is_cuda:
+            # CPU tensor (e.g. accelerate multi-device hooks park
+            # cross-boundary activations on CPU) or no triton: the pure
+            # torch reference has identical padded-tree semantics
+            # (test_lut_ffn verifies kernel == reference).
             return self.forward_reference(x)
         n, d = x.shape
         t_out = 1 + self.num_groups
