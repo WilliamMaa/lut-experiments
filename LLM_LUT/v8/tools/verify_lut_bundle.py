@@ -125,41 +125,48 @@ def check_qual(bundle_dir, model_path, layers, device, prompt=None,
 
     reps = {L: LutFfnReplacer(f"{bundle_dir}/layer{L}.pt", "cpu")
             for L in layers}
-    captured = {}
+    mods = {L: model.model.layers[L].mlp.shared_expert for L in layers}
+    dense_fwd = {L: mods[L].forward for L in layers}
+    captured: dict = {}
 
     def mk_hook(L):
         def hook(mod, inp, out):
-            captured[L] = (inp[0].detach().float().cpu(),
-                           out.detach().float().cpu())
+            if L not in captured:  # 只抓第一次调用 = prefill，几百 token
+                captured[L] = (inp[0].detach().float().cpu(),
+                               out.detach().float().cpu())
         return hook
 
-    handles = []
-    for L in layers:
-        m = model.model.layers[L].mlp.shared_expert
-        handles.append(m.register_forward_hook(mk_hook(L)))
-
-    ids = tok(prompt, return_tensors="pt").to(model.device)
-    with torch.no_grad():
-        model.generate(**ids, max_new_tokens=max_new, do_sample=False)
-    for h in handles:
-        h.remove()
-
     report = {}
-    for L in layers:
+    # 公平模式（on-policy 链是逐层累积的）：测第 L 层时，只有比它浅的层
+    # 装 LUT（与训练该层时的上游分布一致），L 自身和更深的层保持 dense。
+    installed = []
+    for L in sorted(layers):
+        for L2 in layers:
+            mods[L2].forward = reps[L2] if L2 in installed else dense_fwd[L2]
+        captured.clear()
+        h = mods[L].register_forward_hook(mk_hook(L))
+        ids = tok(prompt, return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            model.generate(**ids, max_new_tokens=max_new, do_sample=False)
+        h.remove()
+        installed.append(L)
         if L not in captured:
             report[L] = {"error": "hook not fired"}
             continue
         x, y_true = captured[L]
-        y_lut = reps[L].forward_reference(x).float()
+        x2d = x.reshape(-1, x.shape[-1])
+        y2d = y_true.reshape(-1, y_true.shape[-1])
+        y_lut = reps[L].forward_reference(x2d).float()
         cos = torch.nn.functional.cosine_similarity(
-            y_true.flatten(), y_lut.flatten(), dim=0).item()
-        rel = ((y_true - y_lut).norm() / y_true.norm().clamp_min(1e-9)).item()
-        per_tok = torch.nn.functional.cosine_similarity(
-            y_true, y_lut, dim=-1)
-        report[L] = {"tokens": int(x.shape[0]),
+            y2d.flatten(), y_lut.flatten(), dim=0).item()
+        rel = ((y2d - y_lut).norm() / y2d.norm().clamp_min(1e-9)).item()
+        per_tok = torch.nn.functional.cosine_similarity(y2d, y_lut, dim=-1)
+        report[L] = {"tokens": int(x2d.shape[0]),
                      "cos": round(cos, 4), "rel_l2": round(rel, 4),
                      "cos_p10": round(per_tok.quantile(0.1).item(), 4),
                      "cos_p50": round(per_tok.median().item(), 4)}
+    for L in layers:  # 还原 dense，避免影响调用方后续使用
+        mods[L].forward = dense_fwd[L]
     return report
 
 
