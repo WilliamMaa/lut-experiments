@@ -216,7 +216,8 @@ preservation、in-flight demand aggregation；其价值分别由空间
 
 1. **PIT 正式化**：把行 7 的实验做成最干净的一组正式结果
    （补 ours 第三 rep、固定记账口径的去重 token 数），这是
-   目前最适合往论文推的一条。
+   目前最适合往论文推的一条。低成本执行路径见 **17 号**
+   （testbed v2：小模型 × vLLM × LMCache 提案）。
 2. **Replication 隔离对照**：同预算"除复制外一切相同"的严格
    对照，决定行 5 从"方向性"升级还是维持证伪。
 3. **Nearest-copy（行 6）**：多机 / 拓扑代价模拟。datacenter
