@@ -139,9 +139,15 @@ def check_qual(bundle_dir, model_path, layers, device, prompt=None,
 
     def mk_hook(L):
         def hook(mod, inp, out):
-            if L not in captured:  # 只抓第一次调用 = prefill，几百 token
-                captured[L] = (inp[0].detach().float().cpu(),
-                               out.detach().float().cpu())
+            # 累积 prefill+decode 直到采够样本（prefill 一次只有
+            # 十几 token，统计不稳）
+            if captured.get("n", 0) >= 4096:
+                return
+            x = inp[0].detach().float().cpu()
+            y = out.detach().float().cpu()
+            captured.setdefault("xs", []).append(x.reshape(-1, x.shape[-1]))
+            captured.setdefault("ys", []).append(y.reshape(-1, y.shape[-1]))
+            captured["n"] = captured.get("n", 0) + x.reshape(-1, x.shape[-1]).shape[0]
         return hook
 
     report = {}
@@ -158,10 +164,11 @@ def check_qual(bundle_dir, model_path, layers, device, prompt=None,
             model.generate(**ids, max_new_tokens=max_new, do_sample=False)
         h.remove()
         installed.append(L)
-        if L not in captured:
+        if captured.get("n", 0) == 0:
             report[L] = {"error": "hook not fired"}
             continue
-        x, y_true = captured[L]
+        x = torch.cat(captured["xs"])
+        y_true = torch.cat(captured["ys"])
         x2d = x.reshape(-1, x.shape[-1])
         y2d = y_true.reshape(-1, y_true.shape[-1])
         y_lut = reps[L].forward_reference(x2d).float()
