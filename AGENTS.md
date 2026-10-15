@@ -140,13 +140,24 @@
 均准确引用原文），短问答也全对。权重和分布在 32k 内都无辜（64k 双文档未测，但 8/512 是
 全崩不像渐变）。嫌疑转移到 serve 运行时。
 
-## 当前主嫌疑：vLLM serve 运行时
+## 当前主嫌疑：vLLM serve 运行时（2026-10-15 已定罪）
 
-同一 bundle 三层全装：HF 路径 32k QA 3/3，vLLM bench（64k 多轮）fact_acc 8/512。
-下一步对照：起 serve（0.70、CUDA_VISIBLE_DEVICES=6,7、layers 37 38 39），用
-eval_longctx_server.py --max-docs 2 跑同协议。serve 也全错 → 审计 vllm_plugin 运行时：
-triton kernel 在 vllm_py310（新 triton + bf16 流）、TP all-reduce 只有 rank0 出 LUT 的路径、
-serve 端 bundle 加载是否有警告。
+同一 bundle 三层全装：HF 路径 32k QA 3/3，vLLM serve（64k 多轮）**0/16**。
+关键推理：**0/16 是主动投毒不是 dense 回退**——插件失败会静默保持 dense（WARNING），
+dense 输出是 baseline 质量（~0.734），不可能 0/16。所以 LUT 确实装着、确实在跑、跑得很错。
+kernel 基本排除：test_lut_ffn 在 vllm_py310 下验证过 kernel ≡ reference（但那是小 n）。
+
+投毒两类假设：
+- **A. 与长度无关**：TP rank0 方案不成立（shared_expert 输出没被 all-reduce → rank 间状态分叉；
+  或 is_tp_rank0() 两 rank 都 True → all-reduce 后翻倍）。
+- **B. 与长度有关**：kernel 在 serve 大 n（64k prefill 一次前向几万 token）下有 bug，HF 只测到 32k。
+
+定位靠实测不靠猜（probe 猜类别已废弃）：
+1. **对照组**（控制实验，必须先做）：`bash tools/serve_debug.sh baseline 18004 "4,5"` 起无 LUT serve，
+   eval --max-docs 1。到不了 ~0.73 → LUT 从头到尾无辜，之前全白测。
+2. **插桩组**：`bash tools/serve_debug.sh lut 18002 "6,7"`（V8_LUT_DEBUG=1，插件前 4 次调用对真实
+   输入同时算 dense(x) 和 LUT(x)）。`grep v8_debug logs/serve_lut_debug.log` 拿逐层 rank cos：
+   cos ≈ HF 的 0.75~0.85 → LUT 给定输入是对的，毒在 rank 方案/下游；cos ≈ 0 → 输入/kernel 现形。
 
 ## 教训（时间红线）
 

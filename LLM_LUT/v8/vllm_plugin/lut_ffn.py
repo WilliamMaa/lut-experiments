@@ -334,27 +334,72 @@ def _find_layer_index(module, args, kwargs):
     return None
 
 
+def _tp_rank_and_world():
+    """(rank, world_size), (0, 1) when vllm/TP unavailable."""
+    try:
+        from vllm.distributed import parallel_state
+        r = parallel_state.get_tensor_model_parallel_rank()
+        w = parallel_state.get_tensor_model_parallel_world_size()
+        return int(r), int(w)
+    except Exception:
+        return 0, 1
+
+
+def is_tp_rank0():
+    """True on TP rank 0 (or when vllm/TP is unavailable)."""
+    return _tp_rank_and_world()[0] == 0
+
+
 def _install_lut(module, layer_idx, replacer):
     shared = module.shared_expert
+    orig_forward = shared.forward
     # Non-persistent buffers: ride .to(device), stay out of state_dict
     # (load_weights never touches them), counted in non-KV memory.
     shared.register_buffer("v8_lut_coarse_table", replacer.coarse_table,
                            persistent=False)
     shared.register_buffer("v8_lut_resid_table", replacer.resid_table,
                            persistent=False)
-    rank0 = is_tp_rank0()
+    rank, world = _tp_rank_and_world()
+    rank0 = rank == 0
+    # V8_LUT_DEBUG=1: 对真实输入同时算 dense(x) 和 LUT(x)，打印逐层对比。
+    # 这是 serve 运行时的 qual：HF 参照系 cos 0.75~0.85；serve 里明显更烂 =
+    # 输入/kernel 问题；cos 正常但模型输出仍炸 = 毒在 rank 方案/下游。
+    debug = os.environ.get("V8_LUT_DEBUG", "") not in ("", "0")
+    calls = {"n": 0}
 
-    def lut_forward(x, _rep=replacer, _rank0=rank0):
+    def lut_forward(x, _rep=replacer, _rank0=rank0, _layer=layer_idx,
+                    _rank=rank, _world=world):
         # SharedFusedMoE all-reduces the shared output across TP ranks:
         # only rank 0 contributes the LUT result, the rest contribute
         # zeros so the post-reduce sum equals the single-rank output.
+        if debug and calls["n"] < 4:
+            calls["n"] += 1
+            try:
+                with torch.no_grad():
+                    yd = orig_forward(x).float()
+                    yl = (_rep(x) if _rank0
+                          else torch.zeros_like(x)).float()
+                    cos = torch.nn.functional.cosine_similarity(
+                        yd.flatten(), yl.flatten(), dim=0).item()
+                    rel = ((yd - yl).norm()
+                           / yd.norm().clamp_min(1e-9)).item()
+                    print(f"[v8_debug] layer={_layer} rank={_rank}/"
+                          f"{_world} call={calls['n']} "
+                          f"x={tuple(x.shape)} {x.dtype} dev={x.device} "
+                          f"cos={cos:.4f} rel={rel:.4f} "
+                          f"|yd|={yd.norm().item():.3f} "
+                          f"|yl|={yl.norm().item():.3f}", flush=True)
+            except Exception as e:
+                print(f"[v8_debug] layer={_layer} compare failed: "
+                      f"{type(e).__name__}: {e}", flush=True)
         if not _rank0:
             return torch.zeros_like(x)
         return _rep(x)
 
     shared.forward = lut_forward
     print(f"[v8_plugin] LUT shared_expert layer {layer_idx} installed "
-          f"(bundle layer{layer_idx}.pt)", flush=True)
+          f"(bundle layer{layer_idx}.pt, rank {rank}/{world})",
+          flush=True)
 
 
 def patch_shared_expert_lut(layers):

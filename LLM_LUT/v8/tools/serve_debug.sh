@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# serve_debug.sh — LUT serve 定位实验（对照 + 插桩，问题记录见 AGENTS.md）。
+#
+#   bash tools/serve_debug.sh baseline 18004 "4,5" > logs/serve_baseline.log 2>&1 &
+#       对照组：不带 LUT，eval 必须 ~0.73+，否则 LUT 从头到尾无辜
+#   bash tools/serve_debug.sh lut 18002 "6,7" > logs/serve_lut_debug.log 2>&1 &
+#       实验组：LUT 37 38 39 + V8_LUT_DEBUG（逐层 dense vs LUT 实测对比）
+set -eu
+MODE=$1
+PORT=$2
+GPUS=$3
+
+if [ "$MODE" = "lut" ]; then
+  export V8_LUT_LAYERS="37 38 39"
+  export V8_LUT_BUNDLE_DIR=/data/mamingyu/lut_bundles
+  export V8_LUT_DEBUG=1
+elif [ "$MODE" != "baseline" ]; then
+  echo "usage: serve_debug.sh {baseline|lut} PORT GPUS" >&2
+  exit 1
+fi
+
+CUDA_VISIBLE_DEVICES=$GPUS python -m vllm_plugin.serve \
+  /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --enforce-eager --no-enable-prefix-caching --max-model-len 131072 \
+  --tensor-parallel-size 2 --max-num-seqs 4 --gpu-memory-utilization 0.70 \
+  --port "$PORT"
