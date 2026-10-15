@@ -135,10 +135,18 @@
 
 ## 待验证的假设（用户的）
 
-**LUT 校准/训练用的 prompt 分布 vs bench 实际 prompt 分布错位**（长短不匹配）。
-验证实验只有一个：`verify_lut_bundle.py gen --max_new 2000`（短 + 32k 长文档多轮，
-dense vs 全装 LUT 平行对比，人眼看答案）。短好长烂 → 分布假设成立，做长短分表/补校准数据；
-短的就烂 → 表本身 fidelity 问题，回训练侧。
+~~LUT 校准/训练用的 prompt 分布 vs bench 实际 prompt 分布错位。~~
+**2026-10-15 被 gen 实验否掉**：32k 长文档×3 轮 QA，LUT 三轮全对（19千万元/王丽芳/30天，
+均准确引用原文），短问答也全对。权重和分布在 32k 内都无辜（64k 双文档未测，但 8/512 是
+全崩不像渐变）。嫌疑转移到 serve 运行时。
+
+## 当前主嫌疑：vLLM serve 运行时
+
+同一 bundle 三层全装：HF 路径 32k QA 3/3，vLLM bench（64k 多轮）fact_acc 8/512。
+下一步对照：起 serve（0.70、CUDA_VISIBLE_DEVICES=6,7、layers 37 38 39），用
+eval_longctx_server.py --max-docs 2 跑同协议。serve 也全错 → 审计 vllm_plugin 运行时：
+triton kernel 在 vllm_py310（新 triton + bf16 流）、TP all-reduce 只有 rank0 出 LUT 的路径、
+serve 端 bundle 加载是否有警告。
 
 ## 教训（时间红线）
 
