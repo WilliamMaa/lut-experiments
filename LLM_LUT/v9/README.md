@@ -36,7 +36,7 @@ v6 旧法成本 ≈ N × 完整 generate；本方案 ≈ 1 × 原始 pass + 各�
 ```bash
 python v6/scripts/conversion/extract_shared_expert.py \
   --model_path /data/mamingyu/models/Qwen3.6-35B-A3B \
-  --layer_idx 37 --output_path /data/mamingyu/utputs/v9_teacher/teacher_l37.pt \
+  --layer_idx 37 --output_path /data/mamingyu/outputs/v9_teacher/teacher_l37.pt \
   --layer_idx 38 --output_path /data/mamingyu/outputs/v9_teacher/teacher_l38.pt \
   --layer_idx 39 --output_path /data/mamingyu/outputs/v9_teacher/teacher_l39.pt
 ```
