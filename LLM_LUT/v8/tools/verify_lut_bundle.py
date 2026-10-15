@@ -213,37 +213,28 @@ def check_gen(bundle_dir, model_path, layers, data=None, max_new=192,
         device_map="balanced_low_0")
     model.eval()
 
-    def build_msgs(doc, questions, budget):
+    def render(msgs):
+        text = tok.apply_chat_template(
+            [{"role": m["role"],
+              "content": [{"type": "text", "text": m["content"]}]}
+             for m in msgs],
+            tokenize=False, add_generation_prompt=True,
+            chat_template_kwargs={"enable_thinking": False})
+        if "/no_think" not in text:
+            print("[gen] WARNING: 模板输出里没有 /no_think，"
+                  "enable_thinking=False 可能没生效", flush=True)
+        return text
+
+    def gen(doc, questions, max_new):
         """复刻 bench 协议（eval_longctx_server.py）：user 文档 →
-        assistant 确认 → 逐题 user 提问；enable_thinking=False。"""
-        d_ids = tok(doc).input_ids
-        if len(d_ids) > budget:
-            doc = tok.decode(d_ids[:budget])
-        return [{"role": "user", "content": doc},
-                {"role": "assistant", "content": "好的，我已读完。"},
-                *([{"role": "user", "content": q}
-                   for q in questions])]
-
-    def gen(messages, max_new, n_turns):
-        """从 messages 末尾开始逐轮生成（多轮：把生成结果塞回
-        assistant 再继续），返回各轮输出列表。"""
+        assistant 确认 → 逐题 user 提问，答案塞回 assistant 继续。
+        返回各轮输出列表。"""
+        msgs = ([{"role": "user", "content": doc}] if doc else []) + [
+            {"role": "assistant", "content": "好的，我已读完。"}]
         outs = []
-        tail = messages[-n_turns:]
-        msgs = list(messages[:-n_turns])
-
-        def as_parts(ms):
-            # 该模型 chat template 只收结构化 content（vLLM 服务端
-            # 会自动把 string 转成 parts，HF 这里要手动转）
-            return [{"role": m["role"],
-                     "content": [{"type": "text", "text": m["content"]}]}
-                    for m in ms]
-
-        for t in range(n_turns):
-            msgs = msgs + [{"role": "user", "content": tail[t]}]
-            text = tok.apply_chat_template(
-                as_parts(msgs), tokenize=False, add_generation_prompt=True,
-                chat_template_kwargs={"enable_thinking": False})
-            ids = tok(text, return_tensors="pt").to(model.device)
+        for q in questions:
+            ids = tok(render(msgs + [{"role": "user", "content": q}]),
+                      return_tensors="pt").to(model.device)
             with torch.no_grad():
                 out = model.generate(
                     input_ids=ids["input_ids"],
@@ -252,7 +243,8 @@ def check_gen(bundle_dir, model_path, layers, data=None, max_new=192,
             ans = tok.decode(out[0][ids["input_ids"].shape[1]:],
                              skip_special_tokens=True)
             outs.append(ans)
-            msgs = msgs + [{"role": "assistant", "content": ans}]
+            msgs = msgs + [{"role": "user", "content": q},
+                           {"role": "assistant", "content": ans}]
         return outs
 
     reps = {L: LutFfnReplacer(f"{bundle_dir}/layer{L}.pt", "cpu")
@@ -260,32 +252,32 @@ def check_gen(bundle_dir, model_path, layers, data=None, max_new=192,
     mods = {L: model.model.layers[L].mlp.shared_expert for L in layers}
     dense_fwd = {L: mods[L].forward for L in layers}
 
-    sessions = [("short", build_msgs("", [q], 0)[2:]) for q in short_prompts]
+    sessions = [("short", None, [q]) for q in short_prompts]
     if data and os.path.exists(data):
         with open(data) as f:
             for i, line in enumerate(f):
                 if i >= 1:
                     break
                 rec = json.loads(line)
-                sessions.append(("long", build_msgs(
-                    rec["document"], rec["questions"][:3],
-                    max_prompt_tokens)))
+                doc = rec["document"]
+                d_ids = tok(doc).input_ids
+                if len(d_ids) > max_prompt_tokens:
+                    doc = tok.decode(d_ids[:max_prompt_tokens])
+                sessions.append(("long", doc, rec["questions"][:3]))
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as fo:
-        for tag, msgs in sessions:
-            n_turns = len(msgs) if tag == "long" else 1
-            q = msgs[-1]["content"]
-            fo.write(f"\n{'='*72}\n[{tag}] turns={n_turns}\n"
-                     f"QUESTION: {q}\n{'-'*72}\n")
+        for tag, doc, questions in sessions:
+            fo.write(f"\n{'='*72}\n[{tag}] turns={len(questions)}\n"
+                     f"QUESTIONS: {questions[:2]}...\n{'-'*72}\n")
             print(f"[gen] {tag} dense...", flush=True)
-            dense_outs = gen(msgs, max_new, n_turns)
+            dense_outs = gen(doc, questions, max_new)
             for t, o in enumerate(dense_outs):
                 fo.write(f"DENSE turn{t}:\n{o}\n{'-'*72}\n")
             for L in layers:
                 mods[L].forward = reps[L]
             print(f"[gen] {tag} LUT{layers}...", flush=True)
-            lut_outs = gen(msgs, max_new, n_turns)
+            lut_outs = gen(doc, questions, max_new)
             for t, o in enumerate(lut_outs):
                 fo.write(f"LUT turn{t}:\n{o}\n{'='*72}\n")
             for L in layers:
