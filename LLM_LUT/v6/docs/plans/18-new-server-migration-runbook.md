@@ -125,8 +125,16 @@ python -u v6/scripts/conversion/convert_v3_to_v4_checkpoints.py \
 `collect_l38.log`，并追加：
 
 ```bash
+nohup python -u v6/scripts/data_collection/collect_shared_expert_data.py \
+  --model_path /home/u/downloads/models --layer_idx 38 \
+  --calib_file v6/candidate_prompts.jsonl \
+  --output_dir /data/mamingyu/datasets/layer38_shared_expert_v3_onpolicy \
+  --max_prompts 1000 --max_tokens_per_prompt 512 --max_new_tokens 512 \
+  --max_total_tokens 1200000 \
+  --device_map balanced_low_0 --torch_dtype bfloat16 \
   --replace_layer_idx 37 \
-  --replace_checkpoint_dir /data/mamingyu/outputs_ffn_lut_layer37_shared_expert_v3_onpolicy_as_v4/checkpoints
+  --replace_checkpoint_dir /data/mamingyu/outputs_ffn_lut_layer37_shared_expert_v3_onpolicy_as_v4/checkpoints \
+  > logs/collect_l38.log 2>&1 &
 ```
 
 ### 5.5 训 L38 v3 → 5.6 转 L38 v4
