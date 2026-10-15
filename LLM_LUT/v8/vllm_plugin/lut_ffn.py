@@ -366,13 +366,14 @@ def _install_lut(module, layer_idx, replacer):
     # 输入/kernel 问题；cos 正常但模型输出仍炸 = 毒在 rank 方案/下游。
     debug = os.environ.get("V8_LUT_DEBUG", "") not in ("", "0")
     calls = {"n": 0}
+    DBG_CAP = 64  # profile 会烧掉前几次 dummy 调用，留足额度等真实流量
 
     def lut_forward(x, _rep=replacer, _rank0=rank0, _layer=layer_idx,
                     _rank=rank, _world=world):
         # SharedFusedMoE all-reduces the shared output across TP ranks:
         # only rank 0 contributes the LUT result, the rest contribute
         # zeros so the post-reduce sum equals the single-rank output.
-        if debug and calls["n"] < 4:
+        if debug and calls["n"] < DBG_CAP:
             calls["n"] += 1
             try:
                 with torch.no_grad():
@@ -383,9 +384,12 @@ def _install_lut(module, layer_idx, replacer):
                         yd.flatten(), yl.flatten(), dim=0).item()
                     rel = ((yd - yl).norm()
                            / yd.norm().clamp_min(1e-9)).item()
-                    print(f"[v8_debug] layer={_layer} rank={_rank}/"
+                    import datetime
+                    ts = datetime.datetime.now().strftime("%H:%M:%S")
+                    print(f"[v8_debug] {ts} layer={_layer} rank={_rank}/"
                           f"{_world} call={calls['n']} "
-                          f"x={tuple(x.shape)} {x.dtype} dev={x.device} "
+                          f"x={tuple(x.shape)} |x|={x.float().norm():.2f} "
+                          f"{x.dtype} dev={x.device} "
                           f"cos={cos:.4f} rel={rel:.4f} "
                           f"|yd|={yd.norm().item():.3f} "
                           f"|yl|={yl.norm().item():.3f}", flush=True)

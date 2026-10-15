@@ -153,8 +153,7 @@ kernel 基本排除：test_lut_ffn 在 vllm_py310 下验证过 kernel ≡ refere
 - **B. 与长度有关**：kernel 在 serve 大 n（64k prefill 一次前向几万 token）下有 bug，HF 只测到 32k。
 
 定位靠实测不靠猜（probe 猜类别已废弃）：
-1. **对照组**（控制实验，必须先做）：`bash tools/serve_debug.sh baseline 18004 "4,5"` 起无 LUT serve，
-   eval --max-docs 1。到不了 ~0.73 → LUT 从头到尾无辜，之前全白测。
+1. ~~对照组~~ **跳过**：0.734 红线就是这套 eval 在 baseline serve 上的实测值，对照已存在。
 2. **插桩组**：`bash tools/serve_debug.sh lut 18002 "6,7"`（V8_LUT_DEBUG=1，插件前 4 次调用对真实
    输入同时算 dense(x) 和 LUT(x)）。`grep v8_debug logs/serve_lut_debug.log` 拿逐层 rank cos：
    cos ≈ HF 的 0.75~0.85 → LUT 给定输入是对的，毒在 rank 方案/下游；cos ≈ 0 → 输入/kernel 现形。
