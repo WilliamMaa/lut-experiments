@@ -378,21 +378,47 @@ def _install_lut(module, layer_idx, replacer):
             try:
                 with torch.no_grad():
                     yd = orig_forward(x).float()
-                    yl = (_rep(x) if _rank0
-                          else torch.zeros_like(x)).float()
-                    cos = torch.nn.functional.cosine_similarity(
-                        yd.flatten(), yl.flatten(), dim=0).item()
-                    rel = ((yd - yl).norm()
-                           / yd.norm().clamp_min(1e-9)).item()
+                    # v2: yd is this rank's TP partial (row-parallel
+                    # down_proj shard), NOT the full dense output.
+                    # All-reduce it so rank 0's cos/ratio compare the
+                    # full-width LUT against the full-width dense —
+                    # v1 compared shard vs full and misread by ~2x.
+                    # Collective: executed identically on every rank.
+                    yd_full = yd
+                    if _world > 1:
+                        from vllm.distributed import (
+                            tensor_model_parallel_all_reduce)
+                        yd_full = tensor_model_parallel_all_reduce(
+                            yd.clone())
                     import datetime
                     ts = datetime.datetime.now().strftime("%H:%M:%S")
-                    print(f"[v8_debug] {ts} layer={_layer} rank={_rank}/"
-                          f"{_world} call={calls['n']} "
-                          f"x={tuple(x.shape)} |x|={x.float().norm():.2f} "
-                          f"{x.dtype} dev={x.device} "
-                          f"cos={cos:.4f} rel={rel:.4f} "
-                          f"|yd|={yd.norm().item():.3f} "
-                          f"|yl|={yl.norm().item():.3f}", flush=True)
+                    if _rank0:
+                        yl = _rep(x).float()
+                        cos = torch.nn.functional.cosine_similarity(
+                            yl.flatten(), yd_full.flatten(), dim=0).item()
+                        rel = ((yl - yd_full).norm()
+                               / yd_full.norm().clamp_min(1e-9)).item()
+                        ratio = (yl.norm()
+                                 / yd_full.norm().clamp_min(1e-9)).item()
+                        print(f"[v8_debug] {ts} layer={_layer} "
+                              f"rank={_rank}/{_world} call={calls['n']} "
+                              f"x={tuple(x.shape)} "
+                              f"|x|={x.float().norm():.2f} "
+                              f"{x.dtype} dev={x.device} "
+                              f"cos={cos:.4f} rel={rel:.4f} "
+                              f"ratio={ratio:.4f} "
+                              f"|yl|={yl.norm().item():.3f} "
+                              f"|ydf|={yd_full.norm().item():.3f}",
+                              flush=True)
+                    else:
+                        print(f"[v8_debug] {ts} layer={_layer} "
+                              f"rank={_rank}/{_world} call={calls['n']} "
+                              f"x={tuple(x.shape)} "
+                              f"|x|={x.float().norm():.2f} "
+                              f"{x.dtype} dev={x.device} "
+                              f"|yd|={yd.norm().item():.3f} "
+                              f"|ydf|={yd_full.norm().item():.3f}",
+                              flush=True)
             except Exception as e:
                 print(f"[v8_debug] layer={_layer} compare failed: "
                       f"{type(e).__name__}: {e}", flush=True)
