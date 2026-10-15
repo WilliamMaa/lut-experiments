@@ -230,10 +230,18 @@ def check_gen(bundle_dir, model_path, layers, data=None, max_new=192,
         outs = []
         tail = messages[-n_turns:]
         msgs = list(messages[:-n_turns])
+
+        def as_parts(ms):
+            # 该模型 chat template 只收结构化 content（vLLM 服务端
+            # 会自动把 string 转成 parts，HF 这里要手动转）
+            return [{"role": m["role"],
+                     "content": [{"type": "text", "text": m["content"]}]}
+                    for m in ms]
+
         for t in range(n_turns):
             msgs = msgs + [{"role": "user", "content": tail[t]}]
             text = tok.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=True,
+                as_parts(msgs), tokenize=False, add_generation_prompt=True,
                 chat_template_kwargs={"enable_thinking": False})
             ids = tok(text, return_tensors="pt").to(model.device)
             with torch.no_grad():
