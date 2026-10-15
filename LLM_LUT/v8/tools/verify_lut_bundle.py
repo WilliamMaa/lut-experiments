@@ -185,22 +185,91 @@ def check_qual(bundle_dir, model_path, layers, device, prompt=None,
     return report
 
 
+def check_gen(bundle_dir, model_path, layers, data=None, max_new=128,
+              max_prompt_tokens=8192, out_path="logs/gen_compare.txt"):
+    """同一批 prompt（短→长）各生成两遍：dense 一遍、全装 LUT 一遍，
+    输出写文件人工对比。这才是判据（cos 只是代理指标）。"""
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from vllm_plugin.lut_ffn import LutFfnReplacer
+
+    short_prompts = [
+        "请用一句话解释什么是存算一体芯片。",
+        "明朝灭亡的主要原因是什么？请简要回答。",
+    ]
+    long_prompts = []
+    if data and os.path.exists(data):
+        with open(data) as f:
+            for i, line in enumerate(f):
+                if i >= 2:
+                    break
+                rec = json.loads(line)
+                long_prompts.append(
+                    rec["document"] + "\n\n问题：" + rec["questions"][0])
+    prompts = [("short", p) for p in short_prompts] + \
+              [("long", p) for p in long_prompts]
+
+    tok = AutoTokenizer.from_pretrained(model_path)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_path, torch_dtype=torch.bfloat16,
+        device_map="balanced_low_0")
+    model.eval()
+
+    reps = {L: LutFfnReplacer(f"{bundle_dir}/layer{L}.pt", "cpu")
+            for L in layers}
+    mods = {L: model.model.layers[L].mlp.shared_expert for L in layers}
+    dense_fwd = {L: mods[L].forward for L in layers}
+
+    def gen(prompt):
+        ids = tok(prompt, return_tensors="pt").to(model.device)
+        ids = ids["input_ids"][:, :max_prompt_tokens]
+        with torch.no_grad():
+            out = model.generate(
+                input_ids=ids, max_new_tokens=max_new, do_sample=False)
+        return tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as fo:
+        for tag, prompt in prompts:
+            plen = len(tok(prompt).input_ids)
+            fo.write(f"\n{'='*72}\n[{tag}] prompt_tokens={plen}\n"
+                     f"PROMPT 末尾: ...{prompt[-200:]}\n{'-'*72}\n")
+            print(f"[gen] {tag} prompt_tokens={plen} dense...", flush=True)
+            fo.write(f"DENSE:\n{gen(prompt)}\n{'-'*72}\n")
+            for L in layers:
+                mods[L].forward = reps[L]
+            print(f"[gen] {tag} prompt_tokens={plen} LUT{layers}...",
+                  flush=True)
+            fo.write(f"LUT {layers}:\n{gen(prompt)}\n")
+            for L in layers:
+                mods[L].forward = dense_fwd[L]
+    return {"out": out_path, "prompts": len(prompts)}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("mode", choices=["pack", "qual"])
+    ap.add_argument("mode", choices=["pack", "qual", "gen"])
     ap.add_argument("--bundle_dir", required=True)
     ap.add_argument("--ckpt_root", default="/data/mamingyu")
     ap.add_argument("--model_path", default="/home/u/downloads/models")
     ap.add_argument("--layers", default="37 38 39")
     ap.add_argument("--device", default="cuda:0")
+    ap.add_argument("--data", default=None,
+                    help="gen: 长 prompt 来源 jsonl（document+questions）")
+    ap.add_argument("--max_new", type=int, default=128)
+    ap.add_argument("--out", default="logs/gen_compare.txt")
     args = ap.parse_args()
     layers = [int(t) for t in args.layers.replace(",", " ").split()]
 
     if args.mode == "pack":
         rep = check_pack(args.bundle_dir, args.ckpt_root, layers)
-    else:
+    elif args.mode == "qual":
         rep = check_qual(args.bundle_dir, args.model_path, layers,
                          args.device)
+    else:
+        rep = check_gen(args.bundle_dir, args.model_path, layers,
+                        data=args.data, max_new=args.max_new,
+                        out_path=args.out)
     print(json.dumps(rep, indent=2, ensure_ascii=False))
 
 
