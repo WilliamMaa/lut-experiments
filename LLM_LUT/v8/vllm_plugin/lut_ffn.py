@@ -400,6 +400,10 @@ def _install_lut(module, layer_idx, replacer):
                                / yd_full.norm().clamp_min(1e-9)).item()
                         ratio = (yl.norm()
                                  / yd_full.norm().clamp_min(1e-9)).item()
+                        pt = " ".join(
+                            f"r{i}:yl={yl[j].norm():.2f}/ydf="
+                            f"{yd_full[j].norm():.2f}"
+                            for i, j in enumerate(range(min(2, yl.shape[0]))))
                         print(f"[v8_debug] {ts} layer={_layer} "
                               f"rank={_rank}/{_world} call={calls['n']} "
                               f"x={tuple(x.shape)} "
@@ -408,8 +412,8 @@ def _install_lut(module, layer_idx, replacer):
                               f"cos={cos:.4f} rel={rel:.4f} "
                               f"ratio={ratio:.4f} "
                               f"|yl|={yl.norm().item():.3f} "
-                              f"|ydf|={yd_full.norm().item():.3f}",
-                              flush=True)
+                              f"|ydf|={yd_full.norm().item():.3f} "
+                              f"pt={pt}", flush=True)
                     else:
                         print(f"[v8_debug] {ts} layer={_layer} "
                               f"rank={_rank}/{_world} call={calls['n']} "
