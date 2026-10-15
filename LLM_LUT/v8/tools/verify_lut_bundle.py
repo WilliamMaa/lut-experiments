@@ -214,21 +214,13 @@ def check_gen(bundle_dir, model_path, layers, data=None, max_new=192,
     model.eval()
 
     def render(msgs):
-        text = tok.apply_chat_template(
+        # 保留思考（思考是模型的一部分，dense/LUT 平行对比同样有效）；
+        # bench 协议的 enable_thinking=False 只影响服务端评测口径
+        return tok.apply_chat_template(
             [{"role": m["role"],
               "content": [{"type": "text", "text": m["content"]}]}
              for m in msgs],
-            tokenize=False, add_generation_prompt=True,
-            chat_template_kwargs={"enable_thinking": False})
-        if "/no_think" not in text:
-            # chat_template_kwargs 在该 transformers 版本没生效时，
-            # 手动插 /no_think（vLLM enable_thinking=False 同款做法）
-            marker = "<|im_start|>assistant"
-            idx = text.rfind(marker)
-            if idx != -1:
-                end = idx + len(marker)
-                text = text[:end] + "\n/no_think" + text[end:]
-        return text
+            tokenize=False, add_generation_prompt=True)
 
     def gen(doc, questions, max_new):
         """复刻 bench 协议（eval_longctx_server.py）：user 文档 →
