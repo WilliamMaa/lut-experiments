@@ -64,6 +64,19 @@ for name, dense_norm in LAYERS:
         n = y.norm(dim=-1)
         print(f"    {os.path.basename(f)}: rows={y.shape[0]} "
               f"|y| mean={n.mean():.1f} p10={n.quantile(0.1):.1f} p90={n.quantile(0.9):.1f}")
+    # 关键对照：训练数据 x 的行 norm vs serve 实测 |x|/token
+    # （serve Frobenius |x| / sqrt(8192)，L37~60、L38~56、L39~50）
+    ins = sorted(glob.glob(os.path.join(os.path.dirname(meta), "input", "*.pt")))
+    if not ins:
+        ins = sorted(glob.glob(os.path.join(os.path.dirname(meta), "*x*.pt")))
+    for f in ins[:2]:
+        x = torch.load(f, map_location="cpu", weights_only=True)
+        x = x.float()
+        if x.dim() == 3:
+            x = x.reshape(-1, x.shape[-1])
+        n = x.norm(dim=-1)
+        print(f"    input {os.path.basename(f)}: rows={x.shape[0]} "
+              f"|x| mean={n.mean():.1f} p10={n.quantile(0.1):.1f} p90={n.quantile(0.9):.1f}")
 
 # bundle 表行 norm（与上面 dataset norm 对比）
 print("\n=== bundle coarse_table row norms ===")
