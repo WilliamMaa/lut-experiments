@@ -194,8 +194,8 @@ def check_qual(bundle_dir, model_path, layers, device, prompt=None,
     return report
 
 
-def check_gen(bundle_dir, model_path, layers, data=None, max_new=128,
-              max_prompt_tokens=8192, out_path="logs/gen_compare.txt"):
+def check_gen(bundle_dir, model_path, layers, data=None, max_new=192,
+              max_prompt_tokens=32768, out_path="logs/gen_compare.txt"):
     """同一批 prompt（短→长）各生成两遍：dense 一遍、全装 LUT 一遍，
     输出写文件人工对比。这才是判据（cos 只是代理指标）。"""
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -206,17 +206,6 @@ def check_gen(bundle_dir, model_path, layers, data=None, max_new=128,
         "请用一句话解释什么是存算一体芯片。",
         "明朝灭亡的主要原因是什么？请简要回答。",
     ]
-    long_prompts = []
-    if data and os.path.exists(data):
-        with open(data) as f:
-            for i, line in enumerate(f):
-                if i >= 2:
-                    break
-                rec = json.loads(line)
-                long_prompts.append(
-                    rec["document"] + "\n\n问题：" + rec["questions"][0])
-    prompts = [("short", p) for p in short_prompts] + \
-              [("long", p) for p in long_prompts]
 
     tok = AutoTokenizer.from_pretrained(model_path)
     model = AutoModelForCausalLM.from_pretrained(
@@ -224,35 +213,76 @@ def check_gen(bundle_dir, model_path, layers, data=None, max_new=128,
         device_map="balanced_low_0")
     model.eval()
 
+    def build_msgs(doc, questions, budget):
+        """复刻 bench 协议（eval_longctx_server.py）：user 文档 →
+        assistant 确认 → 逐题 user 提问；enable_thinking=False。"""
+        d_ids = tok(doc).input_ids
+        if len(d_ids) > budget:
+            doc = tok.decode(d_ids[:budget])
+        return [{"role": "user", "content": doc},
+                {"role": "assistant", "content": "好的，我已读完。"},
+                *([{"role": "user", "content": q}
+                   for q in questions])]
+
+    def gen(messages, max_new, n_turns):
+        """从 messages 末尾开始逐轮生成（多轮：把生成结果塞回
+        assistant 再继续），返回各轮输出列表。"""
+        outs = []
+        tail = messages[-n_turns:]
+        msgs = list(messages[:-n_turns])
+        for t in range(n_turns):
+            msgs = msgs + [{"role": "user", "content": tail[t]}]
+            text = tok.apply_chat_template(
+                msgs, tokenize=False, add_generation_prompt=True,
+                chat_template_kwargs={"enable_thinking": False})
+            ids = tok(text, return_tensors="pt").to(model.device)
+            with torch.no_grad():
+                out = model.generate(
+                    input_ids=ids["input_ids"],
+                    attention_mask=ids["attention_mask"],
+                    max_new_tokens=max_new, do_sample=False)
+            ans = tok.decode(out[0][ids["input_ids"].shape[1]:],
+                             skip_special_tokens=True)
+            outs.append(ans)
+            msgs = msgs + [{"role": "assistant", "content": ans}]
+        return outs
+
     reps = {L: LutFfnReplacer(f"{bundle_dir}/layer{L}.pt", "cpu")
             for L in layers}
     mods = {L: model.model.layers[L].mlp.shared_expert for L in layers}
     dense_fwd = {L: mods[L].forward for L in layers}
 
-    def gen(prompt):
-        ids = tok(prompt, return_tensors="pt").to(model.device)
-        ids = ids["input_ids"][:, :max_prompt_tokens]
-        with torch.no_grad():
-            out = model.generate(
-                input_ids=ids, max_new_tokens=max_new, do_sample=False)
-        return tok.decode(out[0][ids.shape[1]:], skip_special_tokens=True)
+    sessions = [("short", build_msgs("", [q], 0)[2:]) for q in short_prompts]
+    if data and os.path.exists(data):
+        with open(data) as f:
+            for i, line in enumerate(f):
+                if i >= 1:
+                    break
+                rec = json.loads(line)
+                sessions.append(("long", build_msgs(
+                    rec["document"], rec["questions"][:3],
+                    max_prompt_tokens)))
 
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
     with open(out_path, "w", encoding="utf-8") as fo:
-        for tag, prompt in prompts:
-            plen = len(tok(prompt).input_ids)
-            fo.write(f"\n{'='*72}\n[{tag}] prompt_tokens={plen}\n"
-                     f"PROMPT 末尾: ...{prompt[-200:]}\n{'-'*72}\n")
-            print(f"[gen] {tag} prompt_tokens={plen} dense...", flush=True)
-            fo.write(f"DENSE:\n{gen(prompt)}\n{'-'*72}\n")
+        for tag, msgs in sessions:
+            n_turns = len(msgs) if tag == "long" else 1
+            q = msgs[-1]["content"]
+            fo.write(f"\n{'='*72}\n[{tag}] turns={n_turns}\n"
+                     f"QUESTION: {q}\n{'-'*72}\n")
+            print(f"[gen] {tag} dense...", flush=True)
+            dense_outs = gen(msgs, max_new, n_turns)
+            for t, o in enumerate(dense_outs):
+                fo.write(f"DENSE turn{t}:\n{o}\n{'-'*72}\n")
             for L in layers:
                 mods[L].forward = reps[L]
-            print(f"[gen] {tag} prompt_tokens={plen} LUT{layers}...",
-                  flush=True)
-            fo.write(f"LUT {layers}:\n{gen(prompt)}\n")
+            print(f"[gen] {tag} LUT{layers}...", flush=True)
+            lut_outs = gen(msgs, max_new, n_turns)
+            for t, o in enumerate(lut_outs):
+                fo.write(f"LUT turn{t}:\n{o}\n{'='*72}\n")
             for L in layers:
                 mods[L].forward = dense_fwd[L]
-    return {"out": out_path, "prompts": len(prompts)}
+    return {"out": out_path, "sessions": len(sessions)}
 
 
 def main():
@@ -265,7 +295,8 @@ def main():
     ap.add_argument("--device", default="cuda:0")
     ap.add_argument("--data", default=None,
                     help="gen: 长 prompt 来源 jsonl（document+questions）")
-    ap.add_argument("--max_new", type=int, default=128)
+    ap.add_argument("--max_new", type=int, default=192)
+    ap.add_argument("--max_prompt_tokens", type=int, default=32768)
     ap.add_argument("--out", default="logs/gen_compare.txt")
     args = ap.parse_args()
     layers = [int(t) for t in args.layers.replace(",", " ").split()]
@@ -278,6 +309,7 @@ def main():
     else:
         rep = check_gen(args.bundle_dir, args.model_path, layers,
                         data=args.data, max_new=args.max_new,
+                        max_prompt_tokens=args.max_prompt_tokens,
                         out_path=args.out)
     print(json.dumps(rep, indent=2, ensure_ascii=False))
 
