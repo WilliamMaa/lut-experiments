@@ -140,7 +140,31 @@
 均准确引用原文），短问答也全对。权重和分布在 32k 内都无辜（64k 双文档未测，但 8/512 是
 全崩不像渐变）。嫌疑转移到 serve 运行时。
 
-## 当前主嫌疑：vLLM serve 运行时（2026-10-15 已定罪）
+## 根因（2026-10-16 定案）：shared_expert gate 语义边界不一致
+
+**0/16 的根因**：LUT bundle 学的是 **HF 语义**的 shared expert 输出（raw MLP，
+gate 在模块外乘），而 vLLM 的 `shared_expert` 模块**内部**已经乘了
+`sigmoid(shared_expert_gate(x))`（vLLM 0.19.1 的 `Qwen3NextMLP` 复用
+`Qwen2MoeMLP`，`expert_gate` 即 `shared_expert_gate`）。插件替换整个
+`shared_expert.forward` 后 gate 丢失 → 输出膨胀 **1/σ(g(x))**。
+
+数值全部吻合（serve 实测 dense/HF dense = σ(g)）：
+- L37: 2.1/15.5 = 0.135 → gate logit ≈ -1.86
+- L38: 2.4/24.5 = 0.098 → gate logit ≈ -2.22
+- L39: 15.2/19 = 0.80 → gate logit ≈ +1.39（所以 L39 碰巧"健康"）
+
+gate 逐 token 波动 → 解释 ratio 逐 token 波动；cos 不受标量影响 → 解释
+serve cos 与训练自评吻合。HF 链路 3/3：HF 里 gate 在模块外，raw LUT 语义正确。
+
+**已排除**（全部有实测/审计）：pack、bundle 表（=训练数据，行 norm 13.1/26.2/13.7
+vs 数据 15.5/24.5/19）、teacher 权重（与模型逐字节一致）、采集 hook（三层全
+shared_expert）、x 尺度（训练 57~68 vs serve 50~60）、均值初始化/转换脚本、
+rank 方案（rank1 ydf 与 rank0 全等）、kernel、探针自身。
+
+**修复**（`vllm_plugin/lut_ffn.py`，v2026-10-08l）：LUT 输出乘回
+`sigmoid(shared_expert_gate(x))`。表不重训、不重新打包。
+
+## 历史排查记录（2026-10-15）
 
 同一 bundle 三层全装：HF 路径 32k QA 3/3，vLLM serve（64k 多轮）**0/16**。
 关键推理：**0/16 是主动投毒不是 dense 回退**——插件失败会静默保持 dense（WARNING），
@@ -149,7 +173,7 @@ kernel 基本排除：test_lut_ffn 在 vllm_py310 下验证过 kernel ≡ refere
 
 投毒两类假设：
 - **A. 与长度无关**：TP rank0 方案不成立（shared_expert 输出没被 all-reduce → rank 间状态分叉；
-  或 is_tp_rank0() 两 rank 都 True → all-reduce 后翻倍）。
+  或 is_tp_rank0() 两 rank 都 True → all-reduce 后翻倍）。**探针 v3 已排除**。
 - **B. 与长度有关**：kernel 在 serve 大 n（64k prefill 一次前向几万 token）下有 bug，HF 只测到 32k。
 
 定位靠实测不靠猜（probe 猜类别已废弃）：

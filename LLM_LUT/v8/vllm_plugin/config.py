@@ -64,7 +64,11 @@ TARGET_ARCH = os.environ.get(
 # switches (V8_LUT_LAYERS / V8_LUT_BUNDLE_DIR, both default off) wrap
 # Qwen3NextSparseMoeBlock.__init__ and swap shared_expert.forward for a
 # triton LUT lookup; with V8_LUT_LAYERS empty the behavior is unchanged.
-PLUGIN_VERSION = "2026-10-08k"
+# 2026-10-08l: shared_expert LUT output now re-applies sigmoid(
+# shared_expert_gate(x)) — vLLM applies the gate inside the module, HF
+# (the bundle's teacher boundary) applies it outside; without this the
+# LUT ran ungated and inflated the shared path by 1/sigma(g).
+PLUGIN_VERSION = "2026-10-08l"
 
 # Margin (in blocks) added on top of the retention budget. Eviction keeps
 # L <= retention strictly, the margin only covers decode append-then-evict

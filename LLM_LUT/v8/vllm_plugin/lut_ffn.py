@@ -353,6 +353,12 @@ def is_tp_rank0():
 def _install_lut(module, layer_idx, replacer):
     shared = module.shared_expert
     orig_forward = shared.forward
+    # vLLM's shared_expert MLP applies sigmoid(shared_expert_gate(x))
+    # INSIDE the module; HF applies the same gate OUTSIDE. The LUT bundle
+    # was trained on HF's raw shared-expert output, so the gate must be
+    # re-applied here to preserve module semantics (missing gate = output
+    # inflated by 1/sigma(g), measured 7.4x/10.2x on L37/L38).
+    gate_mod = getattr(module, "shared_expert_gate", None)
     # Non-persistent buffers: ride .to(device), stay out of state_dict
     # (load_weights never touches them), counted in non-KV memory.
     shared.register_buffer("v8_lut_coarse_table", replacer.coarse_table,
@@ -361,6 +367,14 @@ def _install_lut(module, layer_idx, replacer):
                            persistent=False)
     rank, world = _tp_rank_and_world()
     rank0 = rank == 0
+
+    def _apply_gate(y, x):
+        if gate_mod is None:
+            return y
+        g = gate_mod(x)
+        if isinstance(g, tuple):
+            g = g[0]
+        return y * torch.sigmoid(g.float()).to(y.dtype)
     # V8_LUT_DEBUG=1: 对真实输入同时算 dense(x) 和 LUT(x)，打印逐层对比。
     # 这是 serve 运行时的 qual：HF 参照系 cos 0.75~0.85；serve 里明显更烂 =
     # 输入/kernel 问题；cos 正常但模型输出仍炸 = 毒在 rank 方案/下游。
@@ -393,7 +407,7 @@ def _install_lut(module, layer_idx, replacer):
                     import datetime
                     ts = datetime.datetime.now().strftime("%H:%M:%S")
                     if _rank0:
-                        yl = _rep(x).float()
+                        yl = _apply_gate(_rep(x).float(), x)
                         cos = torch.nn.functional.cosine_similarity(
                             yl.flatten(), yd_full.flatten(), dim=0).item()
                         rel = ((yl - yd_full).norm()
@@ -404,6 +418,12 @@ def _install_lut(module, layer_idx, replacer):
                             f"r{i}:yl={yl[j].norm():.2f}/ydf="
                             f"{yd_full[j].norm():.2f}"
                             for i, j in enumerate(range(min(2, yl.shape[0]))))
+                        gtxt = ""
+                        if gate_mod is not None:
+                            g = gate_mod(x)
+                            if isinstance(g, tuple):
+                                g = g[0]
+                            gtxt = f" gate={torch.sigmoid(g.float()).mean():.4f}"
                         print(f"[v8_debug] {ts} layer={_layer} "
                               f"rank={_rank}/{_world} call={calls['n']} "
                               f"x={tuple(x.shape)} "
@@ -413,6 +433,7 @@ def _install_lut(module, layer_idx, replacer):
                               f"ratio={ratio:.4f} "
                               f"|yl|={yl.norm().item():.3f} "
                               f"|ydf|={yd_full.norm().item():.3f} "
+                              f"gated=1{gtxt} "
                               f"pt={pt}", flush=True)
                     else:
                         print(f"[v8_debug] {ts} layer={_layer} "
@@ -428,7 +449,7 @@ def _install_lut(module, layer_idx, replacer):
                       f"{type(e).__name__}: {e}", flush=True)
         if not _rank0:
             return torch.zeros_like(x)
-        return _rep(x)
+        return _apply_gate(_rep(x), x)
 
     shared.forward = lut_forward
     print(f"[v8_plugin] LUT shared_expert layer {layer_idx} installed "
