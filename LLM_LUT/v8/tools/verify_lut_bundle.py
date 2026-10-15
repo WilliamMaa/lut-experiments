@@ -26,9 +26,18 @@
       --bundle_dir /data/mamingyu/lut_bundles \
       --model_path /home/u/downloads/models \
       --layers "37 38 39" --device cuda:0
+
+  # 生成对比（dense vs 全装 LUT，短+长 prompt，人眼看输出）
+  python tools/verify_lut_bundle.py gen \
+      --bundle_dir /data/mamingyu/lut_bundles \
+      --model_path /home/u/downloads/models/Qwen3.6-35B-A3B \
+      --layers "37 38 39" \
+      --data data/longctx_multi_turn_65536_64docs.jsonl \
+      --max_new 128 --out logs/gen_compare.txt
 """
 import argparse
 import json
+import os
 import sys
 import types
 from pathlib import Path
