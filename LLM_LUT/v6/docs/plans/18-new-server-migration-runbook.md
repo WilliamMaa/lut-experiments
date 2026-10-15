@@ -30,6 +30,17 @@ config.json：多模态 MoE、40 层 hybrid（每 4 层 1 个 full attention）�
 expert top-8、1 个 shared expert、hidden 2048，与 Qwen3.6-35B-A3B 架构一致。
 
 ```bash
+pip install -U modelscope
+
+REPO="Qwen/Qwen3.6-35B-A3B"
+DST=/data/mamingyu/models/Qwen3.6-35B-A3B
+
+rm -rf "$DST"
+mkdir -p "$DST"
+
+nohup modelscope download --model "$REPO" --local_dir "$DST" > ~/dl_qwen35b.log 2>&1 &
+echo "download PID: $!"
+
 ls /home/u/downloads/models/config.json && du -sh /home/u/downloads/models   # 应 ~70GB
 ```
 

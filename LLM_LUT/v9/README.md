@@ -34,11 +34,11 @@ v6 旧法成本 ≈ N × 完整 generate；本方案 ≈ 1 × 原始 pass + 各�
 0. 准备各层 teacher 权重（一次性）：
 
 ```bash
-python ../../v6/scripts/conversion/extract_shared_expert.py \
-  --model_path /path/Qwen3.6-35B-A3B \
-  --layer_idx 37 --output_path /data/outputs/v9_teacher/teacher_l37.pt \
-  --layer_idx 38 --output_path /data/outputs/v9_teacher/teacher_l38.pt \
-  --layer_idx 39 --output_path /data/outputs/v9_teacher/teacher_l39.pt
+python v6/scripts/conversion/extract_shared_expert.py \
+  --model_path /data/mamingyu/models/Qwen3.6-35B-A3B \
+  --layer_idx 37 --output_path /data/mamingyu/utputs/v9_teacher/teacher_l37.pt \
+  --layer_idx 38 --output_path /data/mamingyu/outputs/v9_teacher/teacher_l38.pt \
+  --layer_idx 39 --output_path /data/mamingyu/outputs/v9_teacher/teacher_l39.pt
 ```
 
 1. 等价性小实验（先跑这个；8 条 × 1024 token，几分钟）：
@@ -50,7 +50,7 @@ python scripts/propagation/compare_rerun_vs_propagation.py \
   --lut_checkpoint 37=/path/outputs_l37/checkpoints \
   --prompt_file ../../v6/example_custom_prompts.jsonl \
   --n_seqs 8 --max_len 1024 \
-  --output_json /data/outputs/v9_compare/compare_result.json
+  --output_json /data/mamingyu/outputs/v9_compare/compare_result.json
 ```
 
 判定：`equivalent=true`（各深边界 cos_mean > 0.999，bf16 噪声量级）即推进与重跑语义一致。
@@ -60,12 +60,12 @@ python scripts/propagation/compare_rerun_vs_propagation.py \
 ```bash
 python scripts/propagation/collect_layerwise_propagation.py \
   --model_path /path/Qwen3.6-35B-A3B \
-  --prompt_file ../../v6/candidate_prompts.jsonl \
+  --prompt_file v6/candidate_prompts.jsonl \
   --layers 37,38,39 \
-  --teacher_weights 37=/data/outputs/v9_teacher/teacher_l37.pt \
-                    38=/data/outputs/v9_teacher/teacher_l38.pt \
-                    39=/data/outputs/v9_teacher/teacher_l39.pt \
-  --output_root /data/outputs/v9_layerwise_l37_39 \
+  --teacher_weights 37=/data/mamingyu/outputs/v9_teacher/teacher_l37.pt \
+                    38=/data/mamingyu/outputs/v9_teacher/teacher_l38.pt \
+                    39=/data/mamingyu/outputs/v9_teacher/teacher_l39.pt \
+  --output_root /data/mamingyu/outputs/v9_layerwise_l37_39 \
   --device_map balanced_low_0 --max_prompts 256 --max_len 2048
   # 256 x 2048 ≈ 52万 token/层，覆盖默认 calib 40万 + eval 10万
   # （v6 训练脚本要求 calib_size + eval_size <= 采集总量，调大请同步加 --max_prompts）
@@ -79,11 +79,11 @@ python scripts/propagation/collect_layerwise_propagation.py \
 ```bash
 python ../../v6/scripts/evaluation/run_multilayer_model_eval.py \
   --model_path /path/Qwen3.6-35B-A3B \
-  --layer_idx 37 --checkpoint_dir /data/outputs/v9_layerwise_l37_39/train_layer37/checkpoints \
-  --layer_idx 38 --checkpoint_dir /data/outputs/v9_layerwise_l37_39/train_layer38/checkpoints \
-  --layer_idx 39 --checkpoint_dir /data/outputs/v9_layerwise_l37_39/train_layer39/checkpoints \
+  --layer_idx 37 --checkpoint_dir /data/mamingyu/outputs/v9_layerwise_l37_39/train_layer37/checkpoints \
+  --layer_idx 38 --checkpoint_dir /data/mamingyu/outputs/v9_layerwise_l37_39/train_layer38/checkpoints \
+  --layer_idx 39 --checkpoint_dir /data/mamingyu/outputs/v9_layerwise_l37_39/train_layer39/checkpoints \
   --device_map balanced_low_0 --torch_dtype bfloat16 \
-  --output_json /data/outputs/v9_layerwise_l37_39/eval_result.json
+  --output_json /data/mamingyu/outputs/v9_layerwise_l37_39/eval_result.json
 ```
 
 ## 复用已训好的浅层 checkpoint（混合流程）
