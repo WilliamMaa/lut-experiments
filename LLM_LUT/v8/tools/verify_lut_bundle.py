@@ -221,16 +221,22 @@ def check_gen(bundle_dir, model_path, layers, data=None, max_new=192,
             tokenize=False, add_generation_prompt=True,
             chat_template_kwargs={"enable_thinking": False})
         if "/no_think" not in text:
-            print("[gen] WARNING: 模板输出里没有 /no_think，"
-                  "enable_thinking=False 可能没生效", flush=True)
+            # chat_template_kwargs 在该 transformers 版本没生效时，
+            # 手动插 /no_think（vLLM enable_thinking=False 同款做法）
+            marker = "<|im_start|>assistant"
+            idx = text.rfind(marker)
+            if idx != -1:
+                end = idx + len(marker)
+                text = text[:end] + "\n/no_think" + text[end:]
         return text
 
     def gen(doc, questions, max_new):
         """复刻 bench 协议（eval_longctx_server.py）：user 文档 →
         assistant 确认 → 逐题 user 提问，答案塞回 assistant 继续。
         返回各轮输出列表。"""
-        msgs = ([{"role": "user", "content": doc}] if doc else []) + [
-            {"role": "assistant", "content": "好的，我已读完。"}]
+        msgs = ([{"role": "user", "content": doc},
+                 {"role": "assistant", "content": "好的，我已读完。"}]
+                if doc else [])
         outs = []
         for q in questions:
             ids = tok(render(msgs + [{"role": "user", "content": q}]),
