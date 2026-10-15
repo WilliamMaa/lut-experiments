@@ -33,7 +33,10 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, "..", "..", "archive"))
+sys.path.insert(0, os.path.join(_HERE, "..", "training"))
+sys.path.insert(0, _HERE)
 import build_lut_ffn_output_v3_shared_coarse as v3
 
 
