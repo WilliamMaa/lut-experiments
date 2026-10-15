@@ -202,3 +202,10 @@ OOM/preemption/rewind 计数（server 存活 + 0 contract raises 是硬门，同
 - 不动 v8 的 KV allocator / attention 路径（06j 冻结，升版只做加法）。
 - 不重开 HF 24 层扫描（runbook 15 冻结延后）。
 - 不碰 routed experts。
+
+CUDA_VISIBLE_DEVICES=5,6,7 python tools/verify_lut_bundle.py gen \
+  --bundle_dir /data/mamingyu/lut_bundles \
+  --model_path /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --layers "37 38 39" \
+  --data data/longctx_multi_turn_65536_64docs.jsonl \
+  --max_new 128 --out logs/gen_compare.txt
