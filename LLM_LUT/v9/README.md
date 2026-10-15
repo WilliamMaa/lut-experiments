@@ -45,7 +45,7 @@ python v6/scripts/conversion/extract_shared_expert.py \
 
 ```bash
 python scripts/propagation/compare_rerun_vs_propagation.py \
-  --model_path /path/Qwen3.6-35B-A3B \
+  --model_path /data/mamingyu/models/Qwen3.6-35B-A3B \
   --layers 37,38,39 \
   --lut_checkpoint 37=/path/outputs_l37/checkpoints \
   --prompt_file ../../v6/example_custom_prompts.jsonl \
