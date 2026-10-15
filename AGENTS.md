@@ -111,3 +111,41 @@
 4. **最后才考虑回退**：只有当同一规模所有改进都试过且确实不可用时，才建议减小替换量。
 
 **禁止**：把"回退到更小配置"作为第一个建议。项目目标是前进到更大 MAC 削减，不是保住 baseline 数字。
+
+
+---
+
+# v8 调试记录（2026-10-15，fact_acc 0.0156 排查）
+
+## 已确认的事实（不要再重查）
+
+1. **打包链路无辜**。`verify_lut_bundle.py pack`：L37/38/39 bundle 与 checkpoint 逐字段一致。
+2. **权重 = 训练原样**。qual（公平 on-policy 链）cos 与训练 summary.json 自评严丝合缝：
+   L37 0.75（训练 0.77）、L38 0.85（0.90）、L39 0.74（multilayer 0.80）。左尾烂是训练内在的
+   （p10≈0.5），serve/转换没引入额外损伤。
+3. **短上下文栈健康**：9 token prompt 下 LUT 输出与 dense 逐字级一致（三层全装）。
+4. **64k 长上下文出现退化**：raw 补全下 LUT 有重复循环，dense 没有。
+5. serve 环境约束：共享机唯一可用档位 `--gpu-memory-utilization 0.70`；
+   `CUDA_VISIBLE_DEVICES=6,7` + `V8_LUT_LAYERS="37 38 39"` + `V8_LUT_BUNDLE_DIR=/data/mamingyu/lut_bundles`；
+   模型路径必须写全 `/home/u/downloads/models/Qwen3.6-35B-A3B`（父目录没 tokenizer）；
+   bench 参数是 `--concurrency` 不是 `--currency`；404 = 模型名和 serve 路径不一致。
+6. triton 两个坑（已修）：kernel 体里的名字只从 `fn.__globals__` 解析（模块级 import，
+   函数内 import 旧 triton 会炸 `NameError: tl`）；launch 必须在 `x.device` 的上下文里
+   （跨卡时否则报骗人的 "cpu tensor?"）。
+
+## 待验证的假设（用户的）
+
+**LUT 校准/训练用的 prompt 分布 vs bench 实际 prompt 分布错位**（长短不匹配）。
+验证实验只有一个：`verify_lut_bundle.py gen --max_new 2000`（短 + 32k 长文档多轮，
+dense vs 全装 LUT 平行对比，人眼看答案）。短好长烂 → 分布假设成立，做长短分表/补校准数据；
+短的就烂 → 表本身 fidelity 问题，回训练侧。
+
+## 教训（时间红线）
+
+- **不为零价值目标做战术勤奋**。为"严格复刻 bench 的 enable_thinking=False"绕了三轮
+  （kwarg 不生效 → 手动插 /no_think → 撤回），而真正的阻塞只是 max_new 太短。
+  动手前先问：这一步验证的是哪个假设？
+- 长命令写进文件/脚本，chat 只贴短命令和结论。
+- doc 43 是 Phase 1 唯一权威 runbook；v6 的 18 是迁移专用，不再加 serve/bench 内容。
+- 排查顺序铁律：先 pack（秒级）→ qual 对训练自评（分钟级）→ gen 人眼看输出（分钟级），
+  全 innocent 才轮到审计 serve kernel。
