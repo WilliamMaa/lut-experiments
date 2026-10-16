@@ -39,6 +39,12 @@ python v6/scripts/conversion/extract_shared_expert.py \
   --layer_idx 37 --output_path /data/mamingyu/outputs/v9_teacher/teacher_l37.pt \
   --layer_idx 38 --output_path /data/mamingyu/outputs/v9_teacher/teacher_l38.pt \
   --layer_idx 39 --output_path /data/mamingyu/outputs/v9_teacher/teacher_l39.pt
+
+python v6/scripts/conversion/extract_shared_expert.py \
+  --model_path /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --layer_idx 37 --output_path /data/mamingyu/outputs/v9_teacher/teacher_l37.pt \
+  --layer_idx 38 --output_path /data/mamingyu/outputs/v9_teacher/teacher_l38.pt \
+  --layer_idx 39 --output_path /data/mamingyu/outputs/v9_teacher/teacher_l39.pt
 ```
 
 1. 等价性小实验（先跑这个；8 条 × 1024 token，几分钟）：

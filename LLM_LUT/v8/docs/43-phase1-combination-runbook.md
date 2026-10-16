@@ -117,7 +117,7 @@ done
 python v8/vllm_plugin/tests/test_lut_ffn.py
 
 # 3. 带 LUT 起 server（vllm_py310），grep 确认 "LUT shared_expert layer 39 installed"
-CUDA_VISIBLE_DEVICES=6,7 V8_LUT_LAYERS=39 V8_LUT_BUNDLE_DIR=/data/mamingyu/lut_bundles \
+CUDA_VISIBLE_DEVICES=6,7 V8_LUT_LAYERS="37 38 39" V8_LUT_BUNDLE_DIR=/data/mamingyu/lut_bundles \
 python -m vllm_plugin.serve /home/u/downloads/models/Qwen3.6-35B-A3B \
   --enforce-eager --no-enable-prefix-caching --max-model-len 131072 \
   --tensor-parallel-size 2 --max-num-seqs 4 --gpu-memory-utilization 0.70 \
@@ -208,4 +208,4 @@ CUDA_VISIBLE_DEVICES=5,6,7 python tools/verify_lut_bundle.py gen \
   --model_path /home/u/downloads/models/Qwen3.6-35B-A3B \
   --layers "37 38 39" \
   --data data/longctx_multi_turn_65536_64docs.jsonl \
-  --max_new 128 --out logs/gen_compare.txt
+  --max_new 2048 --out logs/gen_compare.txt
