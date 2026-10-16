@@ -75,7 +75,7 @@ FileNotFoundError: [Errno 2] No such file or directory: '../../v6/example_custom
 
 ```bash
 python scripts/propagation/collect_layerwise_propagation.py \
-  --model_path /path/Qwen3.6-35B-A3B \
+  --model_path /data/mamingyu/models/Qwen3.6-35B-A3B \
   --prompt_file ../v6/candidate_prompts.jsonl \
   --layers 37,38,39 \
   --teacher_weights 37=/data/mamingyu/outputs/v9_teacher/teacher_l37.pt \
