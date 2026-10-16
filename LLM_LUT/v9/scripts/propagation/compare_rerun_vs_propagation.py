@@ -101,6 +101,7 @@ def group_b_propagation(model, seqs, layers, ckpt_map):
 
     engines = []
     t_prop_total = 0.0
+    prop_residual = {idx: [] for idx in layers}  # 推进产生的 on-policy 边界
     try:
         for li in range(len(layers) - 1):
             j, k = layers[li], layers[li + 1]
@@ -113,16 +114,18 @@ def group_b_propagation(model, seqs, layers, ckpt_map):
                 eng.install()
                 engines.append(eng)
             cap = BoundaryCapture(model, [k])
+            # 首段从原始 pass 的 residual 出发，后续段必须接上一段推进出的 residual
+            src = residual[j] if li == 0 else prop_residual[j]
             t0 = time.time()
             try:
-                for n, h_cpu in enumerate(residual[j]):
+                for n, h_cpu in enumerate(src):
                     h = h_cpu  # BoundaryCapture 存的是 [1, S, H]，直接用
                     cap.reset()
                     with torch.no_grad():
                         LWC.run_decoder_slice(model, h, j, k + 1)
                     ffn[k][n] = cap.get(k, "ffn_in")
                     if k != layers[-1]:
-                        residual[k].append(cap.get(k, "residual_in"))
+                        prop_residual[k].append(cap.get(k, "residual_in"))
             finally:
                 cap.close()
             t_prop_total += time.time() - t0
