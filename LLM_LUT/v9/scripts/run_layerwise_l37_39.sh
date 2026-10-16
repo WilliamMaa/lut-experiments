@@ -16,5 +16,4 @@ python scripts/propagation/collect_layerwise_propagation.py \
     37=$TEACHER_ROOT/qwen_35b_shared_expert_l37.pt \
     38=$TEACHER_ROOT/qwen_35b_shared_expert_l38.pt \
     39=$TEACHER_ROOT/qwen_35b_shared_expert_l39.pt \
-  --output_root "$OUT_ROOT" \
-  --max_prompts 256 --max_len 2048
+  --output_root "$OUT_ROOT"

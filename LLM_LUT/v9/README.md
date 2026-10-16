@@ -57,16 +57,6 @@ python scripts/propagation/compare_rerun_vs_propagation.py \
   --prompt_file ../v6/example_custom_prompts.jsonl \
   --n_seqs 8 --max_len 1024 \
   --output_json /data/mamingyu/outputs/v9_compare/compare_result.json
-
-
-Traceback (most recent call last):
-  File "/home/mamingyu/lut-experiments/LLM_LUT/v9/scripts/propagation/compare_rerun_vs_propagation.py", line 252, in <module>
-    main()
-  File "/home/mamingyu/lut-experiments/LLM_LUT/v9/scripts/propagation/compare_rerun_vs_propagation.py", line 203, in main
-    texts = LWC.load_prompt_texts(args.prompt_file, args.n_seqs)
-  File "/home/mamingyu/lut-experiments/LLM_LUT/v9/scripts/propagation/lw_common.py", line 46, in load_prompt_texts
-    with open(prompt_file, "r", encoding="utf-8") as f:
-FileNotFoundError: [Errno 2] No such file or directory: '../../v6/example_custom_prompts.jsonl'
 ```
 
 判定：`equivalent=true`（各深边界 cos_mean > 0.999，bf16 噪声量级）即推进与重跑语义一致。
