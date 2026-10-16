@@ -172,15 +172,19 @@ serve ~0.734。0/16 → 0.955，gate 根因一次性定罪。0.955 > 0.734 超�
 **并发对照（2026-10-16，同 serve 配置：0.70 mem / max-num-seqs 4 / 512 slots /
 N=16，data=longctx_multi_turn_65536_64docs）**：
 
-| 组 | sess/h | fact_acc | P50 会话 |
-|---|---|---|---|
-| baseline v8-only | 87.6 | 0.9844 | 647s |
-| v8 + LUT L37/38/39 | **99.9（+14%）** | 0.9551 | 565s |
+| 层数 | sess/h | fact_acc | P50 会话 | wall | 备注 |
+|---|---|---|---|---|---|
+| 0（baseline） | 87.6 | 0.9844 | 647s | 2629s | |
+| 1（L37） | 81.5 | 0.9707 | 694s | 2828s | DEBUG=0 |
+| 3（L37/38/39） | 99.9 | 0.9551 | 565s | 2306s | **DEBUG=1（ handicap）** |
 
-LUT 组带 V8_LUT_DEBUG=1  handicap 仍胜出，+14% 是保守值。doc 42 Phase 1
-判据（compute 真被替掉、吞吐方向正确、质量不崩）达成。遗留：
-max-num-seqs=4 与 bench N=16 不对齐，两组绝对值都被准入上限压低；
-未做交错重跑，共享机噪声未量化。结果文件：results/phase1_*_c16.json。
+LUT 组带 V8_LUT_DEBUG=1  handicap 仍胜出，方向信号（doc 42 Phase 1 判据：
+compute 真被替掉、吞吐方向正确、质量不崩）初步成立。**但单次跑噪声 ±8~10%
+（三次 wall 2306/2629/2828s），已淹没 per-layer 预期收益（几个百分点）——
+1 层垫底而 3 层最高只能用噪声解释，层数扫描原协议判读无效。**
+
+遗留：max-num-seqs=4 与 bench N=16 不对齐，两组绝对值都被准入上限压低；
+噪声未量化前不给扩层决策。结果文件：results/phase1_*_c16.json。
 
 ## 历史排查记录（2026-10-15）
 
