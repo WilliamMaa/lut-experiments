@@ -161,10 +161,42 @@ def train_layer(idx, ds_in, ds_out, teacher_path, out_root, args):
     subprocess.run(cmd, check=True)
     dt = time.time() - t0
     ckpt = out_dir / "checkpoints"
-    if not ckpt.is_dir():
-        raise RuntimeError(f"Training finished but no checkpoint dir: {ckpt}")
+    if not _v3_train_complete(ckpt):
+        raise RuntimeError(f"Training finished but v3 checkpoints incomplete: {ckpt}")
     print(f"[layer{idx}] training done in {dt:.1f}s, checkpoints at {ckpt}")
     return str(ckpt), dt
+
+
+def _v3_train_complete(ckpt_dir: Path) -> bool:
+    """v3 训练产物齐全判定：shared_coarse.pt + 连续编号的 residual_g*.pt。"""
+    if not (Path(ckpt_dir) / "shared_coarse.pt").is_file():
+        return False
+    gid = 0
+    while (Path(ckpt_dir) / f"residual_g{gid}.pt").is_file():
+        gid += 1
+    return gid > 0
+
+
+def ensure_v4_checkpoint(ckpt_dir, out_root, idx, device):
+    """V6ReplacementEngine 只认 replacement_g*.pt（v4 格式）；v3 目录先转换。"""
+    ckpt_dir = Path(ckpt_dir)
+    if any(ckpt_dir.glob("replacement_g*.pt")):
+        return str(ckpt_dir)
+    conv_dir = Path(out_root) / f"converted_layer{idx}"
+    conv_ckpt = conv_dir / "checkpoints"
+    if any(conv_ckpt.glob("replacement_g*.pt")):
+        print(f"[layer{idx}] v4 转换已存在，跳过: {conv_ckpt}")
+        return str(conv_ckpt)
+    cmd = [
+        sys.executable, os.path.join(LWC.V6_ROOT, "scripts", "conversion",
+                                     "convert_v3_to_v4_checkpoints.py"),
+        "--v3_checkpoint_dir", str(ckpt_dir),
+        "--output_root", str(conv_dir),
+        "--device", device,
+    ]
+    print(f"[layer{idx}] v3->v4: {' '.join(cmd)}", flush=True)
+    subprocess.run(cmd, check=True)
+    return str(conv_ckpt)
 
 
 def propagate(model, idx_from, idx_to, res_shards, out_root):
@@ -275,13 +307,19 @@ def main():
             if args.no_train:
                 if idx not in existing_map:
                     raise ValueError(f"--no_train 需要提供 --existing_ckpt {idx}=...")
-                ckpt_dir = existing_map[idx]
                 train_dt = 0.0
+                v3_ckpt_dir = existing_map[idx]
             else:
                 if idx not in teacher_map:
                     raise ValueError(f"layer {idx} 缺少 teacher 权重：--teacher_weights {idx}=...")
-                ckpt_dir, train_dt = train_layer(
-                    idx, ds_in, ds_out, teacher_map[idx], out_root, args)
+                trained_ckpt = Path(out_root) / f"train_layer{idx}" / "checkpoints"
+                if _v3_train_complete(trained_ckpt):
+                    print(f"[layer{idx}] 训练产物已存在，跳过训练: {trained_ckpt}")
+                    v3_ckpt_dir, train_dt = str(trained_ckpt), 0.0
+                else:
+                    v3_ckpt_dir, train_dt = train_layer(
+                        idx, ds_in, ds_out, teacher_map[idx], out_root, args)
+            ckpt_dir = ensure_v4_checkpoint(v3_ckpt_dir, out_root, idx, args.train_device)
 
             engine = V6ReplacementEngine(
                 model=model, layer_idx=idx, checkpoint_dir=ckpt_dir,

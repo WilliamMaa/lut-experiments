@@ -22,6 +22,7 @@ import torch
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _V6_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", "..", "v6"))
+V6_ROOT = _V6_ROOT
 V6_UTILS = os.path.join(_V6_ROOT, "scripts", "utils")
 V6_TRAINING = os.path.join(_V6_ROOT, "scripts", "training")
 V6_EVAL = os.path.join(_V6_ROOT, "scripts", "evaluation")
