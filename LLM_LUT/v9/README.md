@@ -48,7 +48,7 @@ python scripts/propagation/compare_rerun_vs_propagation.py \
   --model_path /data/mamingyu/models/Qwen3.6-35B-A3B \
   --layers 37,38,39 \
   --lut_checkpoint 37=/path/outputs_l37/checkpoints \
-  --prompt_file ../../v6/example_custom_prompts.jsonl \
+  --prompt_file ../v6/example_custom_prompts.jsonl \
   --n_seqs 8 --max_len 1024 \
   --output_json /data/mamingyu/outputs/v9_compare/compare_result.json
 
@@ -70,7 +70,7 @@ FileNotFoundError: [Errno 2] No such file or directory: '../../v6/example_custom
 ```bash
 python scripts/propagation/collect_layerwise_propagation.py \
   --model_path /path/Qwen3.6-35B-A3B \
-  --prompt_file v6/candidate_prompts.jsonl \
+  --prompt_file ../v6/candidate_prompts.jsonl \
   --layers 37,38,39 \
   --teacher_weights 37=/data/mamingyu/outputs/v9_teacher/teacher_l37.pt \
                     38=/data/mamingyu/outputs/v9_teacher/teacher_l38.pt \
