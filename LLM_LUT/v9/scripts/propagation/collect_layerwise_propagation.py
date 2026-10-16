@@ -158,7 +158,7 @@ def propagate(model, idx_from, idx_to, res_shards, out_root):
     t0 = time.time()
     try:
         for n, sp in enumerate(res_shards):
-            h = torch.load(sp, map_location="cpu", weights_only=False).unsqueeze(0)  # [1,S,H]
+            h = torch.load(sp, map_location="cpu", weights_only=False)  # residual 分片已是 [1,S,H]
             capture.reset()
             with torch.no_grad():
                 LWC.run_decoder_slice(model, h, idx_from, idx_to + 1)

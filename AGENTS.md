@@ -217,3 +217,30 @@ kernel 基本排除：test_lut_ffn 在 vllm_py310 下验证过 kernel ≡ refere
   和边界后一次写完整；能用现有工具（curl/serve/bench）判读的，不造新 harness。
 - **agent 不能在服务器执行，每轮试错都是用户买单**（同步+重跑+贴日志 10~30 分钟）。
   交付前自问：这一版能不能第一次就跑通？
+
+---
+
+# v9 逐层推进实验记录
+
+## 方向 1 等价性小实验：已通过（2026-10-16，bit 级精确）
+
+`compare_rerun_vs_propagation.py`（L37 装 as_v4 LUT，layers 37,38,39，8 条短 prompt）：
+layer38/39 边界 cos_mean = 1.0000005 / 1.0000004，**abs_max = 0.0（bit 精确）**，
+`equivalent=True`。推进语义与完整重跑等价，v9 前提成立。
+结果：`/data/mamingyu/outputs/v9_compare/compare_result.json`。
+checkpoint：`/data/mamingyu/outputs_ffn_lut_layer37_shared_expert_v3_onpolicy_as_v4/checkpoints`（32 groups）。
+
+## 已修的脚本 bug（勿回退）
+
+- `compare_rerun_vs_propagation.py` / `collect_layerwise_propagation.py`：`BoundaryCapture` 存的
+  `residual_in` 是 3 维 `[1,S,H]`，推进循环里再 `.unsqueeze(0)` 会变 4 维在 linear_attn 炸掉；
+  两处均已去掉 unsqueeze（collect 脚本 propagate() 同款提前修掉）。
+- `compare_rerun_vs_propagation.py`：B 组推进链的 residual 分成 `residual`（原始 pass，只作
+  首段起点）与 `prop_residual`（on-policy 推进产物，深层必须用这份），否则条数翻倍越界且语义错。
+
+## 下一步
+
+第 2 步 `collect_layerwise_propagation.py` 三层全流程（采样+打标+训练+推进），
+跑完从 build_log.json 读各层成本，再 bundle 化走 serve 64k bench 对 0.9551/0.9844。
+注意 phase0 单次 pass 全程最贵，且本机 causal_conv1d / flash-linear-attention 是
+参考实现 fallback，偏慢。
