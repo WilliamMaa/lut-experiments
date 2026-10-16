@@ -79,7 +79,27 @@ def phase0_original_pass(model, tokenizer, texts, layers, max_len, out_root):
         capture.close()
     dt = time.time() - t0
     print(f"[phase0] original pass done: {len(texts)} seqs in {dt:.1f}s; tokens/层: {stats}")
+    meta = {"n_seqs": len(texts), "max_len": max_len,
+            "tokens_per_layer": stats, "time_s": dt}
+    (Path(orig_dir) / "_phase0_meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False), encoding="utf-8")
     return stats, dt
+
+
+def _phase0_cache(out_root, layers, n_seqs, max_len):
+    """phase0 断点：分片齐全且配置一致则跳过最贵的原始 pass，直接复用缓存。"""
+    orig_dir = Path(out_root) / "boundary" / "original"
+    meta_p = orig_dir / "_phase0_meta.json"
+    if not meta_p.is_file():
+        return None
+    meta = json.loads(meta_p.read_text(encoding="utf-8"))
+    if meta.get("n_seqs", 0) < n_seqs or meta.get("max_len") != max_len:
+        return None
+    for idx in layers:
+        if len(list(orig_dir.glob(f"layer{idx}_ffn_*.pt"))) < n_seqs:
+            return None
+    print(f"[phase0] 缓存命中（{meta['n_seqs']} seqs），跳过原始 pass")
+    return meta["tokens_per_layer"], meta["time_s"]
 
 
 def _shard_source_dirs(out_root, idx):
@@ -190,15 +210,15 @@ def main():
     ap.add_argument("--shard_dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"],
                     help="训练数据分片存储 dtype（边界缓存始终 fp32）")
     ap.add_argument("--max_len", type=int, default=2048)
-    ap.add_argument("--max_prompts", type=int, default=256,
-                    help="校准序列条数；256 x 2048 token ≈ 52万，对齐 v6 的 600K calib 量级")
+    ap.add_argument("--max_prompts", type=int, default=None,
+                    help="校准序列条数；默认用满整个 prompt 文件")
     # 训练
     ap.add_argument("--no_train", action="store_true", help="只采集+推进，不训练（需 --existing_ckpt）")
     ap.add_argument("--existing_ckpt", type=str, nargs="*", default=None,
                     help="复用已训好的 checkpoint：37=/path/to/checkpoints ...")
     ap.add_argument("--train_device", default="cuda:0")
     ap.add_argument("--calib_size", type=int, default=400000,
-                    help="训练用校准样本数；注意 v6 训练脚本要求 calib+eval <= 采集的总 token 数")
+                    help="训练用校准样本数；超过采集量时按比例自动下调")
     ap.add_argument("--eval_size", type=int, default=100000)
     ap.add_argument("--finetune_epochs", type=int, default=50)
     ap.add_argument("--seed", type=int, default=42)
@@ -226,7 +246,11 @@ def main():
 
     log = {"args": vars(args), "layers": layers, "phases": {}}
 
-    stats, dt = phase0_original_pass(model, tokenizer, texts, layers, args.max_len, out_root)
+    cached = _phase0_cache(out_root, layers, len(texts), args.max_len)
+    if cached is not None:
+        stats, dt = cached
+    else:
+        stats, dt = phase0_original_pass(model, tokenizer, texts, layers, args.max_len, out_root)
     log["phases"]["original_pass"] = {"time_s": dt, "tokens_per_layer": stats}
 
     engines = []
@@ -239,6 +263,14 @@ def main():
 
             n_tokens, label_dt, ds_in, ds_out = label_and_write_dataset(
                 model, idx, ffn_shards, out_root, dtype)
+
+            need = args.calib_size + args.eval_size
+            if not args.no_train and n_tokens < need:
+                scale = n_tokens * 0.95 / need
+                args.calib_size = max(int(args.calib_size * scale), 1000)
+                args.eval_size = max(int(args.eval_size * scale), 200)
+                print(f"[warn] 采集 {n_tokens} token < calib+eval {need}，"
+                      f"自动下调为 calib={args.calib_size} eval={args.eval_size}")
 
             if args.no_train:
                 if idx not in existing_map:
