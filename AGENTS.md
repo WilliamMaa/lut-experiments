@@ -164,6 +164,24 @@ rank 方案（rank1 ydf 与 rank0 全等）、kernel、探针自身。
 **修复**（`vllm_plugin/lut_ffn.py`，v2026-10-08l）：LUT 输出乘回
 `sigmoid(shared_expert_gate(x))`。表不重训、不重新打包。
 
+**2026-10-16 已验证**：64k 多轮 bench（N=16，64 sessions，三层全装）
+**fact_acc = 0.9551（489/512）**，errors=0。对照：修复前 0/16，baseline dense
+serve ~0.734。0/16 → 0.955，gate 根因一次性定罪。0.955 > 0.734 超出预期，
+可能是该 bench 上的偶然/方差，不要过度解读，但"LUT 替换可用"已实锤。
+
+**并发对照（2026-10-16，同 serve 配置：0.70 mem / max-num-seqs 4 / 512 slots /
+N=16，data=longctx_multi_turn_65536_64docs）**：
+
+| 组 | sess/h | fact_acc | P50 会话 |
+|---|---|---|---|
+| baseline v8-only | 87.6 | 0.9844 | 647s |
+| v8 + LUT L37/38/39 | **99.9（+14%）** | 0.9551 | 565s |
+
+LUT 组带 V8_LUT_DEBUG=1  handicap 仍胜出，+14% 是保守值。doc 42 Phase 1
+判据（compute 真被替掉、吞吐方向正确、质量不崩）达成。遗留：
+max-num-seqs=4 与 bench N=16 不对齐，两组绝对值都被准入上限压低；
+未做交错重跑，共享机噪声未量化。结果文件：results/phase1_*_c16.json。
+
 ## 历史排查记录（2026-10-15）
 
 同一 bundle 三层全装：HF 路径 32k QA 3/3，vLLM serve（64k 多轮）**0/16**。

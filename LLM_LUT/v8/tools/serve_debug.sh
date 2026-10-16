@@ -5,15 +5,19 @@
 #       对照组：不带 LUT，eval 必须 ~0.73+，否则 LUT 从头到尾无辜
 #   bash tools/serve_debug.sh lut 18002 "6,7" > logs/serve_lut_debug.log 2>&1 &
 #       实验组：LUT 37 38 39 + V8_LUT_DEBUG（逐层 dense vs LUT 实测对比）
+#   LAYERS="37" DEBUG=0 bash tools/serve_debug.sh lut 18002 "6,7" > logs/serve_lut_l37.log 2>&1 &
+#       层数扫描/并发实验：LAYERS 覆盖层集合，DEBUG=0 关插桩（timing 干净）
 set -eu
 MODE=$1
 PORT=$2
 GPUS=$3
 
 if [ "$MODE" = "lut" ]; then
-  export V8_LUT_LAYERS="37 38 39"
+  export V8_LUT_LAYERS="${LAYERS:-37 38 39}"
   export V8_LUT_BUNDLE_DIR=/data/mamingyu/lut_bundles
-  export V8_LUT_DEBUG=1
+  if [ "${DEBUG:-1}" = "1" ]; then
+    export V8_LUT_DEBUG=1
+  fi
 elif [ "$MODE" != "baseline" ]; then
   echo "usage: serve_debug.sh {baseline|lut} PORT GPUS" >&2
   exit 1

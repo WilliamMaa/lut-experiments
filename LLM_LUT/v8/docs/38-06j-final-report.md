@@ -48,3 +48,16 @@
 - 06j 验证：`tools/verify_06j.sh`（Gate A+D）、`tools/verify_06j_phase2.sh`（residency+质量）、`tools/verify_06j_phase3.sh` + `V8_DEBUG_ALLOC=1`（分配日志）
 - 最终对照：`N_LIST="16 32" BACKENDS="v8-1024" bash tools/run_capacity_sweep.sh`
 - 结果：`results/capacity_{full,v8-1024}_c{N}.json`、分配日志 `logs/verify_06j_phase3.log`
+
+
+# 格 1：只 L37（DEBUG=0，timing 干净）
+LAYERS="37" DEBUG=0 bash tools/serve_debug.sh lut 18002 "6,7" > logs/serve_lut_l37.log 2>&1 &
+# health 起来后：
+python tools/bench_concurrency.py --base-url http://localhost:18002 \
+  --model /home/u/downloads/models/Qwen3.6-35B-A3B \
+  --data data/longctx_multi_turn_65536_64docs.jsonl \
+  --concurrency 16 --out results/phase1_lut_l37_c16.json
+
+# 格 2：L37+L38（重启 再跑，out 改 l37l38）
+LAYERS="37 38" DEBUG=0 bash tools/serve_debug.sh lut 18002 "6,7" > logs/serve_lut_l37l38.log 2>&1 &
+python tools/bench_concurrency.py ... --out results/phase1_lut_l37l38_c16.json
