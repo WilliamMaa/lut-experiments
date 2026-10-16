@@ -116,7 +116,7 @@ def group_b_propagation(model, seqs, layers, ckpt_map):
             t0 = time.time()
             try:
                 for n, h_cpu in enumerate(residual[j]):
-                    h = h_cpu.unsqueeze(0)
+                    h = h_cpu  # BoundaryCapture 存的是 [1, S, H]，直接用
                     cap.reset()
                     with torch.no_grad():
                         LWC.run_decoder_slice(model, h, j, k + 1)
@@ -162,7 +162,7 @@ def compare_leaf_distributions(engine, a_tensors, b_tensors, device):
     for name, tensors in (("A", a_tensors), ("B", b_tensors)):
         idxs = []
         for t in tensors:
-            x = t.to(device).unsqueeze(0)
+            x = t.to(device)  # ffn_in 已是 [1, S, H]
             with torch.no_grad():
                 ind = addr.compute_indices(x).view(-1, addr.num_tables)[:, 0]
             idxs.append(ind.cpu())
