@@ -19,7 +19,7 @@
 
 ```bash
 cd ~/lut-experiments/LLM_LUT/v6
-CUDA_VISIBLE_DEVICES=0,1 python -u scripts/conversion/extract_shared_expert.py \
+CUDA_VISIBLE_DEVICES=6,7 python -u scripts/conversion/extract_shared_expert.py \
   --model_path /data/mamingyu/models/Qwen3.6-35B-A3B \
   --layer_idx 33 --layer_idx 34 --layer_idx 35 --layer_idx 36 \
   --output_path /data/mamingyu/outputs/v9_teacher/teacher_l33.pt \

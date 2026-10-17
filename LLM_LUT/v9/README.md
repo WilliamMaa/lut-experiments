@@ -64,7 +64,7 @@ python scripts/propagation/compare_rerun_vs_propagation.py \
 2. 三层构建：
 
 ```bash
-python scripts/propagation/collect_layerwise_propagation.py \
+nohup python scripts/propagation/collect_layerwise_propagation.py \
   --model_path /data/mamingyu/models/Qwen3.6-35B-A3B \
   --prompt_file ../v6/candidate_prompts.jsonl \
   --layers 37,38,39 \
@@ -72,7 +72,7 @@ python scripts/propagation/collect_layerwise_propagation.py \
                     38=/data/mamingyu/outputs/v9_teacher/teacher_l38.pt \
                     39=/data/mamingyu/outputs/v9_teacher/teacher_l39.pt \
   --output_root /data/mamingyu/outputs/v9_layerwise_l37_39 \
-  --device_map balanced_low_0 --max_prompts 256 --max_len 2048
+  --device_map balanced_low_0 > logs/collect_layerwise_propagation.log 2>&1 &
   # 256 x 2048 ≈ 52万 token/层，覆盖默认 calib 40万 + eval 10万
   # （v6 训练脚本要求 calib_size + eval_size <= 采集总量，调大请同步加 --max_prompts）
 ```
