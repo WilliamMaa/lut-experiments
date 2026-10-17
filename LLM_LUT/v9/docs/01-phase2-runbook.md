@@ -33,26 +33,47 @@ done
 
 注意：输出到独立目录 `lut_bundles_v9/`，**不得覆盖** v8 的 `/data/mamingyu/lut_bundles/`。
 
-## 第 3 步：serve + 64k bench（与 v8 同一套）
+## 第 3 步：serve + 64k bench（裸命令，不用 serve_debug.sh，配置全部可见）
 
-serve（共享机 0.70 档位，参数与 v8 Phase 1 完全一致）：
+serve（在 `~/lut-experiments/LLM_LUT/v8` 下跑；`python -m vllm_plugin.serve` 需要 v8 目录在
+PYTHONPATH，cwd 在 v8/ 即可）：
 
 ```bash
 cd ~/lut-experiments/LLM_LUT/v8
-CUDA_VISIBLE_DEVICES=6,7 V8_LUT_LAYERS="37 38 39" \
-V8_LUT_BUNDLE_DIR=/data/mamingyu/lut_bundles_v9 \
-bash tools/serve_debug.sh lut 18002 "6,7"
+
+# 插件开关（这就是全部配置项）：
+export V8_LUT_LAYERS="37 38 39"                 # 替换层
+export V8_LUT_BUNDLE_DIR=/data/mamingyu/lut_bundles_v9  # bundle 目录
+export V8_COMPRESS_SLOTS=512                    # KV 档位（0.70 util 对应）
+unset V8_LUT_DEBUG                              # 正式 bench 必须关插桩
+
+# 模型路径按服务器实况填；权重/tokenizer 不在同一目录时加 --tokenizer <目录>
+MODEL=/data/mamingyu/models/Qwen3.6-35B-A3B
+
+CUDA_VISIBLE_DEVICES=6,7 python -m vllm_plugin.serve "$MODEL" \
+  --served-model-name "$MODEL" \
+  --enforce-eager \
+  --no-enable-prefix-caching \
+  --max-model-len 131072 \
+  --tensor-parallel-size 2 \
+  --max-num-seqs 4 \
+  --gpu-memory-utilization 0.70 \
+  --port 18002
 ```
 
-bench（另开终端，N=16，结果文件名带 v9 区分）：
+bench（另开终端，N=16；`--model` 必须和 `--served-model-name` 一致）：
 
 ```bash
-python tools/bench_concurrency.py --port 18002 --concurrency 16 \
+cd ~/lut-experiments/LLM_LUT/v8
+python tools/bench_concurrency.py \
+  --base-url http://127.0.0.1:18002/v1 \
+  --model /data/mamingyu/models/Qwen3.6-35B-A3B \
+  --concurrency 16 \
   --data data/longctx_multi_turn_65536_64docs.jsonl \
-  --output results/phase1_v9_c16.json
+  --out results/phase1_v9_c16.json
 ```
 
-（bench 参数以 `tools/bench_concurrency.py --help` 实际为准；对照文件 `results/phase1_l37l38l39_c16.json` 是 v8-LUT 的。）
+（对照文件 `results/phase1_l37l38l39_c16.json` 是 v8-LUT 的；baseline 0.9844 同配置实测。）
 
 ## 判读
 
