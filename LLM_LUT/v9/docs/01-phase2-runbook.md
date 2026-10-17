@@ -33,7 +33,23 @@ done
 
 注意：输出到独立目录 `lut_bundles_v9/`，**不得覆盖** v8 的 `/data/mamingyu/lut_bundles/`。
 
-## 第 3 步：serve + 64k bench（裸命令，不用 serve_debug.sh，配置全部可见）
+## 第 3 步：生成 bench 数据（CPU，30~60 分钟，不占卡）
+
+```bash
+cd ~/lut-experiments/LLM_LUT/v8
+python tools/gen_longctx_multiturn.py \
+  --target-tokens 65536 --num-docs 64 \
+  --tokenizer-path /data/mamingyu/models/Qwen3.6-35B-A3B \
+  --out data/longctx_multi_turn_65536_64docs.jsonl
+```
+
+- **seed 必须用默认（20260917）**：原版数据就是默认参数生成的，改 seed 会换文档，
+  和 0.9551/0.9844 的对照不再同分布。
+- tokenizer 路径填模型实际目录（脚本按它做 ±2% 长度校准）。
+- 自带断言：每行 `tokens=` 在 target ±2% 内、ground truth 在文档内、digit_span ≥ 1/4，
+  全过即成功，不用额外检查。
+
+## 第 4 步：serve + 64k bench（裸命令，不用 serve_debug.sh，配置全部可见）
 
 serve（在 `~/lut-experiments/LLM_LUT/v8` 下跑；`python -m vllm_plugin.serve` 需要 v8 目录在
 PYTHONPATH，cwd 在 v8/ 即可）：
@@ -66,7 +82,7 @@ bench（另开终端，N=16；`--model` 必须和 `--served-model-name` 一致�
 ```bash
 cd ~/lut-experiments/LLM_LUT/v8
 python tools/bench_concurrency.py \
-  --base-url http://127.0.0.1:18002/v1 \
+  --base-url http://127.0.0.1:18002 \
   --model /data/mamingyu/models/Qwen3.6-35B-A3B \
   --concurrency 16 \
   --data data/longctx_multi_turn_65536_64docs.jsonl \
