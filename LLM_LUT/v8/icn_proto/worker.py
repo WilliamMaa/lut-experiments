@@ -182,6 +182,10 @@ class Worker:
         else:
             print("  layout check OK: all params on accelerator",
                   flush=True)
+        if getattr(self.args, "lut_bundle_dir", None):
+            from icn_proto.lut_patch import install_lut
+            install_lut(self.model, self.args.lut_layers,
+                        self.args.lut_bundle_dir)
 
     def _explicit_even_map(self):
         n = self._layer_count()
@@ -499,6 +503,11 @@ def main():
                     help="E2 backing tier: host-DRAM spill capacity in MB; "
                          "0 (default) = off (evict drops the block), "
                          "-1 = unlimited; a full tier drops LRU-oldest")
+    ap.add_argument("--lut-bundle-dir", default=None,
+                    help="dir of layer{N}.pt LUT bundles (docs 18/20); "
+                         "unset = dense serve")
+    ap.add_argument("--lut-layers", default="",
+                    help="comma/space separated layer list, e.g. 37,38,39")
     args = ap.parse_args()
     w = Worker(args)
     w.load_model()

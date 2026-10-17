@@ -66,6 +66,37 @@ def load_prompt_texts(prompt_file: str, max_prompts: Optional[int] = None) -> Li
     return texts
 
 
+def _resolve_num_layers(model_path: str, cfg) -> int:
+    """
+    Qwen3_5MoeConfig 没有 num_hidden_layers 字段（可能是 num_layers 或包在
+    text_config 里）。多候选属性 + 从 safetensors index 数 model.layers.N. 兜底。
+    """
+    import glob
+    import re
+
+    cands = [cfg, getattr(cfg, "text_config", None)]
+    for c in cands:
+        if c is None:
+            continue
+        for attr in ("num_hidden_layers", "num_layers", "n_layers"):
+            v = getattr(c, attr, None)
+            if isinstance(v, int) and v > 0:
+                return v
+    best = -1
+    for idx_file in glob.glob(os.path.join(model_path, "*.safetensors.index.json")):
+        with open(idx_file, "r", encoding="utf-8") as f:
+            weight_map = json.load(f).get("weight_map", {})
+        for k in weight_map:
+            m = re.search(r"layers\.(\d+)\.", k)
+            if m:
+                best = max(best, int(m.group(1)))
+    if best >= 0:
+        return best + 1
+    raise ValueError(
+        f"无法从 config({type(cfg).__name__}) 或 safetensors index 确定层数，"
+        f"请手动数 model.layers.N. 的最大 N")
+
+
 def _explicit_layer_map(model_path: str, devs: List[str]) -> dict:
     """
     显式逐层双卡映射（红线 5：禁 auto / accelerate 自动串）。
@@ -77,7 +108,7 @@ def _explicit_layer_map(model_path: str, devs: List[str]) -> dict:
     if len(devs) != 2:
         raise ValueError(f"dual: 需要恰好两张卡，得到 {devs}")
     cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    n_layers = int(cfg.num_hidden_layers)
+    n_layers = _resolve_num_layers(model_path, cfg)
     half = (n_layers + 1) // 2
     m = {"model.embed_tokens.weight": devs[-1],
          "model.norm.weight": devs[-1],

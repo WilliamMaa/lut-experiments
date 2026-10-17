@@ -1,7 +1,9 @@
-# v9 Phase 3 Runbook：扩层（示例 37→39 扩到 35→41）
+# v9 Phase 3 Runbook：扩层（37→39 扩到 33→39，7 层）
 
 权威 runbook。前置结论：v9 三层 bench 0.9375 已过门槛（见 `02-experiment-record.md`），
 判据按 doc 42 记账（Δ吞吐 / Δ训练成本），不是回 baseline。
+
+模型是 40 层架构，最后一层就是 39，**不存在 40/41**。扩层只能从 37 往浅扩。
 
 ## 资源前提（先确认再动手）
 
@@ -13,17 +15,17 @@
 
 ## 第 1 步：提取新层 teacher 权重（占两张卡，一次性）
 
-新层（示例 35/36/40/41）各需要一个 teacher .pt；已训层（37/38/39）不需要重提：
+新层（33/34/35/36）各需要一个 teacher .pt；已训层（37/38/39）不需要重提：
 
 ```bash
 cd ~/lut-experiments/LLM_LUT/v6
 CUDA_VISIBLE_DEVICES=0,1 python -u scripts/conversion/extract_shared_expert.py \
   --model_path /data/mamingyu/models/Qwen3.6-35B-A3B \
-  --layer_idx 35 --layer_idx 36 --layer_idx 40 --layer_idx 41 \
+  --layer_idx 33 --layer_idx 34 --layer_idx 35 --layer_idx 36 \
+  --output_path /data/mamingyu/outputs/v9_teacher/teacher_l33.pt \
+  --output_path /data/mamingyu/outputs/v9_teacher/teacher_l34.pt \
   --output_path /data/mamingyu/outputs/v9_teacher/teacher_l35.pt \
   --output_path /data/mamingyu/outputs/v9_teacher/teacher_l36.pt \
-  --output_path /data/mamingyu/outputs/v9_teacher/teacher_l40.pt \
-  --output_path /data/mamingyu/outputs/v9_teacher/teacher_l41.pt \
   --device_map dual:0,1 --torch_dtype bfloat16
 ```
 
@@ -32,27 +34,28 @@ CUDA_VISIBLE_DEVICES=0,1 python -u scripts/conversion/extract_shared_expert.py \
 ## 第 2 步：collect 扩层（三张卡：模型 dual 两张 + 训练一张）
 
 **沿用同一个 output_root**（`/data/mamingyu/outputs/v9_layerwise_l37_39`），
-37-39 的 phase0 / 训练 / 转换全部自动跳过，只做 35/36/40/41 的推进标注和训练：
+37-39 的 phase0 / 训练 / 转换全部自动跳过，只做 33/34/35/36 的推进标注和训练：
 
 ```bash
 cd ~/lut-experiments/LLM_LUT/v9
 CUDA_VISIBLE_DEVICES=0,1,2 python scripts/propagation/collect_layerwise_propagation.py \
   --model_path /data/mamingyu/models/Qwen3.6-35B-A3B \
   --prompt_file ../v6/candidate_prompts.jsonl \
-  --layers 35,36,37,38,39,40,41 \
-  --teacher_weights 35=/data/mamingyu/outputs/v9_teacher/teacher_l35.pt \
+  --layers 33,34,35,36,37,38,39 \
+  --teacher_weights 33=/data/mamingyu/outputs/v9_teacher/teacher_l33.pt \
+                    34=/data/mamingyu/outputs/v9_teacher/teacher_l34.pt \
+                    35=/data/mamingyu/outputs/v9_teacher/teacher_l35.pt \
                     36=/data/mamingyu/outputs/v9_teacher/teacher_l36.pt \
-                    40=/data/mamingyu/outputs/v9_teacher/teacher_l40.pt \
-                    41=/data/mamingyu/outputs/v9_teacher/teacher_l41.pt \
   --output_root /data/mamingyu/outputs/v9_layerwise_l37_39 \
   --device_map dual:0,1 --train_device cuda:2 --max_len 2048
 ```
 
 - 层列表**必须从浅到深排序**，推进语义要求按层序处理。
-- 扩到第几层按 `config.num_hidden_layers` 定（脚本运行时自己读，不用手填）；
-  本文 35-41 只是示例，可改。
-- 训练成本随深度涨：L41 的 on-policy 标注要推进 41 层，比 L37 贵一个量级，
-  盯 `build_log.json` 里的 per-layer label_time_s 记账。
+- 想扩更多层就把列表往浅续（32,31,...），只要小于 37 都是新层，需要 teacher .pt；
+  记住标注成本随深度涨：浅层推进要经过更多层，但每层的标注都要从 phase0 边界
+  重新推一遍，盯 `build_log.json` 里的 per-layer label_time_s 记账。
+- 层数由脚本从 config / safetensors index 自己解析（`Qwen3_5MoeConfig` 没有
+  `num_hidden_layers` 字段，已兼容），不用手填。
 
 ### 挂死预案（预期内，不是故障）
 
@@ -64,7 +67,7 @@ CUDA_VISIBLE_DEVICES=0,1,2 python scripts/propagation/collect_layerwise_propagat
 
 ## 第 3 步：收尾（CPU，不占卡，命令与 01-phase2-runbook 第 1/2 步相同）
 
-对每个**新层** L ∈ {35,36,40,41}：
+对每个**新层** L ∈ {33,34,35,36}：
 
 ```bash
 python /home/mamingyu/lut-experiments/LLM_LUT/v6/scripts/conversion/convert_v3_to_v4_checkpoints.py \
@@ -85,8 +88,8 @@ ls /data/mamingyu/outputs/v9_layerwise_l37_39/converted_layer*/checkpoints/repla
 
 ## 第 4 步：serve + bench（同 01-phase2-runbook 第 3/4 步，只改两处）
 
-- `export V8_LUT_LAYERS="35 36 37 38 39 40 41"`（层数变了，其余环境变量不变）。
-- bench `--out results/phase1_v9_l35_41_c16.json`（新文件名，别覆盖三层结果）。
+- `export V8_LUT_LAYERS="33 34 35 36 37 38 39"`（层数变了，其余环境变量不变）。
+- bench `--out results/phase1_v9_l33_39_c16.json`（新文件名，别覆盖三层结果）。
 - bench 数据若被删：按 01 第 3 步重新生成，**seed 必须默认 20260917**。
 
 ## 判读

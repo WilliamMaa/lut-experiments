@@ -86,6 +86,11 @@ v8 LUT 插件（L37-39 bundle，gate 修复版），其余走 11 号 runbook：
 | reps | ≥2 |
 | 策略 | b3（放置控制是另一个变量，本实验先不叠） |
 
+**可执行 runbook：`20-lut-e2-crossover-runbook.md`**（代码改动、
+门禁、正式格命令、预登记判文阈值全在里面；worker 侧插件为
+`icn_proto/lut_patch.py`，HF 路径不 re-apply gate，与 vLLM 插件
+语义不同，勿混用）。
+
 **判读指标（过程计数器优先，不看终局比分）：**
 
 - sp96 × LUT on 相对 LUT off：hit 跌幅、new_tok 涨幅、evict/recall

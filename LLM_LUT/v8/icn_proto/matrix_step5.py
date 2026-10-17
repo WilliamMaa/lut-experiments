@@ -55,6 +55,10 @@ def wl_signature(args):
     sp = getattr(args, "spill_mb", 0.0)
     if sp:
         tail += f"_sp{sp:g}"
+    if getattr(args, "lut_bundle_dir", None):
+        # LUT 常驻 HBM 改变 worker 资源预算，和 spill 一样是 workload
+        # shape 的一部分（docs 20）——pit 的机制开关先例不适用于它
+        tail += "_lut"
     if args.arrival == "poisson":
         return (f"pp{args.arrival_rate:g}_z{args.zipf_n}s{args.zipf_s:g}"
                 f"_t{args.think_s:g}{tail}_sd{args.seed}")
@@ -109,6 +113,9 @@ def run_cell(args, share, pol, rep, port):
                 os.path.join(args.trace_dir, cell)]
     if getattr(args, "spill_mb", 0.0) != 0:
         cmd += ["--spill-mb", str(args.spill_mb)]
+    if getattr(args, "lut_bundle_dir", None):
+        cmd += ["--lut-bundle-dir", args.lut_bundle_dir,
+                "--lut-layers", args.lut_layers]
     if getattr(args, "pit", False):
         # 15 §6: pit is a MECHANISM switch, not workload shape — it
         # stays out of wl_signature; pit=on cells live in their own
@@ -256,6 +263,12 @@ def main():
                     help="E2: host-DRAM spill tier capacity passed through "
                          "to run_cluster (0 = off, -1 = unlimited); enters "
                          "the workload signature")
+    ap.add_argument("--lut-bundle-dir", default=None,
+                    help="docs 20 (交点 A): dir of layer{N}.pt LUT bundles "
+                         "passed through to run_cluster/workers; enters "
+                         "the workload signature (_lut)")
+    ap.add_argument("--lut-layers", default="37,38,39",
+                    help="LUT replacement layers forwarded to workers")
     ap.add_argument("--trace-dir", default=None,
                     help="enable block-lifecycle tracing; each cell gets a "
                          "sub-dir (cell_<wl>_s<share>_<pol>_r<rep>)")

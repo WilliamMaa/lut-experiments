@@ -40,6 +40,10 @@ def spawn_workers(pool, gpus_per_worker, scheduler_addr, args):
                "--repr", args.repr,
                "--worker-id", f"w{wi}",
                "--spill-mb", str(getattr(args, "spill_mb", 0.0))]
+        if getattr(args, "lut_bundle_dir", None):
+            cmd += ["--lut-bundle-dir", args.lut_bundle_dir,
+                    "--lut-layers",
+                    getattr(args, "lut_layers", "") or ""]
         print(f"[launcher] w{wi} <- CUDA_VISIBLE_DEVICES={env['CUDA_VISIBLE_DEVICES']}")
         procs.append(subprocess.Popen(cmd, cwd=ROOT, env=env))
     return procs
@@ -74,6 +78,12 @@ def main():
                          "balanced_low_0 without tenant-dependent "
                          "reshuffling. Never 'auto' (project red line).")
     ap.add_argument("--dtype", default="bfloat16")
+    ap.add_argument("--lut-bundle-dir", default=None,
+                    help="forwarded to workers: dir of layer{N}.pt LUT "
+                         "bundles (docs 18/20); unset = dense serve")
+    ap.add_argument("--lut-layers", default="",
+                    help="forwarded to workers: comma/space separated "
+                         "layer list")
     ap.add_argument("--no-share", action="store_true",
                     help="baseline shortcut for the sharing A/B (run_sharing): "
                          "forces --policy b0 (load-only, no content awareness, "
