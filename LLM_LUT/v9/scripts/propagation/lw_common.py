@@ -66,17 +66,53 @@ def load_prompt_texts(prompt_file: str, max_prompts: Optional[int] = None) -> Li
     return texts
 
 
+def _explicit_layer_map(model_path: str, devs: List[str]) -> dict:
+    """
+    显式逐层双卡映射（红线 5：禁 auto / accelerate 自动串）。
+    embed_tokens / norm / lm_head 放 devs[-1]；layers[0..half) 放 devs[0]，
+    其余放 devs[-1]。层数从 config 读，无需调用方知道。
+    """
+    from transformers import AutoConfig
+
+    if len(devs) != 2:
+        raise ValueError(f"dual: 需要恰好两张卡，得到 {devs}")
+    cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+    n_layers = int(cfg.num_hidden_layers)
+    half = (n_layers + 1) // 2
+    m = {"model.embed_tokens.weight": devs[-1],
+         "model.norm.weight": devs[-1],
+         "lm_head.weight": devs[-1]}
+    for i in range(n_layers):
+        m[f"model.layers.{i}."] = devs[0] if i < half else devs[-1]
+    return m
+
+
 def load_model(model_path: str, device_map: Optional[str], torch_dtype: str):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    if device_map == "auto":
-        raise ValueError("device_map='auto' is forbidden (project red line). Use e.g. balanced_low_0.")
+    if device_map == "auto" or (device_map and device_map.startswith("auto")):
+        raise ValueError(
+            "device_map='auto*' is forbidden (project red line). "
+            "Use explicit JSON dict, 'dual:N,M', or empty (single cuda:0)."
+        )
 
     dtype = getattr(torch, torch_dtype)
     print(f"[lw] Loading model: {model_path} (dtype={torch_dtype}, device_map={device_map})")
-    if device_map:
+    if device_map and device_map.startswith("dual:"):
+        devs = [f"cuda:{d.strip()}" for d in device_map.split(":", 1)[1].split(",")]
+        dm: object = _explicit_layer_map(model_path, devs)
+        n_l = len([k for k in dm if k.startswith("model.layers.")])
+        print(f"[lw] explicit dual map: {n_l} decoder layers split across {devs}")
+    elif device_map and device_map.startswith("{"):
+        dm = json.loads(device_map)
+    elif device_map:
+        dm = device_map
+    else:
+        dm = None
+
+    if dm is not None:
         model = AutoModelForCausalLM.from_pretrained(
-            model_path, torch_dtype=dtype, trust_remote_code=True, device_map=device_map,
+            model_path, torch_dtype=dtype, trust_remote_code=True, device_map=dm,
         )
     else:
         model = AutoModelForCausalLM.from_pretrained(

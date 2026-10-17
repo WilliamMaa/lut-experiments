@@ -119,8 +119,9 @@
 
 - v8 全部调试记录（0/16 → shared_expert gate 根因 → 修复后 0.9551，含并发对照）：
   `LLM_LUT/v8/docs/45-debug-gate-rootcause.md`；serve/bench 操作 runbook 是 v8 的 doc 43。
-- v9 实验记录（等价性小实验、三层训练状态、脚本修复清单）：
-  `LLM_LUT/v9/docs/02-experiment-record.md`；收尾操作 runbook 是 `01-phase2-runbook.md`。
+- v9 实验记录（等价性小实验、三层训练状态、脚本修复清单、0.9375 bench 结果）：
+  `LLM_LUT/v9/docs/02-experiment-record.md`；收尾操作 runbook 是 `01-phase2-runbook.md`；
+  **扩层 runbook 是 `03-phase3-expansion-runbook.md`（当前阶段，下一步照它跑）**。
 
 ---
 

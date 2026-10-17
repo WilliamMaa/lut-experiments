@@ -34,3 +34,22 @@ v9 表训练数据 ~20 万 token/层（v6 的 1/3），bench 解读记住这个 
 - 训练产物齐全自动跳过该层训练；engine 装前自动 v3→v4 转换（`ensure_v4_checkpoint`，
   转换产物缓存复用）；phase0 分片齐全自动跳过原始 pass（`_phase0_meta.json` 校验配置）。
 - `load_model` 支持显式 JSON dict device_map（红线 5：禁 auto/auto-类字符串）。
+- `load_model` 新增 `dual:N,M`：逐层显式对半分两张卡（共享机没有空 80G 单卡时的
+  合法加载方式）。`extract_shared_expert.py` 同步支持 `dual:` / JSON dict。
+
+## serve bench：64 篇完整（2026-10-16）
+
+三层全装（bundle `lut_bundles_v9/layer{37,38,39}.pt`），与 v8 Phase 1 完全同配置
+（0.70 mem / max-num-seqs 4 / N=16 / 64 docs × 8 问 / max-model-len 131072）：
+
+| 配置 | fact_acc | sess/h | wall |
+|---|---|---|---|
+| baseline dense | 0.9844（504/512） | 87.6 | 2629s |
+| v8 LUT 三层（60 万 token/层 训练） | 0.9551（489/512） | 99.9 | 2306s |
+| **v9 LUT 三层（20 万 token/层 训练）** | **0.9375（480/512）** | 101.4 | 2271s |
+
+v9 用 1/3 训练数据交出与 v8 同档的 fact_acc（差 1.8pt，在 bench 噪声 ±2~3pt 内），
+**Phase 3 门槛过**：v9 管线（便宜采集 + 逐层推进 + on-policy）方向成立，判据按
+doc 42 记账（Δ吞吐 / Δ训练成本）。结果文件：`v8/results/phase1_v9_c16.json`。
+注意：第一次 bench 只跑出 22 sessions（生成被截断，0.9148），已重生成完整数据后重跑，
+以本次 0.9375 为准。扩层步骤见 `03-phase3-expansion-runbook.md`。
