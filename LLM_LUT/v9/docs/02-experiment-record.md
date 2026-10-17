@@ -34,8 +34,8 @@ v9 表训练数据 ~20 万 token/层（v6 的 1/3），bench 解读记住这个 
 - 训练产物齐全自动跳过该层训练；engine 装前自动 v3→v4 转换（`ensure_v4_checkpoint`，
   转换产物缓存复用）；phase0 分片齐全自动跳过原始 pass（`_phase0_meta.json` 校验配置）。
 - `load_model` 支持显式 JSON dict device_map（红线 5：禁 auto/auto-类字符串）。
-- `load_model` 新增 `dual:N,M`：逐层显式对半分两张卡（共享机没有空 80G 单卡时的
-  合法加载方式）。`extract_shared_expert.py` 同步支持 `dual:` / JSON dict。
+- ~~`dual:N,M` 双卡映射~~ 已回退：homemade 层映射不对，模型加载恢复三层跑通过的
+  `balanced_low_0` 方式（卡范围用 `CUDA_VISIBLE_DEVICES` 圈），不再折腾。
 
 ## serve bench：64 篇完整（2026-10-16）
 
