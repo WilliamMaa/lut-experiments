@@ -66,84 +66,17 @@ def load_prompt_texts(prompt_file: str, max_prompts: Optional[int] = None) -> Li
     return texts
 
 
-def _resolve_num_layers(model_path: str, cfg) -> int:
-    """
-    Qwen3_5MoeConfig 没有 num_hidden_layers 字段（可能是 num_layers 或包在
-    text_config 里）。多候选属性 + 从 safetensors index 数 model.layers.N. 兜底。
-    """
-    import glob
-    import re
-
-    cands = [cfg, getattr(cfg, "text_config", None)]
-    for c in cands:
-        if c is None:
-            continue
-        for attr in ("num_hidden_layers", "num_layers", "n_layers"):
-            v = getattr(c, attr, None)
-            if isinstance(v, int) and v > 0:
-                return v
-    best = -1
-    for idx_file in glob.glob(os.path.join(model_path, "*.safetensors.index.json")):
-        with open(idx_file, "r", encoding="utf-8") as f:
-            weight_map = json.load(f).get("weight_map", {})
-        for k in weight_map:
-            m = re.search(r"layers\.(\d+)\.", k)
-            if m:
-                best = max(best, int(m.group(1)))
-    if best >= 0:
-        return best + 1
-    raise ValueError(
-        f"无法从 config({type(cfg).__name__}) 或 safetensors index 确定层数，"
-        f"请手动数 model.layers.N. 的最大 N")
-
-
-def _explicit_layer_map(model_path: str, devs: List[str]) -> dict:
-    """
-    显式逐层双卡映射（红线 5：禁 auto / accelerate 自动串）。
-    embed_tokens / norm / lm_head 放 devs[-1]；layers[0..half) 放 devs[0]，
-    其余放 devs[-1]。层数从 config 读，无需调用方知道。
-    """
-    from transformers import AutoConfig
-
-    if len(devs) != 2:
-        raise ValueError(f"dual: 需要恰好两张卡，得到 {devs}")
-    cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    n_layers = _resolve_num_layers(model_path, cfg)
-    half = (n_layers + 1) // 2
-    m = {"model.embed_tokens.weight": devs[-1],
-         "model.norm.weight": devs[-1],
-         "lm_head.weight": devs[-1]}
-    for i in range(n_layers):
-        m[f"model.layers.{i}."] = devs[0] if i < half else devs[-1]
-    return m
-
-
 def load_model(model_path: str, device_map: Optional[str], torch_dtype: str):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    if device_map == "auto" or (device_map and device_map.startswith("auto")):
-        raise ValueError(
-            "device_map='auto*' is forbidden (project red line). "
-            "Use explicit JSON dict, 'dual:N,M', or empty (single cuda:0)."
-        )
+    if device_map == "auto":
+        raise ValueError("device_map='auto' is forbidden (project red line). Use e.g. balanced_low_0.")
 
     dtype = getattr(torch, torch_dtype)
     print(f"[lw] Loading model: {model_path} (dtype={torch_dtype}, device_map={device_map})")
-    if device_map and device_map.startswith("dual:"):
-        devs = [f"cuda:{d.strip()}" for d in device_map.split(":", 1)[1].split(",")]
-        dm: object = _explicit_layer_map(model_path, devs)
-        n_l = len([k for k in dm if k.startswith("model.layers.")])
-        print(f"[lw] explicit dual map: {n_l} decoder layers split across {devs}")
-    elif device_map and device_map.startswith("{"):
-        dm = json.loads(device_map)
-    elif device_map:
-        dm = device_map
-    else:
-        dm = None
-
-    if dm is not None:
+    if device_map:
         model = AutoModelForCausalLM.from_pretrained(
-            model_path, torch_dtype=dtype, trust_remote_code=True, device_map=dm,
+            model_path, torch_dtype=dtype, trust_remote_code=True, device_map=device_map,
         )
     else:
         model = AutoModelForCausalLM.from_pretrained(

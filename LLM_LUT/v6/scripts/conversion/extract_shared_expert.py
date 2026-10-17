@@ -15,40 +15,8 @@ extract_shared_expert.py
 """
 
 import argparse
-import glob
-import json
-import os
-import re
 import torch
 from transformers import AutoModelForCausalLM
-
-
-def _resolve_num_layers(model_path: str, cfg) -> int:
-    """
-    Qwen3_5MoeConfig 没有 num_hidden_layers 字段（可能是 num_layers 或包在
-    text_config 里）。多候选属性 + 从 safetensors index 数 model.layers.N. 兜底。
-    """
-    cands = [cfg, getattr(cfg, "text_config", None)]
-    for c in cands:
-        if c is None:
-            continue
-        for attr in ("num_hidden_layers", "num_layers", "n_layers"):
-            v = getattr(c, attr, None)
-            if isinstance(v, int) and v > 0:
-                return v
-    best = -1
-    for idx_file in glob.glob(os.path.join(model_path, "*.safetensors.index.json")):
-        with open(idx_file, "r", encoding="utf-8") as f:
-            weight_map = json.load(f).get("weight_map", {})
-        for k in weight_map:
-            m = re.search(r"layers\.(\d+)\.", k)
-            if m:
-                best = max(best, int(m.group(1)))
-    if best >= 0:
-        return best + 1
-    raise ValueError(
-        f"无法从 config({type(cfg).__name__}) 或 safetensors index 确定层数，"
-        f"请手动数 model.layers.N. 的最大 N")
 
 
 def main():
@@ -63,37 +31,18 @@ def main():
     if len(args.layer_idx) != len(args.output_path):
         raise ValueError("Number of --layer_idx and --output_path must match")
 
-    if args.device_map == "auto" or args.device_map.startswith("auto"):
-        raise ValueError("device_map='auto*' forbidden (red line). Use 'dual:N,M', JSON dict, or explicit map.")
+    if args.device_map == "auto":
+        raise ValueError("device_map='auto' forbidden. Use 'balanced_low_0' or explicit map.")
 
     dtype = getattr(torch, args.torch_dtype)
     print(f"Loading model from {args.model_path}")
     print(f"  dtype: {args.torch_dtype}")
     print(f"  device_map: {args.device_map}")
 
-    if args.device_map.startswith("dual:"):
-        from transformers import AutoConfig
-        devs = [f"cuda:{d.strip()}" for d in args.device_map.split(":", 1)[1].split(",")]
-        if len(devs) != 2:
-            raise ValueError(f"dual: 需要恰好两张卡，得到 {devs}")
-        cfg = AutoConfig.from_pretrained(args.model_path, trust_remote_code=True)
-        n_layers = _resolve_num_layers(args.model_path, cfg)
-        half = (n_layers + 1) // 2
-        device_map = {"model.embed_tokens.weight": devs[-1],
-                      "model.norm.weight": devs[-1],
-                      "lm_head.weight": devs[-1]}
-        for i in range(n_layers):
-            device_map[f"model.layers.{i}."] = devs[0] if i < half else devs[-1]
-    elif args.device_map.startswith("{"):
-        import json
-        device_map = json.loads(args.device_map)
-    else:
-        device_map = args.device_map
-
     model = AutoModelForCausalLM.from_pretrained(
         args.model_path,
         torch_dtype=dtype,
-        device_map=device_map,
+        device_map=args.device_map,
         trust_remote_code=True,
     )
 

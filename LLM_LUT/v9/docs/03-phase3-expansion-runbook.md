@@ -5,15 +5,13 @@
 
 模型是 40 层架构，最后一层就是 39，**不存在 40/41**。扩层只能从 37 往浅扩。
 
-## 资源前提（先确认再动手）
+## 资源前提
 
-- 共享机永远没有空 80G 单卡。模型 ~70GB，必须**显式**摊两张卡：
-  `dual:N,M`（lw_common / extract_shared_expert 已支持，逐层对半分，红线 5 合法）。
-- 训练子进程用第三张卡（`--train_device`），**父子不得共卡**（共卡会在训练子进程
-  CUDA 析构时死锁——挂死那轮就是这个，产物其实已经齐了）。
-- 开跑前 `nvidia-smi` 确认三张目标卡都空，卡号按实况填，不要照抄本文的数字。
+- 模型加载就用三层跑通过的方式：`--device_map balanced_low_0`（collect 默认就是，
+  不用传）。要控制用哪几张卡，用 `CUDA_VISIBLE_DEVICES` 圈出有空余显存的卡，
+  balance 会在圈出的卡上摊，卡号按 `nvidia-smi` 实况填。
 
-## 第 1 步：提取新层 teacher 权重（占两张卡，一次性）
+## 第 1 步：提取新层 teacher 权重（占卡，一次性）
 
 新层（33/34/35/36）各需要一个 teacher .pt；已训层（37/38/39）不需要重提：
 
@@ -26,10 +24,8 @@ CUDA_VISIBLE_DEVICES=6,7 python -u scripts/conversion/extract_shared_expert.py \
   --output_path /data/mamingyu/outputs/v9_teacher/teacher_l34.pt \
   --output_path /data/mamingyu/outputs/v9_teacher/teacher_l35.pt \
   --output_path /data/mamingyu/outputs/v9_teacher/teacher_l36.pt \
-  --device_map dual:0,1 --torch_dtype bfloat16
+  --device_map balanced_low_0 --torch_dtype bfloat16
 ```
-
-（`dual:` 后面的卡号对应 `CUDA_VISIBLE_DEVICES` 暴露后的 0/1，按实况填。）
 
 ## 第 2 步：collect 扩层（三张卡：模型 dual 两张 + 训练一张）
 
@@ -38,7 +34,7 @@ CUDA_VISIBLE_DEVICES=6,7 python -u scripts/conversion/extract_shared_expert.py \
 
 ```bash
 cd ~/lut-experiments/LLM_LUT/v9
-CUDA_VISIBLE_DEVICES=0,1,2 python scripts/propagation/collect_layerwise_propagation.py \
+python scripts/propagation/collect_layerwise_propagation.py \
   --model_path /data/mamingyu/models/Qwen3.6-35B-A3B \
   --prompt_file ../v6/candidate_prompts.jsonl \
   --layers 33,34,35,36,37,38,39 \
@@ -47,15 +43,13 @@ CUDA_VISIBLE_DEVICES=0,1,2 python scripts/propagation/collect_layerwise_propagat
                     35=/data/mamingyu/outputs/v9_teacher/teacher_l35.pt \
                     36=/data/mamingyu/outputs/v9_teacher/teacher_l36.pt \
   --output_root /data/mamingyu/outputs/v9_layerwise_l37_39 \
-  --device_map dual:0,1 --train_device cuda:2 --max_len 2048
+  --max_len 2048
 ```
 
 - 层列表**必须从浅到深排序**，推进语义要求按层序处理。
 - 想扩更多层就把列表往浅续（32,31,...），只要小于 37 都是新层，需要 teacher .pt；
-  记住标注成本随深度涨：浅层推进要经过更多层，但每层的标注都要从 phase0 边界
-  重新推一遍，盯 `build_log.json` 里的 per-layer label_time_s 记账。
-- 层数由脚本从 config / safetensors index 自己解析（`Qwen3_5MoeConfig` 没有
-  `num_hidden_layers` 字段，已兼容），不用手填。
+  记住标注成本随深度涨，盯 `build_log.json` 里的 per-layer label_time_s 记账。
+- 训练卡用 `--train_device` 指定（默认 cuda:0，不够就换空卡）。
 
 ### 挂死预案（预期内，不是故障）
 

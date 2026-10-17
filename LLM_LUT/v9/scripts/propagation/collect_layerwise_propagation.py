@@ -25,11 +25,7 @@ v9 逐层推进多层 LUT 构建（对应 docs/00-setup.md 方向 1）。
     --layers 37,38,39 \
     --teacher_weights 37=/path/teacher_l37.pt 38=/path/teacher_l38.pt 39=/path/teacher_l39.pt \
     --output_root /data/outputs/v9_layerwise_l37_39 \
-    --device_map dual:0,1 --train_device cuda:2 --max_len 2048
-
-共享机没有空 80G 单卡：模型用 dual:0,1 显式摊两张卡（逐层对半分，
-红线 5 禁 auto），训练子进程用 --train_device 指定的第三张卡（父子不共卡，
-避免 CUDA 析构死锁）。
+    --device_map balanced_low_0 --max_len 2048
 """
 
 import argparse
@@ -249,8 +245,8 @@ def main():
     ap.add_argument("--output_root", required=True)
     ap.add_argument("--teacher_weights", type=str, nargs="*", default=None,
                     help="每层 teacher expert .pt：37=/path/teacher_l37.pt ...（训练阶段必填，可用 extract_shared_expert.py 生成）")
-    ap.add_argument("--device_map", default="dual:0,1",
-                    help="显式 device_map；支持 'dual:N,M'（逐层对半分两张卡）、JSON dict；禁止 auto")
+    ap.add_argument("--device_map", default="balanced_low_0",
+                    help="显式 device_map；禁止 auto")
     ap.add_argument("--torch_dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"])
     ap.add_argument("--shard_dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"],
                     help="训练数据分片存储 dtype（边界缓存始终 fp32）")
@@ -261,8 +257,7 @@ def main():
     ap.add_argument("--no_train", action="store_true", help="只采集+推进，不训练（需 --existing_ckpt）")
     ap.add_argument("--existing_ckpt", type=str, nargs="*", default=None,
                     help="复用已训好的 checkpoint：37=/path/to/checkpoints ...")
-    ap.add_argument("--train_device", default="cuda:2",
-                    help="训练子进程用的卡（必须与模型 dual 占的卡不同，避免父子共卡死锁）")
+    ap.add_argument("--train_device", default="cuda:0")
     ap.add_argument("--calib_size", type=int, default=400000,
                     help="训练用校准样本数；超过采集量时按比例自动下调")
     ap.add_argument("--eval_size", type=int, default=100000)
